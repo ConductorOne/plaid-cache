@@ -31,14 +31,18 @@ type Server struct {
 	version string
 	started time.Time
 
-	// getLimit bounds concurrent Get handling. A get can fault from the
-	// shared tier, so without a bound a single pipelined build could open one
-	// connection per in-flight action.
-	getLimit chan struct{}
-
 	mu        sync.Mutex
 	active    int
 	idleTimer *time.Timer
+
+	// maxGets bounds concurrent get handling per session. Zero means
+	// maxConcurrentGets; a test lowers it so a wedged session can be made to
+	// hold every slot deterministically.
+	maxGets int
+
+	// sessionIdle overrides sessionIdleTimeout. Zero uses the constant; a test
+	// shortens it so a silent session can be observed being closed.
+	sessionIdle time.Duration
 
 	conns    sync.WaitGroup
 	stopped  chan struct{}
@@ -52,10 +56,39 @@ type ServerParams struct {
 	Index   *index.Index
 	Logf    cache.Logf
 	Version string
+
+	// MaxConcurrentGets overrides the per-session get bound. Zero uses
+	// maxConcurrentGets.
+	MaxConcurrentGets int
+
+	// SessionIdleTimeout overrides sessionIdleTimeout. Zero uses the constant.
+	SessionIdleTimeout time.Duration
 }
 
-// maxConcurrentGets bounds in-flight remote faults per daemon.
+// maxConcurrentGets bounds in-flight remote faults per session.
+//
+// The bound is per session rather than per daemon on purpose. A shared
+// semaphore couples unrelated builds: a client that stops reading its responses
+// leaves its handlers parked in a write, and once they hold every slot the
+// decode loop of every other session blocks acquiring one. One stuck build
+// would stall all of them.
 const maxConcurrentGets = 64
+
+// sessionIdleTimeout closes a session that has gone silent.
+//
+// Without it a connection that completes the handshake and then says nothing
+// keeps the daemon's active-connection count above zero, so the idle timer can
+// never fire and the daemon lives forever. Gaps between cache requests during a
+// long compile are seconds, not hours, so an hour of silence means the peer is
+// gone.
+const sessionIdleTimeout = time.Hour
+
+// maxAcceptFailures and acceptRetryDelay bound how long Serve tolerates a
+// listener that keeps failing before it gives up.
+const (
+	maxAcceptFailures = 10
+	acceptRetryDelay  = 100 * time.Millisecond
+)
 
 // NewServer constructs a Server. Call Serve to run it.
 func NewServer(p ServerParams) *Server {
@@ -64,15 +97,24 @@ func NewServer(p ServerParams) *Server {
 		logf = func(string, ...any) {}
 	}
 	return &Server{
-		cfg:      p.Config,
-		cache:    p.Cache,
-		idx:      p.Index,
-		logf:     logf,
-		version:  p.Version,
-		started:  time.Now(),
-		getLimit: make(chan struct{}, maxConcurrentGets),
-		stopped:  make(chan struct{}),
+		cfg:         p.Config,
+		cache:       p.Cache,
+		idx:         p.Index,
+		logf:        logf,
+		version:     p.Version,
+		started:     time.Now(),
+		maxGets:     p.MaxConcurrentGets,
+		sessionIdle: p.SessionIdleTimeout,
+		stopped:     make(chan struct{}),
 	}
+}
+
+// sessionIdleTimeout returns the effective per-session silence budget.
+func (s *Server) sessionIdleTimeout() time.Duration {
+	if s.sessionIdle > 0 {
+		return s.sessionIdle
+	}
+	return sessionIdleTimeout
 }
 
 // Listen binds the unix socket.
@@ -92,12 +134,28 @@ func Listen(cfg *config.Config) (net.Listener, error) {
 			return nil, fmt.Errorf("Listen: remove stale socket: %w", rerr)
 		}
 	}
+	// Narrow the containing directory before binding. bind creates the socket
+	// with umask-derived permissions and only the chmod below narrows it, so
+	// for that window the socket may be connectable by anyone who can reach
+	// it. A caller who reaches it can serve build outputs to a compile, so the
+	// window is worth closing rather than shrinking: a directory only its
+	// owner may traverse makes the socket unreachable regardless of its own
+	// mode. This matters most when SocketDir falls back under the system
+	// temporary directory, which is world writable.
+	dir := cfg.SocketDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("Listen: create socket dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("Listen: chmod socket dir: %w", err)
+	}
+
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, fmt.Errorf("Listen: %w", err)
 	}
 	// The cache holds build outputs; only its owner should be able to read or
-	// poison them.
+	// poison them. Belt and braces with the directory mode above.
 	if err := os.Chmod(path, 0o600); err != nil {
 		ln.Close()
 		return nil, fmt.Errorf("Listen: chmod socket: %w", err)
@@ -128,6 +186,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		ln.Close()
 	}()
 
+	var acceptFails int
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -140,8 +199,27 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 				return ctx.Err()
 			default:
 			}
-			return fmt.Errorf("Serve: accept: %w", err)
+			// A transient accept failure — typically the process or system
+			// running out of descriptors — must not take the daemon down with
+			// it, because every build in the env depends on it. Back off and
+			// keep serving; give up only if it never clears.
+			acceptFails++
+			if acceptFails > maxAcceptFailures {
+				return fmt.Errorf("Serve: accept: %w", err)
+			}
+			s.logf("accept: %v (retry %d/%d)", err, acceptFails, maxAcceptFailures)
+			select {
+			case <-time.After(acceptRetryDelay):
+			case <-s.stopped:
+				s.drain()
+				return nil
+			case <-ctx.Done():
+				s.drain()
+				return ctx.Err()
+			}
+			continue
 		}
+		acceptFails = 0
 		s.conns.Add(1)
 		go func() {
 			defer s.conns.Done()
@@ -264,9 +342,12 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Clear the deadline: a session lives as long as the build does.
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		s.logf("clear deadline: %v", err)
+	// Replace the handshake deadline with the (much longer) session one. It is
+	// not cleared outright: an unbounded deadline lets a peer that completes
+	// the handshake and then stalls keep this connection counted as active,
+	// which stops the idle timer from ever firing.
+	if err := conn.SetReadDeadline(time.Now().Add(s.sessionIdleTimeout())); err != nil {
+		s.logf("set session deadline: %v", err)
 		return
 	}
 
@@ -286,7 +367,15 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		if err := writeJSONLine(conn, HelloResponse{Version: s.version, OK: true}); err != nil {
 			return
 		}
-		s.session(ctx, br, conn)
+		// Refresh the read deadline on every decoded request so a silent
+		// session is closed rather than pinning the daemon awake forever.
+		bump := func() {
+			if err := conn.SetReadDeadline(time.Now().Add(s.sessionIdleTimeout())); err != nil {
+				s.logf("set session deadline: %v", err)
+			}
+		}
+		bump()
+		s.session(ctx, br, conn, bump)
 	case OpStatus:
 		_ = writeJSONLine(conn, HelloResponse{Version: s.version, OK: true})
 		_ = writeJSONLine(conn, s.status())
@@ -344,7 +433,7 @@ func (s *Server) gc(ctx context.Context) GCResponse {
 // This is the fallback path used when no daemon can be reached: the process
 // that would have been a thin relay instead does the work itself.
 func (s *Server) RunSession(ctx context.Context, r io.Reader, w io.Writer) {
-	s.session(ctx, r, w)
+	s.session(ctx, r, w, nil)
 }
 
 // ServeMisses speaks the protocol correctly while storing nothing.
@@ -397,9 +486,19 @@ func ServeMisses(r io.Reader, w io.Writer) error {
 // stream and must be consumed before the next request can be read. Gets are
 // dispatched concurrently because they may fault from the shared tier, and
 // the protocol explicitly permits out-of-order responses.
-func (s *Server) session(ctx context.Context, r io.Reader, w io.Writer) {
+func (s *Server) session(ctx context.Context, r io.Reader, w io.Writer, onActivity func()) {
 	dec := wire.NewDecoder(r)
 	enc := wire.NewEncoder(w)
+
+	// Per-session, so one wedged peer cannot starve the others.
+	limit := s.maxGets
+	if limit <= 0 {
+		limit = maxConcurrentGets
+	}
+	getLimit := make(chan struct{}, limit)
+	if onActivity == nil {
+		onActivity = func() {}
+	}
 
 	if err := enc.Encode(&wire.Response{ID: 0, KnownCommands: []wire.Cmd{wire.CmdGet, wire.CmdPut, wire.CmdClose}}); err != nil {
 		s.logf("session handshake: %v", err)
@@ -417,18 +516,19 @@ func (s *Server) session(ctx context.Context, r io.Reader, w io.Writer) {
 			}
 			return
 		}
+		onActivity()
 
 		switch req.Command {
 		case wire.CmdGet:
 			select {
-			case s.getLimit <- struct{}{}:
+			case getLimit <- struct{}{}:
 			case <-ctx.Done():
 				return
 			}
 			inflight.Add(1)
 			go func(id int64, actionID []byte) {
 				defer inflight.Done()
-				defer func() { <-s.getLimit }()
+				defer func() { <-getLimit }()
 				if err := enc.Encode(s.handleGet(ctx, id, actionID)); err != nil {
 					s.logf("session encode get: %v", err)
 				}

@@ -199,21 +199,34 @@ func (c *Config) IndexDir() string { return filepath.Join(c.Dir, "index") }
 // below the smaller limit leaves room for the filename itself.
 const maxSocketPath = 100
 
-// SocketPath is the daemon's unix socket.
+// SocketDir is the directory holding the daemon's unix socket.
 //
-// It normally lives beside the cache, which keeps everything the tool creates
-// under one directory. A deep cache directory can exceed the kernel's socket
-// path limit, though, so an over-long path falls back to the temporary
-// directory under a name derived from the cache directory. The derivation is
-// deterministic, so every client of a given cache agrees on where to look.
-func (c *Config) SocketPath() string {
-	p := filepath.Join(c.Dir, "plaid-cache.sock")
-	if len(p) <= maxSocketPath {
-		return p
+// It normally is the cache directory itself, which keeps everything the tool
+// creates under one root. A deep cache directory can exceed the kernel's
+// socket path limit, though, so an over-long path falls back to a directory
+// under the system temporary directory, named from a digest of the cache
+// directory. The derivation is deterministic, so every client of a given cache
+// agrees on where to look.
+//
+// The fallback is a directory rather than a bare filename because the socket's
+// permissions cannot be set atomically: bind creates it with umask-derived
+// permissions and only a following chmod narrows it. Holding the socket inside
+// a directory the owner alone may traverse closes that window, which matters
+// most for the fallback, since the system temporary directory is world
+// writable.
+func (c *Config) SocketDir() string {
+	if len(filepath.Join(c.Dir, socketName)) <= maxSocketPath {
+		return c.Dir
 	}
 	sum := sha256.Sum256([]byte(c.Dir))
-	return filepath.Join(os.TempDir(), fmt.Sprintf("plaid-cache-%x.sock", sum[:8]))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("plaid-cache-%x", sum[:8]))
 }
+
+// socketName is the socket's filename within SocketDir.
+const socketName = "plaid-cache.sock"
+
+// SocketPath is the daemon's unix socket.
+func (c *Config) SocketPath() string { return filepath.Join(c.SocketDir(), socketName) }
 
 // LogPath is where a daemon spawned in the background sends its output. A
 // detached daemon has no terminal to inherit, so without this its diagnostics

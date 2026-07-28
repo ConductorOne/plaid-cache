@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -156,9 +157,19 @@ func (c *Cache) Get(ctx context.Context, a ids.ActionID) (Result, error) {
 				Time:     time.Unix(0, e.CreatedAt),
 			}, nil
 		}
-		// The index referenced a body that is gone — someone deleted the
-		// blob tree by hand, or a partial clean ran. Drop the dangling entry
-		// so the accounting stays honest, then fall through to the remote.
+		if !errors.Is(err, fs.ErrNotExist) {
+			// The body may well be fine and simply unreadable right now — a
+			// transient I/O error, or a permissions change. Treat it as a miss
+			// so the build proceeds, but leave the index alone: deleting the
+			// entry would discard a good body and its refcount on the strength
+			// of a temporary failure.
+			c.logf("blob get %s: %v", e.OutputID, err)
+			c.metrics.GetMiss.Add(1)
+			return Result{Miss: true}, nil
+		}
+		// The body is genuinely gone — someone deleted the blob tree by hand,
+		// or a partial clean ran. Drop the dangling entry so the accounting
+		// stays honest, then fall through to the remote.
 		c.metrics.GetRepair.Add(1)
 		if orphan, isOrphan, derr := c.idx.Delete(a); derr != nil {
 			c.logf("index repair %s: %v", a, derr)
@@ -316,6 +327,14 @@ type uploader struct {
 	logf    Logf
 	metrics *Metrics
 	once    sync.Once
+
+	// mu guards jobs against a send racing close. A send on a closed channel
+	// panics even inside a select with a default, because the send case is
+	// always ready once the channel is closed, so default cannot make submit
+	// safe after close. A panic here aborts the build, which is the one thing
+	// this package promises not to do.
+	mu     sync.RWMutex
+	closed bool
 }
 
 // queueDepthPerWorker sizes the backlog relative to the pool.
@@ -341,6 +360,13 @@ func newUploader(workers int, logf Logf, m *Metrics) *uploader {
 // submit queues a job, dropping it if the queue is full rather than blocking
 // the build that produced it.
 func (u *uploader) submit(j uploadJob) {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	if u.closed {
+		// Nothing will drain it, so count it as dropped rather than panicking.
+		u.metrics.UploadDrop.Add(1)
+		return
+	}
 	select {
 	case u.jobs <- j:
 	default:
@@ -394,7 +420,10 @@ func (u *uploader) run(j uploadJob) {
 // close stops accepting work and waits for the pool to drain.
 func (u *uploader) close() {
 	u.once.Do(func() {
+		u.mu.Lock()
+		u.closed = true
 		close(u.jobs)
+		u.mu.Unlock()
 		u.wg.Wait()
 	})
 }
