@@ -24,6 +24,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/conductorone/plaid-cache/internal/ids"
 )
@@ -170,4 +171,64 @@ func createTemp(path string) (*os.File, error) {
 		}
 	}
 	return nil, fmt.Errorf("no free temp name for %s after %d attempts", path, tempAttempts)
+}
+
+// Adopt takes ownership of a body that already exists elsewhere on disk,
+// publishing it under this store's content address without copying the bytes.
+//
+// It hardlinks, so the adopted body occupies no additional space and neither
+// location can corrupt the other: each holds its own name for one inode, and
+// the data survives until the last name is unlinked. That is what makes it safe
+// to adopt another cache's stage while that cache is still using it.
+//
+// A cross-device source cannot be linked, so those fall back to a copy. The
+// caller learns which happened from linked, because the distinction decides
+// whether the operation was free.
+//
+// Like Put, this is first-writer-wins: an existing body at the same address is
+// equivalent by construction, so finding one is success.
+func (s *Store) Adopt(id ids.OutputID, srcPath string, size int64) (path string, nbytes int64, linked bool, err error) {
+	src, err := os.Stat(srcPath)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("Adopt: %w", err)
+	}
+	if src.Size() != size {
+		// The source disagrees with the record that pointed at it, so one of
+		// them is stale. Refuse rather than publish bytes under an address that
+		// may not describe them.
+		return "", 0, false, fmt.Errorf("Adopt: %s is %d bytes, want %d", srcPath, src.Size(), size)
+	}
+
+	path = s.Path(id)
+	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
+		return "", 0, false, fmt.Errorf("Adopt: %w", err)
+	}
+
+	// EEXIST means this address is already published, by us or by an earlier
+	// adoption. Content addressing makes those bytes equivalent, so it is
+	// success either way.
+	lerr := os.Link(srcPath, path)
+	switch {
+	case lerr == nil, errors.Is(lerr, fs.ErrExist):
+		fi, serr := os.Stat(path)
+		if serr != nil {
+			return "", 0, false, fmt.Errorf("Adopt: %w", serr)
+		}
+		return path, diskBytes(fi), true, nil
+	case !errors.Is(lerr, syscall.EXDEV):
+		return "", 0, false, fmt.Errorf("Adopt: link: %w", lerr)
+	}
+
+	// Different filesystem: the bytes have to move. Reuse Put so the copy gets
+	// the same atomic publish and size verification.
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("Adopt: %w", err)
+	}
+	defer f.Close()
+	p, db, err := s.Put(id, f, size)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("Adopt: %w", err)
+	}
+	return p, db, false, nil
 }

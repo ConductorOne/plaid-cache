@@ -121,6 +121,22 @@ func Connect(ctx context.Context, cfg *config.Config, version string, op Op, log
 	return nil, fmt.Errorf("Connect: %w: gave up replacing mismatched daemon", ErrNoDaemon)
 }
 
+// respawnAfter is how long to keep dialing a daemon we started before starting
+// another one.
+//
+// A daemon can exit for a reason that has already cleared by the time we notice:
+// a predecessor mid-shutdown removes its socket before it releases the index
+// lock, so a daemon spawned inside that window loses the lock and exits quietly,
+// and it is the only one anybody was going to start. Waiting out the whole
+// backoff ladder on a socket that will never appear costs the build its cache and
+// ends in direct mode. The window is milliseconds wide, so trying again shortly
+// is enough.
+const respawnAfter = 600 * time.Millisecond
+
+// maxSpawns bounds the retries, so an index that genuinely cannot be opened
+// produces a handful of short-lived processes rather than a fork storm.
+const maxSpawns = 4
+
 // dialOrSpawn connects to a running daemon, starting one if needed.
 func dialOrSpawn(ctx context.Context, cfg *config.Config, logf cache.Logf) (*Conn, error) {
 	if conn, err := net.Dial("unix", cfg.SocketPath()); err == nil {
@@ -129,6 +145,8 @@ func dialOrSpawn(ctx context.Context, cfg *config.Config, logf cache.Logf) (*Con
 	if err := spawn(cfg, logf); err != nil {
 		return nil, fmt.Errorf("dialOrSpawn: %w", err)
 	}
+	spawns := 1
+	var sinceSpawn time.Duration
 	var lastErr error
 	for _, d := range spawnBackoff {
 		select {
@@ -141,8 +159,19 @@ func dialOrSpawn(ctx context.Context, cfg *config.Config, logf cache.Logf) (*Con
 			return newConn(conn), nil
 		}
 		lastErr = err
+		sinceSpawn += d
+		if sinceSpawn < respawnAfter || spawns >= maxSpawns {
+			continue
+		}
+		// Retrying costs one fork against a daemon that is merely slow to bind:
+		// it loses the lock to the one already starting and exits.
+		if serr := spawn(cfg, logf); serr != nil {
+			return nil, fmt.Errorf("dialOrSpawn: %w", serr)
+		}
+		spawns++
+		sinceSpawn = 0
 	}
-	return nil, fmt.Errorf("dialOrSpawn: %w: %v", ErrNoDaemon, lastErr)
+	return nil, fmt.Errorf("dialOrSpawn: %w after %d spawns: %v", ErrNoDaemon, spawns, lastErr)
 }
 
 // spawn starts a detached daemon.

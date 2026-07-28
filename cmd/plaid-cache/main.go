@@ -77,6 +77,8 @@ func (a *app) run() int {
 		return a.runStatus(ctx)
 	case "gc":
 		return a.runGC(ctx)
+	case "adopt":
+		return a.runAdopt(ctx)
 	case "clean":
 		return a.runClean(ctx)
 	case "version", "-v", "--version":
@@ -101,11 +103,17 @@ Usage:
   plaid-cache serve        run the cache daemon in the foreground
   plaid-cache status       report cache contents and counters
   plaid-cache gc           force one eviction pass
+  plaid-cache adopt DIR    import a go-cache-plugin stage into this cache
   plaid-cache clean        remove the entire local cache
   plaid-cache version      print build information
 
 The Go toolchain invokes the first form:
   GOCACHEPROG=plaid-cache go build ./...
+
+adopt imports an existing go-cache-plugin local stage: it reconstructs the
+action-to-output mapping from that stage's records and publishes its bodies by
+hardlink, so nothing is copied and the imported bytes count toward this cache's
+size ceiling.
 
 Both serve and gc accept -max-bytes and -ttl, which override the environment.
 On gc the override applies to that pass only, and is forwarded to a running

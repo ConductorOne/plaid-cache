@@ -372,3 +372,55 @@ func TestSpawnCreatesTheCacheDirectory(t *testing.T) {
 		}
 	}
 }
+
+// lockHeldFor is how long TestConnectRetriesWhenTheFirstSpawnLosesTheIndexLock
+// keeps the index, chosen to outlast the first retry and not the ladder.
+const lockHeldFor = 1200 * time.Millisecond
+
+// TestConnectRetriesWhenTheFirstSpawnLosesTheIndexLock pins that a client whose
+// daemon exits on a lock it could not take starts another one.
+//
+// This is the shape of every daemon handover rather than a corner case. A daemon
+// shutting down closes its listener first, which unlinks the socket, and releases
+// the index lock last, so a client that sees the socket vanish and immediately
+// spawns lands in a window where the new daemon cannot open the index and exits
+// quietly — as the real one does, since losing that race is normally how a spawn
+// storm resolves. Nothing else was going to start a daemon, so spawning once and
+// then only dialing spends the whole backoff ladder on a socket that will never
+// appear and hands the build to direct mode.
+//
+// Holding the index open here reproduces that window deterministically instead of
+// waiting for it to be lost under load, which is how it first showed up: the
+// version-replacement test failed only on a loaded two-core runner.
+func TestConnectRetriesWhenTheFirstSpawnLosesTheIndexLock(t *testing.T) {
+	cfg := newSpawnConfig(t)
+	t.Setenv(testDaemonVersionEnv, "v-test")
+
+	ix, err := index.Open(cfg.IndexDir())
+	if err != nil {
+		t.Fatalf("holding the index: %v", err)
+	}
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		time.Sleep(lockHeldFor)
+		_ = ix.Close()
+	}()
+	t.Cleanup(func() { <-released })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := Connect(ctx, cfg, "v-test", OpStatus, nil)
+	if err != nil {
+		t.Fatalf("Connect while the index lock was briefly held: %v\ndaemon log:\n%s", err, spawnLog(cfg))
+	}
+	defer conn.Close()
+
+	var st StatusResponse
+	if err := conn.ReadJSONLine(&st); err != nil {
+		t.Fatalf("status from the daemon that eventually started: %v", err)
+	}
+	if st.PID == 0 {
+		t.Fatal("no PID: no daemon took the index after it was released")
+	}
+}

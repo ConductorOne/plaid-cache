@@ -7,11 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
 	"time"
 
+	"github.com/conductorone/plaid-cache/internal/adopt"
 	"github.com/conductorone/plaid-cache/internal/blob"
 	"github.com/conductorone/plaid-cache/internal/cache"
 	"github.com/conductorone/plaid-cache/internal/config"
@@ -509,4 +511,59 @@ func writeLine(w io.Writer, v any) error {
 // the daemon's own removal of it.
 func waitGone(path string) error {
 	return daemon.WaitSocketGone(context.Background(), path)
+}
+
+// runAdopt imports a go-cache-plugin stage into this cache.
+//
+// It takes the index lock directly rather than going through a daemon, because
+// adoption is a migration step that runs before builds start. A daemon holding
+// the lock is reported plainly instead of being worked around: silently adopting
+// into a second index would leave two disagreeing views of the same bodies.
+func (a *app) runAdopt(ctx context.Context) int {
+	var dryRun bool
+	fs, err := a.parseFlagsAllowingArgs("adopt", func(f *flag.FlagSet) {
+		f.BoolVar(&dryRun, "dry-run", false, "report what would be adopted without writing anything")
+	}, a.args[1:])
+	if err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		return exitUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintf(a.stderr, "plaid-cache: adopt needs exactly one directory, the go-cache-plugin stage root\n")
+		return exitUsage
+	}
+	legacyDir := fs.Arg(0)
+
+	cfg, ok := a.loadConfig()
+	if !ok {
+		return exitError
+	}
+	st, err := openStores(ctx, cfg)
+	if err != nil {
+		if errors.Is(err, index.ErrLocked) {
+			fmt.Fprintf(a.stderr, "plaid-cache: a daemon owns the index; stop it before adopting\n")
+			return exitError
+		}
+		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		return exitError
+	}
+	defer st.close()
+
+	res, err := adopt.Run(ctx, adopt.Params{
+		LegacyDir: legacyDir,
+		Index:     st.idx,
+		Blobs:     st.blobs,
+		DryRun:    dryRun,
+		Logf:      a.logger(cfg, config.LogInfo),
+	})
+	if err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		return exitError
+	}
+	prefix := ""
+	if dryRun {
+		prefix = "would adopt: "
+	}
+	fmt.Fprintf(a.stdout, "%s%s\n", prefix, res)
+	return exitOK
 }

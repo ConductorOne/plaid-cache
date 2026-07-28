@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/conductorone/plaid-cache/internal/ids"
@@ -406,5 +407,123 @@ func TestDiskBytesNeverUndercountsLogicalSize(t *testing.T) {
 	}
 	if got < size {
 		t.Fatalf("Get diskBytes = %d, want >= %d (logical size)", got, size)
+	}
+}
+
+// TestAdoptHardlinksWithoutCopying pins that adopting an existing body costs no
+// additional disk.
+//
+// This is what makes taking over another cache's stage viable: the bodies are
+// already content-addressed identically, so a link publishes them under this
+// store's name for free. A copy would double 15 GB of stage on a volume that
+// also carries /tmp.
+func TestAdoptHardlinksWithoutCopying(t *testing.T) {
+	s := newStore(t)
+
+	src := filepath.Join(t.TempDir(), "legacy-body")
+	body := bytes.Repeat([]byte("adopt me"), 1024)
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatalf("writing source: %v", err)
+	}
+	id := sha256.Sum256(body)
+
+	path, db, linked, err := s.Adopt(id, src, int64(len(body)))
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if !linked {
+		t.Fatal("Adopt copied instead of linking on one filesystem")
+	}
+	if db <= 0 {
+		t.Fatalf("diskBytes = %d, want > 0", db)
+	}
+
+	// Same inode, so the bytes exist once.
+	var a, b syscall.Stat_t
+	if err := syscall.Stat(src, &a); err != nil {
+		t.Fatalf("stat src: %v", err)
+	}
+	if err := syscall.Stat(path, &b); err != nil {
+		t.Fatalf("stat adopted: %v", err)
+	}
+	if a.Ino != b.Ino {
+		t.Fatalf("inode %d != %d; Adopt did not hardlink", a.Ino, b.Ino)
+	}
+	if b.Nlink < 2 {
+		t.Fatalf("nlink = %d, want >= 2", b.Nlink)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading adopted body: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatal("adopted body does not match the source")
+	}
+}
+
+// TestAdoptSurvivesSourceRemoval pins that adoption is not a borrow: unlinking
+// the original leaves this store's copy intact.
+//
+// That is the property that makes it safe to adopt a stage the other cache is
+// still pruning — each side holds its own name, and the data lives until the
+// last one goes.
+func TestAdoptSurvivesSourceRemoval(t *testing.T) {
+	s := newStore(t)
+	src := filepath.Join(t.TempDir(), "doomed")
+	body := []byte("outlives its origin")
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatalf("writing source: %v", err)
+	}
+	id := sha256.Sum256(body)
+	if _, _, _, err := s.Adopt(id, src, int64(len(body))); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if err := os.Remove(src); err != nil {
+		t.Fatalf("removing source: %v", err)
+	}
+	p, _, err := s.Get(id)
+	if err != nil {
+		t.Fatalf("Get after the source was removed: %v", err)
+	}
+	got, err := os.ReadFile(p)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("adopted body lost when the source went away: %v", err)
+	}
+}
+
+// TestAdoptRejectsASizeMismatch pins that a record disagreeing with the file it
+// points at is refused, rather than publishing bytes under an address that may
+// not describe them.
+func TestAdoptRejectsASizeMismatch(t *testing.T) {
+	s := newStore(t)
+	src := filepath.Join(t.TempDir(), "body")
+	body := []byte("twelve bytes")
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatalf("writing source: %v", err)
+	}
+	id := sha256.Sum256(body)
+	if _, _, _, err := s.Adopt(id, src, int64(len(body))+1); err == nil {
+		t.Fatal("Adopt accepted a size that disagrees with the source")
+	}
+	if _, _, err := s.Get(id); err == nil {
+		t.Fatal("a rejected adoption still published a body")
+	}
+}
+
+// TestAdoptIsIdempotent pins that adopting the same body twice, as happens when
+// several actions share one output, succeeds both times.
+func TestAdoptIsIdempotent(t *testing.T) {
+	s := newStore(t)
+	src := filepath.Join(t.TempDir(), "shared")
+	body := []byte("shared by many actions")
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatalf("writing source: %v", err)
+	}
+	id := sha256.Sum256(body)
+	for i := range 3 {
+		if _, _, _, err := s.Adopt(id, src, int64(len(body))); err != nil {
+			t.Fatalf("Adopt #%d: %v", i+1, err)
+		}
 	}
 }

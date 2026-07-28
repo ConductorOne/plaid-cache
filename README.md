@@ -79,7 +79,47 @@ Run the daemon in the foreground, for a container or a supervised service:
 plaid-cache serve
 ```
 
-Subcommands are `serve`, `status`, `clean`, `gc`, and `version`.
+Subcommands are `serve`, `status`, `clean`, `gc`, `adopt`, and `version`.
+
+### Adopting an existing go-cache-plugin stage
+
+`plaid-cache` and [tailscale/go-cache-plugin](https://github.com/tailscale/go-cache-plugin)
+address bodies identically, so a local stage written by one is already laid out
+the way the other expects. `adopt` imports one:
+
+```sh
+plaid-cache adopt /path/to/go-cache-plugin/stage
+plaid-cache adopt -dry-run /path/to/go-cache-plugin/stage
+```
+
+It reconstructs the action-to-output mapping from that stage's own records — one
+file per action, named for the action id and containing the output id and size —
+and publishes the bodies by **hardlink**, so nothing is copied:
+
+```
+16836 records: 16836 adopted (16836 linked, 0 copied, 14.1 GiB), 0 already
+present, 0 missing bodies, 0 size mismatches, 0 malformed, in 2.4s
+```
+
+Hardlinking is what makes this safe to run against a stage the other cache is
+still using: each side holds its own name for one inode, so neither one's pruning
+can pull data out from under the other. It also means the imported bytes count
+toward this cache's size ceiling, which is the reason to adopt rather than simply
+point both tools at one directory — an index that does not know about the bodies
+cannot bound them.
+
+Recency is taken from the action file rather than the body. go-cache-plugin
+stamps a body it faults in from the remote tier with the time that content was
+originally produced, so an entry in daily use can have a months-old body; its own
+prune keys off the action file for the same reason. The body's time becomes the
+entry's creation time.
+
+Adoption needs the index, so stop any running daemon first. It is idempotent:
+records already indexed are left alone.
+
+Bodies are only linkable within one filesystem. Two mounts of the same ZFS
+dataset report the same device and still refuse a link, so a cross-device stage
+falls back to copying — the `linked` and `copied` counts say which happened.
 
 ### Overriding the limits
 
