@@ -49,6 +49,7 @@ plaid-cache clean
 
 ```
 directory   /home/you/.cache/plaid-cache
+config      /home/you/.config/plaid-cache/config
 entries     274 actions, 206 objects (1.33x dedup, 173.1 KiB avg)
 size        34.8 MiB of 64.0 MiB (54.4%, 29.2 MiB free)
 ttl         168h0m0s
@@ -159,10 +160,64 @@ Zero is a meaningful value for either limit and disables that constraint, so
 
 ## Configuration
 
-Configuration is environment variables only. There are no defaults for the bucket, region, prefix, or endpoint: leaving `PLAID_GOCACHE_S3_BUCKET` empty runs the cache entirely locally.
+Every setting has one name and one fallback chain: the environment, then the
+configuration file, then the default. There are no defaults for the bucket,
+region, prefix, or endpoint — leaving `PLAID_GOCACHE_S3_BUCKET` empty runs the
+cache entirely locally.
+
+### The configuration file
+
+Settings that should apply to every build go in a file, so that a shell profile is
+not the only place to put them:
+
+```sh
+$XDG_CONFIG_HOME/plaid-cache/config     # or ~/.config/plaid-cache/config
+```
+
+It is a list of `KEY=value` lines using **the same names as the environment**, so
+there is one vocabulary rather than two with a mapping in between — a setting moves
+between a shell and a file by copying the line:
+
+```sh
+# ~/.config/plaid-cache/config
+s3-bucket = my-bucket--usw2-az1--x-s3
+s3-region = us-west-2
+max-bytes = 50GiB
+ttl       = 168h
+```
+
+The shared `PLAID_GOCACHE_` prefix may be left off, keys are case-insensitive, and
+dashes read as underscores. Blank lines and `#` comments are ignored, a leading
+`export ` is tolerated, and a value may be quoted when its spacing matters.
+
+**The environment wins.** A file is a standing preference on one machine; a
+variable is a decision about the invocation in front of you, and a wrapper script
+or a CI job has no other way to express one.
+
+**A key outside the documented set is an error, not a warning**, as is a duplicate
+key or a line that is not `KEY=value`. The whole risk of a configuration file is a
+setting that looks applied and is not: a typo in a size ceiling that quietly
+reverted to the default would let the cache grow until it filled the disk, which is
+the failure this tool exists to prevent. `status` prints the file it read for the
+same reason.
+
+Note what that costs. The GOCACHEPROG plugin is one of the commands that reads this
+file, so a malformed file fails builds until it is fixed, the same way an
+unparseable `PLAID_GOCACHE_MAX_BYTES` already does. That is the deliberate trade:
+the error names the file, the line, and the offending key, and it is one edit to
+fix — where a silently-ignored file gives you a cache that is not the one you
+configured and no way to notice.
+
+An absent file is the normal case and not an error. `PLAID_GOCACHE_CONFIG` names
+one explicitly, and a file named that way must exist.
+
+`XDG_CACHE_HOME` is read from the environment only — it is the platform's setting
+rather than this tool's, and a file able to move every program's cache root would
+be a surprising amount of reach for this one to have.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
+| `PLAID_GOCACHE_CONFIG` | Configuration file to read, overriding the XDG lookup. A file named here must exist. | `$XDG_CONFIG_HOME/plaid-cache/config` |
 | `PLAID_GOCACHE_DIR` | Local cache root. | `$XDG_CACHE_HOME/plaid-cache`, else `os.UserCacheDir()/plaid-cache` |
 | `PLAID_GOCACHE_MAX_BYTES` | Local size ceiling. Accepts `50GB`, `1TiB`. | `20GB` |
 | `PLAID_GOCACHE_TTL` | Local entry TTL, as a Go duration. | `168h` |

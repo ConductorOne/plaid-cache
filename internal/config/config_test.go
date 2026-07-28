@@ -263,6 +263,7 @@ func clearEnv(t *testing.T) {
 		"PLAID_GOCACHE_DISABLE_EVICTION",
 		"PLAID_GOCACHE_DISABLE_DAEMON",
 		"PLAID_GOCACHE_LOG",
+		"PLAID_GOCACHE_COMPACT_AFTER",
 		"XDG_CACHE_HOME",
 	} {
 		// Setting to empty is equivalent to unset for every reader here,
@@ -270,4 +271,10 @@ func clearEnv(t *testing.T) {
 		// automatic restore.
 		t.Setenv(n, "")
 	}
+	// Point the configuration-file lookup at an empty directory. Clearing
+	// XDG_CONFIG_HOME would fall through to os.UserConfigDir and pick up the
+	// file on a developer's own machine, which is exactly the leak this
+	// clearing exists to prevent.
+	t.Setenv("PLAID_GOCACHE_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 }

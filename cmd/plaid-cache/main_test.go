@@ -42,10 +42,16 @@ func clearCacheEnv(t *testing.T) {
 		"PLAID_GOCACHE_S3_ENDPOINT_URL", "PLAID_GOCACHE_MIN_UPLOAD_SIZE",
 		"PLAID_GOCACHE_UPLOAD_CONCURRENCY", "PLAID_GOCACHE_IDLE_TIMEOUT",
 		"PLAID_GOCACHE_EVICT_INTERVAL", "PLAID_GOCACHE_DISABLE_EVICTION",
-		"PLAID_GOCACHE_DISABLE_DAEMON", "PLAID_GOCACHE_LOG", "XDG_CACHE_HOME",
+		"PLAID_GOCACHE_DISABLE_DAEMON", "PLAID_GOCACHE_LOG", "PLAID_GOCACHE_COMPACT_AFTER", "XDG_CACHE_HOME",
 	} {
 		t.Setenv(n, "")
 	}
+	// Point the configuration-file lookup at an empty directory. Clearing
+	// XDG_CONFIG_HOME would fall through to os.UserConfigDir and pick up the
+	// file on a developer's own machine, which is exactly the leak this
+	// clearing exists to prevent.
+	t.Setenv("PLAID_GOCACHE_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 }
 
 // TestVersionFlagWorks pins that `-v` prints build info and exits zero.
