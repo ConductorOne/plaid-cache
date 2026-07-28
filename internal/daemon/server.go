@@ -201,7 +201,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			}
 			// A transient accept failure — typically the process or system
 			// running out of descriptors — must not take the daemon down with
-			// it, because every build in the env depends on it. Back off and
+			// it, because every build on this machine depends on it. Back off and
 			// keep serving; give up only if it never clears.
 			acceptFails++
 			if acceptFails > maxAcceptFailures {

@@ -266,7 +266,7 @@ func (l *failingListener) attempts() int {
 // TestServeRetriesTransientAcceptErrors pins that a temporary accept failure
 // does not take the daemon down.
 //
-// Every build in the env depends on this one process, so treating a transient
+// Every build on this machine depends on this one process, so treating a transient
 // EMFILE as fatal would turn a brief descriptor shortage into a dead cache.
 func TestServeRetriesTransientAcceptErrors(t *testing.T) {
 	cfg := newTestConfig(t)
