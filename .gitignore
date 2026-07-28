@@ -1,0 +1,22 @@
+/bin/
+/dist/
+*.test
+*.out
+*.pprof
+*.prof
+/coverage/
+/.cache/
+/tmp/
+/vendor/
+.DS_Store
+
+# Local cache / index artifacts, in case a run is pointed at the repo root.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.sst
+LOCK
+MANIFEST-*
+/testdata-tmp/
+plaid-cache.sock
