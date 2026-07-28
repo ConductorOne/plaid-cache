@@ -278,18 +278,41 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 		maxBytes, ttl = d.MaxBytes, d.TTL
 	}
 	fmt.Fprintf(a.stdout, "directory   %s\n", cfg.Dir)
-	fmt.Fprintf(a.stdout, "actions     %d\n", actions)
-	fmt.Fprintf(a.stdout, "objects     %d\n", objects)
+
+	// Report the derived figures, not just the raw counts. Actions per object is
+	// the dedup ratio the output refcounting exists to produce, and the share of
+	// the budget in use is what says whether eviction is about to start biting.
+	if objects > 0 {
+		fmt.Fprintf(a.stdout, "entries     %d actions, %d objects (%.2fx dedup, %s avg)\n",
+			actions, objects, float64(actions)/float64(objects),
+			config.FormatBytes(diskBytes/objects))
+	} else {
+		fmt.Fprintf(a.stdout, "entries     %d actions, %d objects\n", actions, objects)
+	}
+
 	if maxBytes > 0 {
-		fmt.Fprintf(a.stdout, "size        %s of %s\n",
-			config.FormatBytes(diskBytes), config.FormatBytes(maxBytes))
+		pct := 100 * float64(diskBytes) / float64(maxBytes)
+		headroom := maxBytes - diskBytes
+		if headroom < 0 {
+			headroom = 0
+		}
+		fmt.Fprintf(a.stdout, "size        %s of %s (%.1f%%, %s free)\n",
+			config.FormatBytes(diskBytes), config.FormatBytes(maxBytes), pct,
+			config.FormatBytes(headroom))
 	} else {
 		fmt.Fprintf(a.stdout, "size        %s (no limit)\n", config.FormatBytes(diskBytes))
 	}
+
 	if ttl != "" && ttl != "0s" {
 		fmt.Fprintf(a.stdout, "ttl         %s\n", ttl)
 	} else {
 		fmt.Fprintf(a.stdout, "ttl         none\n")
+	}
+
+	// The age span says whether the TTL is doing anything: if the oldest entry
+	// is younger than the TTL, only the size ceiling is evicting.
+	if d != nil && d.OldestAge != "" {
+		fmt.Fprintf(a.stdout, "age         oldest %s, newest %s\n", d.OldestAge, d.NewestAge)
 	}
 	if cfg.RemoteEnabled() {
 		fmt.Fprintf(a.stdout, "remote      s3://%s/%s\n", cfg.S3Bucket, cfg.S3Prefix)
@@ -302,9 +325,22 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 	}
 	fmt.Fprintf(a.stdout, "daemon      pid %d, up %s\n", d.PID, d.Uptime)
 	m := d.Metrics
+
+	// A hit rate is the one number worth reading first, and it is the one the
+	// caller would otherwise have to work out from three separate counters.
+	// Repairs are called out because a nonzero count means bodies went missing
+	// under the index, which is worth noticing rather than burying.
+	lookups := m.GetLocalHit + m.GetRemoteHit + m.GetMiss
+	if lookups > 0 {
+		fmt.Fprintf(a.stdout, "hit rate    %.1f%% of %d lookups\n",
+			100*float64(m.GetLocalHit+m.GetRemoteHit)/float64(lookups), lookups)
+	}
 	fmt.Fprintf(a.stdout, "hits        %d local, %d remote\n", m.GetLocalHit, m.GetRemoteHit)
 	fmt.Fprintf(a.stdout, "misses      %d\n", m.GetMiss)
 	fmt.Fprintf(a.stdout, "puts        %d\n", m.Put)
+	if m.GetRepair > 0 {
+		fmt.Fprintf(a.stdout, "repairs     %d (index entries dropped for missing bodies)\n", m.GetRepair)
+	}
 	if cfg.RemoteEnabled() {
 		fmt.Fprintf(a.stdout, "uploads     %d ok, %d failed, %d dropped, %d skipped\n",
 			m.UploadOK, m.UploadFail, m.UploadDrop, m.UploadSkip)

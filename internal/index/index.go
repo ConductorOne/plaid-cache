@@ -491,3 +491,44 @@ func (ix *Index) getCopy(key []byte) ([]byte, bool, error) {
 	copy(out, v)
 	return out, true, closer.Close()
 }
+
+// AgeSpan reports the last-used timestamps of the least and most recently used
+// entries, in Unix nanoseconds. ok is false when the index is empty.
+//
+// It is two seeks rather than a scan: the LRU keyspace is ordered by timestamp,
+// so the first and last keys under that prefix are the extremes by
+// construction. That is what makes it cheap enough for a status command to call
+// on every invocation.
+func (ix *Index) AgeSpan() (oldest, newest int64, ok bool, err error) {
+	if ix.closed.Load() {
+		return 0, 0, false, fmt.Errorf("AgeSpan: %w", ErrClosed)
+	}
+	lower, upper := prefixRange(prefixLRU)
+	iter, err := ix.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("AgeSpan: %w", err)
+	}
+	defer func() {
+		if cerr := iter.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("AgeSpan: close iterator: %w", cerr)
+		}
+	}()
+
+	if !iter.First() {
+		return 0, 0, false, nil
+	}
+	oldest, _, err = parseLRUKey(iter.Key())
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("AgeSpan: %w", err)
+	}
+	if !iter.Last() {
+		// A valid First with no Last cannot happen, but treat the single-entry
+		// case explicitly rather than returning a zero newest.
+		return oldest, oldest, true, nil
+	}
+	newest, _, err = parseLRUKey(iter.Key())
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("AgeSpan: %w", err)
+	}
+	return oldest, newest, true, nil
+}

@@ -45,6 +45,34 @@ plaid-cache gc
 plaid-cache clean
 ```
 
+`status` summarises what is in the cache and how close it is to being evicted:
+
+```
+directory   /home/you/.cache/plaid-cache
+entries     274 actions, 206 objects (1.33x dedup, 173.1 KiB avg)
+size        34.8 MiB of 64.0 MiB (54.4%, 29.2 MiB free)
+ttl         168h0m0s
+age         oldest 4s, newest 1s
+remote      s3://example-bucket--usw2-az1--x-s3/arm64
+daemon      pid 195247, up 4s
+hit rate    59.6% of 344 lookups
+hits        205 local, 0 remote
+misses      139
+puts        275
+uploads     205 ok, 0 failed, 0 dropped, 0 skipped
+```
+
+Two of those lines answer questions the raw counters do not. The dedup ratio is
+actions per stored body, which is what refcounting outputs buys: many actions
+resolve to one object. The age span is the last-used time of the least and most
+recently used entries, so an oldest age well under the TTL means only the size
+ceiling is currently evicting anything.
+
+`status` reads from the running daemon when there is one, since it holds the
+index and the live counters, and opens the index directly when there is not. It
+never starts a daemon just to answer a question, so the metrics lines are absent
+when nothing is running.
+
 Run the daemon in the foreground, for a container or a supervised service:
 
 ```sh

@@ -412,3 +412,66 @@ func statsAt(t *testing.T, cfg *config.Config) index.Stats {
 	}
 	return s
 }
+
+// TestStatusReportsDerivedFigures pins that the summary does the arithmetic for
+// the reader rather than printing raw counters.
+//
+// Dedup ratio is the property output refcounting exists to produce, and the
+// share of the budget in use is what says whether eviction is about to bite;
+// both are useless if the caller has to compute them from other lines.
+func TestStatusReportsDerivedFigures(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Dir: dir, MaxBytes: 64 << 20, TTL: time.Hour,
+		TouchGranularity: time.Hour, UploadConcurrency: 1,
+	}
+	// Two actions sharing one output, so the dedup ratio is not 1.00x.
+	body := bytes.Repeat([]byte("d"), 4096)
+	func() {
+		idx, err := index.Open(cfg.IndexDir())
+		if err != nil {
+			t.Fatalf("index.Open: %v", err)
+		}
+		defer func() { _ = idx.Close() }()
+		blobs, err := blob.Open(cfg.BlobDir())
+		if err != nil {
+			t.Fatalf("blob.Open: %v", err)
+		}
+		c := cache.New(cache.Params{
+			Config: cfg, Index: idx, Blobs: blobs, Remote: remote.Noop{},
+			Logf: func(string, ...any) {},
+		})
+		o := ids.OutputID(sha256.Sum256(body))
+		for _, tag := range []string{"one", "two"} {
+			a := ids.ActionID(sha256.Sum256([]byte(tag)))
+			if _, err := c.Put(context.Background(), a, o, bytes.NewReader(body), int64(len(body))); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+		if err := c.Close(); err != nil {
+			t.Fatalf("cache.Close: %v", err)
+		}
+	}()
+
+	clearCacheEnv(t)
+	t.Setenv("PLAID_GOCACHE_DIR", dir)
+	t.Setenv("PLAID_GOCACHE_MAX_BYTES", "64MiB")
+	var out, errb bytes.Buffer
+	if code := (&app{args: []string{"status"}, stdin: strings.NewReader(""), stdout: &out, stderr: &errb}).run(); code != exitOK {
+		t.Fatalf("run(status) = %d (stderr: %s)", code, &errb)
+	}
+
+	got := out.String()
+	for _, want := range []string{
+		"2 actions, 1 objects", // the counts
+		"2.00x dedup",          // derived: two actions per stored body
+		"avg",                  // derived: average object size
+		"of 64.0 MiB",          // the ceiling
+		"free",                 // derived: headroom
+		"%",                    // derived: share of budget
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("status output missing %q:\n%s", want, got)
+		}
+	}
+}

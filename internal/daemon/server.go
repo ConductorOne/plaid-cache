@@ -409,6 +409,13 @@ func (s *Server) status() StatusResponse {
 		return r
 	}
 	r.Actions, r.Objects, r.DiskBytes = st.Actions, st.Objects, st.DiskBytes
+	if oldest, newest, ok, err := s.idx.AgeSpan(); err != nil {
+		s.logf("age span: %v", err)
+	} else if ok {
+		now := time.Now()
+		r.OldestAge = now.Sub(time.Unix(0, oldest)).Round(time.Second).String()
+		r.NewestAge = now.Sub(time.Unix(0, newest)).Round(time.Second).String()
+	}
 	return r
 }
 

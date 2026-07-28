@@ -66,6 +66,8 @@ type StatusResponse struct {
 	MaxBytes  int64                 `json:"max_bytes"`
 	TTL       string                `json:"ttl"`
 	Uptime    string                `json:"uptime"`
+	OldestAge string                `json:"oldest_age,omitempty"`
+	NewestAge string                `json:"newest_age,omitempty"`
 	Metrics   cache.MetricsSnapshot `json:"metrics"`
 	Err       string                `json:"err,omitempty"`
 }
