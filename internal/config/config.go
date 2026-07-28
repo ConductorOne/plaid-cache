@@ -1,14 +1,19 @@
 // Copyright 2026 The plaid-cache authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package config resolves plaid-cache's runtime configuration from the
-// environment.
+// Package config resolves plaid-cache's runtime configuration.
 //
-// Every setting has exactly one environment variable and a documented
-// fallback chain. There are deliberately no option structs and no
-// configuration file: the tool is executed by the Go toolchain as a
-// GOCACHEPROG plugin, which offers no way to pass flags, so the environment
-// is the only channel that reaches every invocation.
+// Every setting has exactly one name and a documented fallback chain: the
+// process environment, then the configuration file, then the default. The
+// environment comes first because the tool is executed by the Go toolchain as a
+// GOCACHEPROG plugin, which offers no way to pass flags — the environment is the
+// only channel that reaches every invocation, so it has to be able to override a
+// file a user wrote months ago and forgot.
+//
+// The file exists because that same constraint makes settings awkward to apply
+// otherwise: a user who wants a bucket for every build has nowhere to put it but
+// a shell profile. It uses the same names as the environment, so there is one
+// vocabulary to learn rather than two with a mapping between them.
 //
 // Unparseable values are a hard error rather than a silent fallback to the
 // default. A typo in PLAID_GOCACHE_MAX_BYTES that quietly disabled the size
@@ -57,6 +62,11 @@ func (l LogLevel) String() string {
 
 // Config is the fully resolved configuration for one plaid-cache process.
 type Config struct {
+	// ConfigFile is the file settings were read from, empty when there was
+	// none. It is reported by status: a setting coming from a file nobody
+	// remembers writing is otherwise hard to account for.
+	ConfigFile string
+
 	// Dir is the local cache root. It holds the body store, the index, the
 	// daemon socket, and the daemon log.
 	Dir string
@@ -141,59 +151,204 @@ const (
 	defaultCompactAfter     = 1000
 )
 
-// Load resolves configuration from the process environment.
+// Load resolves configuration from the environment and the configuration file.
 func Load() (*Config, error) {
-	dir, err := resolveDir()
+	file, path, err := loadFile()
+	if err != nil {
+		return nil, fmt.Errorf("Load: %w", err)
+	}
+	// The environment wins. A file is a set of defaults for a user's machine; a
+	// variable is a decision about the invocation in front of you, and one that
+	// a wrapper script or a CI job has no other way to express.
+	src := func(name string) string {
+		if v, ok := os.LookupEnv(name); ok && v != "" {
+			return v
+		}
+		return file[name]
+	}
+
+	dir, err := resolveDir(src)
 	if err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
 
 	c := &Config{
+		ConfigFile:        path,
 		Dir:               dir,
-		S3Bucket:          os.Getenv("PLAID_GOCACHE_S3_BUCKET"),
-		S3Region:          os.Getenv("PLAID_GOCACHE_S3_REGION"),
-		S3Prefix:          os.Getenv("PLAID_GOCACHE_S3_PREFIX"),
-		S3EndpointURL:     os.Getenv("PLAID_GOCACHE_S3_ENDPOINT_URL"),
+		S3Bucket:          src("PLAID_GOCACHE_S3_BUCKET"),
+		S3Region:          src("PLAID_GOCACHE_S3_REGION"),
+		S3Prefix:          src("PLAID_GOCACHE_S3_PREFIX"),
+		S3EndpointURL:     src("PLAID_GOCACHE_S3_ENDPOINT_URL"),
 		UploadConcurrency: runtime.NumCPU(),
 	}
 
-	if c.MaxBytes, err = envBytes("PLAID_GOCACHE_MAX_BYTES", defaultMaxBytes); err != nil {
+	if c.MaxBytes, err = envBytes(src, "PLAID_GOCACHE_MAX_BYTES", defaultMaxBytes); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
-	if c.TTL, err = envDuration("PLAID_GOCACHE_TTL", defaultTTL); err != nil {
+	if c.TTL, err = envDuration(src, "PLAID_GOCACHE_TTL", defaultTTL); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
-	if c.TouchGranularity, err = envDuration("PLAID_GOCACHE_TOUCH_GRANULARITY", defaultTouchGranularity); err != nil {
+	if c.TouchGranularity, err = envDuration(src, "PLAID_GOCACHE_TOUCH_GRANULARITY", defaultTouchGranularity); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
-	if c.MinUploadSize, err = envBytes("PLAID_GOCACHE_MIN_UPLOAD_SIZE", defaultMinUploadSize); err != nil {
+	if c.MinUploadSize, err = envBytes(src, "PLAID_GOCACHE_MIN_UPLOAD_SIZE", defaultMinUploadSize); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
-	if c.IdleTimeout, err = envDuration("PLAID_GOCACHE_IDLE_TIMEOUT", defaultIdleTimeout); err != nil {
+	if c.IdleTimeout, err = envDuration(src, "PLAID_GOCACHE_IDLE_TIMEOUT", defaultIdleTimeout); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
-	if c.EvictInterval, err = envDuration("PLAID_GOCACHE_EVICT_INTERVAL", defaultEvictInterval); err != nil {
+	if c.EvictInterval, err = envDuration(src, "PLAID_GOCACHE_EVICT_INTERVAL", defaultEvictInterval); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
-	if c.CompactAfterPruned, err = envBytes("PLAID_GOCACHE_COMPACT_AFTER", defaultCompactAfter); err != nil {
+	if c.CompactAfterPruned, err = envBytes(src, "PLAID_GOCACHE_COMPACT_AFTER", defaultCompactAfter); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
-	if c.UploadConcurrency, err = envInt("PLAID_GOCACHE_UPLOAD_CONCURRENCY", runtime.NumCPU()); err != nil {
+	if c.UploadConcurrency, err = envInt(src, "PLAID_GOCACHE_UPLOAD_CONCURRENCY", runtime.NumCPU()); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
 	if c.UploadConcurrency < 1 {
 		return nil, fmt.Errorf("Load: PLAID_GOCACHE_UPLOAD_CONCURRENCY: got %d, want >= 1", c.UploadConcurrency)
 	}
-	if c.DisableEviction, err = envBool("PLAID_GOCACHE_DISABLE_EVICTION"); err != nil {
+	if c.DisableEviction, err = envBool(src, "PLAID_GOCACHE_DISABLE_EVICTION"); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
-	if c.DisableDaemon, err = envBool("PLAID_GOCACHE_DISABLE_DAEMON"); err != nil {
+	if c.DisableDaemon, err = envBool(src, "PLAID_GOCACHE_DISABLE_DAEMON"); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
-	if c.Log, err = envLogLevel("PLAID_GOCACHE_LOG", LogError); err != nil {
+	if c.Log, err = envLogLevel(src, "PLAID_GOCACHE_LOG", LogError); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
 	return c, nil
+}
+
+// source resolves one setting by name, returning "" when nothing sets it.
+type source func(name string) string
+
+// configFileEnvVar names a configuration file explicitly, overriding the
+// XDG lookup. A file named this way must exist: a caller who points at a path
+// has stated it matters, and silently ignoring a typo would apply a
+// configuration they did not ask for.
+const configFileEnvVar = "PLAID_GOCACHE_CONFIG"
+
+// configFileName is the file's name inside its directory.
+const configFileName = "config"
+
+// settingNames are the keys a configuration file may set.
+//
+// A key outside this set is an error rather than a warning. The whole risk of a
+// configuration file is a setting that looks applied and is not, and a typo in a
+// size ceiling that silently reverts to the default would let the cache grow
+// until it filled the disk — the failure this tool exists to prevent.
+var settingNames = map[string]bool{
+	"PLAID_GOCACHE_DIR":                true,
+	"PLAID_GOCACHE_MAX_BYTES":          true,
+	"PLAID_GOCACHE_TTL":                true,
+	"PLAID_GOCACHE_S3_BUCKET":          true,
+	"PLAID_GOCACHE_S3_REGION":          true,
+	"PLAID_GOCACHE_S3_PREFIX":          true,
+	"PLAID_GOCACHE_S3_ENDPOINT_URL":    true,
+	"PLAID_GOCACHE_MIN_UPLOAD_SIZE":    true,
+	"PLAID_GOCACHE_UPLOAD_CONCURRENCY": true,
+	"PLAID_GOCACHE_TOUCH_GRANULARITY":  true,
+	"PLAID_GOCACHE_IDLE_TIMEOUT":       true,
+	"PLAID_GOCACHE_EVICT_INTERVAL":     true,
+	"PLAID_GOCACHE_COMPACT_AFTER":      true,
+	"PLAID_GOCACHE_DISABLE_EVICTION":   true,
+	"PLAID_GOCACHE_DISABLE_DAEMON":     true,
+	"PLAID_GOCACHE_LOG":                true,
+}
+
+// ConfigFilePath returns where the configuration file is looked for, whether or
+// not one is there.
+func ConfigFilePath() (string, error) {
+	if p := os.Getenv(configFileEnvVar); p != "" {
+		return filepath.Abs(p)
+	}
+	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
+		return filepath.Join(d, "plaid-cache", configFileName), nil
+	}
+	d, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("ConfigFilePath: %w", err)
+	}
+	return filepath.Join(d, "plaid-cache", configFileName), nil
+}
+
+// loadFile reads the configuration file and returns its settings and the path
+// they came from.
+//
+// An absent file is the normal case and not an error, unless the caller named
+// one explicitly.
+func loadFile() (map[string]string, string, error) {
+	path, err := ConfigFilePath()
+	if err != nil {
+		return nil, "", err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) && os.Getenv(configFileEnvVar) == "" {
+			return nil, "", nil
+		}
+		return nil, "", fmt.Errorf("loadFile: %s: %w", path, err)
+	}
+	vals, err := parseFile(string(b))
+	if err != nil {
+		return nil, "", fmt.Errorf("loadFile: %s: %w", path, err)
+	}
+	return vals, path, nil
+}
+
+// parseFile reads KEY=value lines, the same names the environment uses.
+//
+// Using one vocabulary rather than a file schema and a mapping between them is
+// the point: what a user reads in the documentation is what they write in the
+// file, and a setting can be moved between a shell and a file by copying the
+// line. The PLAID_GOCACHE_ prefix may be left off, since repeating it on every
+// line of a file that is already about plaid-cache is only noise.
+func parseFile(text string) (map[string]string, error) {
+	vals := map[string]string{}
+	for n, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("line %d: %q is not KEY=value", n+1, raw)
+		}
+		key := normalizeKey(k)
+		if !settingNames[key] {
+			return nil, fmt.Errorf("line %d: unknown setting %q", n+1, strings.TrimSpace(k))
+		}
+		if _, dup := vals[key]; dup {
+			// Last-wins would leave one of two contradictory lines silently
+			// dead, and a reader no way to tell which.
+			return nil, fmt.Errorf("line %d: %s is set twice", n+1, key)
+		}
+		vals[key] = unquote(strings.TrimSpace(v))
+	}
+	return vals, nil
+}
+
+// normalizeKey accepts the spellings a person actually writes: any case, dashes
+// for underscores, and the shared prefix left off.
+func normalizeKey(k string) string {
+	key := strings.ToUpper(strings.TrimSpace(k))
+	key = strings.ReplaceAll(key, "-", "_")
+	if !strings.HasPrefix(key, "PLAID_GOCACHE_") {
+		key = "PLAID_GOCACHE_" + key
+	}
+	return key
+}
+
+// unquote strips one layer of matching quotes, so a value with trailing spaces
+// can be written deliberately.
+func unquote(v string) string {
+	if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
+		return v[1 : len(v)-1]
+	}
+	return v
 }
 
 // BlobDir is the root of the content-addressed body store.
@@ -248,8 +403,12 @@ func (c *Config) RemoteEnabled() bool { return c.S3Bucket != "" }
 
 // resolveDir returns the local cache root, honoring the documented chain:
 // PLAID_GOCACHE_DIR, then XDG_CACHE_HOME, then os.UserCacheDir.
-func resolveDir() (string, error) {
-	if d := os.Getenv("PLAID_GOCACHE_DIR"); d != "" {
+//
+// XDG_CACHE_HOME is read from the environment only. It is the platform's
+// setting, not this tool's, and a file that could move every program's cache
+// root would be a surprising thing for this file to be able to do.
+func resolveDir(src source) (string, error) {
+	if d := src("PLAID_GOCACHE_DIR"); d != "" {
 		abs, err := filepath.Abs(d)
 		if err != nil {
 			return "", fmt.Errorf("resolveDir: PLAID_GOCACHE_DIR: %w", err)
@@ -267,8 +426,8 @@ func resolveDir() (string, error) {
 }
 
 // envDuration reads a Go duration, e.g. "168h" or "90m".
-func envDuration(name string, def time.Duration) (time.Duration, error) {
-	v := os.Getenv(name)
+func envDuration(src source, name string, def time.Duration) (time.Duration, error) {
+	v := src(name)
 	if v == "" {
 		return def, nil
 	}
@@ -283,8 +442,8 @@ func envDuration(name string, def time.Duration) (time.Duration, error) {
 }
 
 // envInt reads a plain integer.
-func envInt(name string, def int) (int, error) {
-	v := os.Getenv(name)
+func envInt(src source, name string, def int) (int, error) {
+	v := src(name)
 	if v == "" {
 		return def, nil
 	}
@@ -298,8 +457,8 @@ func envInt(name string, def int) (int, error) {
 // envBool treats only "1" as true and only "" or "0" as false, rejecting
 // anything else. Accepting "false" but silently ignoring "no" is the kind of
 // near-miss that makes a disable flag appear not to work.
-func envBool(name string) (bool, error) {
-	switch v := os.Getenv(name); v {
+func envBool(src source, name string) (bool, error) {
+	switch v := src(name); v {
 	case "", "0":
 		return false, nil
 	case "1":
@@ -310,8 +469,8 @@ func envBool(name string) (bool, error) {
 }
 
 // envLogLevel reads a log level name.
-func envLogLevel(name string, def LogLevel) (LogLevel, error) {
-	switch v := os.Getenv(name); v {
+func envLogLevel(src source, name string, def LogLevel) (LogLevel, error) {
+	switch v := src(name); v {
 	case "":
 		return def, nil
 	case "off":
@@ -341,8 +500,8 @@ var byteUnits = []struct {
 }
 
 // envBytes reads a byte quantity, accepting a bare integer or a suffixed one.
-func envBytes(name string, def int64) (int64, error) {
-	v := strings.TrimSpace(os.Getenv(name))
+func envBytes(src source, name string, def int64) (int64, error) {
+	v := strings.TrimSpace(src(name))
 	if v == "" {
 		return def, nil
 	}

@@ -289,6 +289,9 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 		maxBytes, ttl = d.MaxBytes, d.TTL
 	}
 	fmt.Fprintf(a.stdout, "directory   %s\n", cfg.Dir)
+	if cfg.ConfigFile != "" {
+		fmt.Fprintf(a.stdout, "config      %s\n", cfg.ConfigFile)
+	}
 
 	// Report the derived figures, not just the raw counts. Actions per object is
 	// the dedup ratio the output refcounting exists to produce, and the share of
