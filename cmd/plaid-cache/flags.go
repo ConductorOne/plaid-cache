@@ -89,6 +89,17 @@ func (l *limitFlags) gcParams() (*daemon.GCParams, error) {
 	return p, nil
 }
 
+// parseFlagsAllowingArgs is parseFlags for subcommands that take operands.
+func (a *app) parseFlagsAllowingArgs(name string, register func(*flag.FlagSet), args []string) (*flag.FlagSet, error) {
+	fs := flag.NewFlagSet("plaid-cache "+name, flag.ContinueOnError)
+	fs.SetOutput(a.stderr)
+	register(fs)
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	return fs, nil
+}
+
 // parseFlags parses a subcommand's arguments.
 //
 // Errors and usage go to the app's stderr rather than os.Stderr so tests can
