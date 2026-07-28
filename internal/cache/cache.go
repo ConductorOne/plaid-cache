@@ -42,6 +42,12 @@ type Cache struct {
 	logf    Logf
 	uploads *uploader
 	metrics Metrics
+
+	// prunedSinceCompact is the tombstone debt built up since the last
+	// compaction, counted across passes rather than within one: a thousand
+	// small evictions leave as many tombstones as a single large one, and a
+	// per-pass threshold would never fire for the eviction ticker.
+	prunedSinceCompact atomic.Int64
 }
 
 // Metrics counts what happened, for the status command and the daemon log.
@@ -57,6 +63,7 @@ type Metrics struct {
 	UploadFail   atomic.Int64
 	UploadDrop   atomic.Int64
 	UploadSkip   atomic.Int64
+	Compactions  atomic.Int64
 }
 
 // MetricsSnapshot is a value copy of Metrics for reporting.
@@ -70,6 +77,7 @@ type MetricsSnapshot struct {
 	UploadFail   int64 `json:"upload_fail"`
 	UploadDrop   int64 `json:"upload_drop"`
 	UploadSkip   int64 `json:"upload_skip"`
+	Compactions  int64 `json:"compactions"`
 }
 
 // Snapshot returns a consistent-enough copy of the counters.
@@ -84,6 +92,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		UploadFail:   m.UploadFail.Load(),
 		UploadDrop:   m.UploadDrop.Load(),
 		UploadSkip:   m.UploadSkip.Load(),
+		Compactions:  m.Compactions.Load(),
 	}
 }
 
@@ -295,7 +304,45 @@ func (c *Cache) Evict(ctx context.Context) (index.EvictResult, error) {
 	if err != nil {
 		return res, fmt.Errorf("Evict: %w", err)
 	}
+	c.maybeCompact(res.ActionsPruned)
 	return res, nil
+}
+
+// compactAfterPruned is the default tombstone debt that triggers a compaction.
+//
+// Deletes in an LSM are writes: a pass that prunes the index makes it larger,
+// and Pebble's own background compactions are driven by level fill, which a
+// small index never reaches. Measured on a 3076-entry index, evicting 99.6% of
+// it grew the index from 0.63 MiB to 0.82 MiB and 30 seconds of idle time
+// reclaimed nothing, while an explicit compaction took it to 0.01 MiB.
+const compactAfterPruned = 1000
+
+// maybeCompact compacts the index once enough entries have been pruned.
+//
+// The threshold exists because compaction is synchronous and would otherwise
+// run on every tick of a cache sitting at its ceiling, where each pass prunes a
+// handful of entries. Only the caller that observes the debt crossing the
+// threshold and successfully resets it compacts, so concurrent passes cannot
+// both trigger one.
+func (c *Cache) maybeCompact(pruned int64) {
+	if pruned <= 0 {
+		return
+	}
+	threshold := c.cfg.CompactAfterPruned
+	if threshold <= 0 {
+		threshold = compactAfterPruned
+	}
+	n := c.prunedSinceCompact.Add(pruned)
+	if n < threshold || !c.prunedSinceCompact.CompareAndSwap(n, 0) {
+		return
+	}
+	start := time.Now()
+	if err := c.idx.Compact(); err != nil {
+		c.logf("compact: %v", err)
+		return
+	}
+	c.metrics.Compactions.Add(1)
+	c.logf("compacted the index after %d pruned entries in %v", n, time.Since(start).Round(time.Millisecond))
 }
 
 // Close waits for queued uploads to finish or time out. It does not close the

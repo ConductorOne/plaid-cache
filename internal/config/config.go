@@ -111,6 +111,12 @@ type Config struct {
 	// EvictInterval is how often the daemon runs an eviction pass.
 	EvictInterval time.Duration
 
+	// CompactAfterPruned is how many pruned entries must accumulate before the
+	// index is compacted. Deletes in an LSM are writes, so pruning grows the
+	// index until a compaction reclaims it, and Pebble's own background
+	// compactions are driven by level fill, which a small index never reaches.
+	CompactAfterPruned int64
+
 	// DisableEviction turns off the eviction ticker entirely. Intended for
 	// debugging; it reintroduces unbounded growth.
 	DisableEviction bool
@@ -132,6 +138,7 @@ const (
 	defaultMinUploadSize    = 0
 	defaultIdleTimeout      = 30 * time.Minute
 	defaultEvictInterval    = time.Minute
+	defaultCompactAfter     = 1000
 )
 
 // Load resolves configuration from the process environment.
@@ -166,6 +173,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
 	if c.EvictInterval, err = envDuration("PLAID_GOCACHE_EVICT_INTERVAL", defaultEvictInterval); err != nil {
+		return nil, fmt.Errorf("Load: %w", err)
+	}
+	if c.CompactAfterPruned, err = envBytes("PLAID_GOCACHE_COMPACT_AFTER", defaultCompactAfter); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
 	if c.UploadConcurrency, err = envInt("PLAID_GOCACHE_UPLOAD_CONCURRENCY", runtime.NumCPU()); err != nil {

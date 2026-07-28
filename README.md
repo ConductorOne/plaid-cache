@@ -98,6 +98,7 @@ Configuration is environment variables only. There are no defaults for the bucke
 | `PLAID_GOCACHE_TOUCH_GRANULARITY` | Relatime-style window for last-used updates. | `1h` |
 | `PLAID_GOCACHE_IDLE_TIMEOUT` | Daemon exits after this long with no connections. | `30m` |
 | `PLAID_GOCACHE_EVICT_INTERVAL` | Eviction ticker period. | `1m` |
+| `PLAID_GOCACHE_COMPACT_AFTER` | Pruned entries that must accumulate before the index is compacted. Deletes in an LSM are writes, so pruning grows the index until a compaction reclaims it. | `1000` |
 | `PLAID_GOCACHE_DISABLE_EVICTION` | `1` disables eviction entirely. | unset |
 | `PLAID_GOCACHE_DISABLE_DAEMON` | `1` forces direct in-process mode. | unset |
 | `PLAID_GOCACHE_LOG` | Verbosity: `off`, `error`, `info`, `debug`. | `error` |

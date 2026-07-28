@@ -225,6 +225,11 @@ func withMinUploadSize(n int64) option {
 	return func(c *config.Config) { c.MinUploadSize = n }
 }
 
+// withCompactAfter sets the pruned-entry debt that triggers a compaction.
+func withCompactAfter(n int64) option {
+	return func(c *config.Config) { c.CompactAfterPruned = n }
+}
+
 // withMaxBytes sets the eviction size ceiling.
 func withMaxBytes(n int64) option {
 	return func(c *config.Config) { c.MaxBytes = n }

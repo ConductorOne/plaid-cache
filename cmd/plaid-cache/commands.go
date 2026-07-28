@@ -341,6 +341,9 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 	if m.GetRepair > 0 {
 		fmt.Fprintf(a.stdout, "repairs     %d (index entries dropped for missing bodies)\n", m.GetRepair)
 	}
+	if m.Compactions > 0 {
+		fmt.Fprintf(a.stdout, "compactions %d (index reclaimed after pruning)\n", m.Compactions)
+	}
 	if cfg.RemoteEnabled() {
 		fmt.Fprintf(a.stdout, "uploads     %d ok, %d failed, %d dropped, %d skipped\n",
 			m.UploadOK, m.UploadFail, m.UploadDrop, m.UploadSkip)

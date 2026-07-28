@@ -122,3 +122,88 @@ func TestUnreadableBodyIsAMissAndKeepsTheIndexEntry(t *testing.T) {
 		t.Fatalf("index changed on a transient failure: %+v -> %+v", before, after)
 	}
 }
+
+// TestSmallEvictionsDoNotCompact pins that compaction is not run on every pass.
+//
+// Compaction is synchronous, and a cache sitting at its ceiling prunes a handful
+// of entries on every tick of the eviction timer. Compacting each time would
+// turn routine eviction into a stall.
+func TestSmallEvictionsDoNotCompact(t *testing.T) {
+	tc := newTestCache(t, withMaxBytes(1), withCompactAfter(1000))
+
+	for i := range 5 {
+		putSized(t, tc, byte(i), 4096)
+		if _, err := tc.cache.Evict(context.Background()); err != nil {
+			t.Fatalf("Evict: %v", err)
+		}
+	}
+	if got := tc.cache.Metrics().Compactions; got != 0 {
+		t.Fatalf("Compactions = %d after five small passes, want 0", got)
+	}
+}
+
+// TestAccumulatedPruningTriggersOneCompaction pins that the debt is counted
+// across passes, not within one.
+//
+// A thousand passes pruning one entry each leave as many tombstones as a single
+// pass pruning a thousand, so a per-pass threshold would never fire for the
+// eviction ticker — which is the path that does almost all of the pruning.
+func TestAccumulatedPruningTriggersOneCompaction(t *testing.T) {
+	const threshold = 4
+	tc := newTestCache(t, withMaxBytes(1), withCompactAfter(threshold))
+
+	// Each pass prunes exactly one entry, so only the accumulated count can
+	// cross the threshold.
+	for i := range threshold {
+		putSized(t, tc, byte(i), 4096)
+		res, err := tc.cache.Evict(context.Background())
+		if err != nil {
+			t.Fatalf("Evict: %v", err)
+		}
+		if res.ActionsPruned != 1 {
+			t.Fatalf("pass %d pruned %d actions, want 1", i, res.ActionsPruned)
+		}
+	}
+
+	if got := tc.cache.Metrics().Compactions; got != 1 {
+		t.Fatalf("Compactions = %d after %d single-entry passes, want exactly 1", got, threshold)
+	}
+
+	// The debt resets, so the next small pass does not compact again.
+	putSized(t, tc, 200, 4096)
+	if _, err := tc.cache.Evict(context.Background()); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	if got := tc.cache.Metrics().Compactions; got != 1 {
+		t.Fatalf("Compactions = %d after the debt reset, want it to stay 1", got)
+	}
+}
+
+// TestEvictWithNothingPrunedNeverCompacts pins that a no-op pass, which is what
+// most ticks of a cache under its ceiling are, costs nothing.
+func TestEvictWithNothingPrunedNeverCompacts(t *testing.T) {
+	tc := newTestCache(t, withCompactAfter(1))
+	for range 3 {
+		res, err := tc.cache.Evict(context.Background())
+		if err != nil {
+			t.Fatalf("Evict: %v", err)
+		}
+		if res.ActionsPruned != 0 {
+			t.Fatalf("pruned %d actions from an empty cache, want 0", res.ActionsPruned)
+		}
+	}
+	if got := tc.cache.Metrics().Compactions; got != 0 {
+		t.Fatalf("Compactions = %d with nothing pruned, want 0", got)
+	}
+}
+
+// putSized stores one body of a given size under a seed-derived action.
+func putSized(t *testing.T, tc *testCache, seed byte, size int) {
+	t.Helper()
+	body := bytes.Repeat([]byte{seed}, size)
+	o := ids.OutputID(sha256.Sum256(body))
+	a := ids.ActionID(sha256.Sum256([]byte{seed, 0xC0}))
+	if _, err := tc.cache.Put(context.Background(), a, o, bytes.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+}
