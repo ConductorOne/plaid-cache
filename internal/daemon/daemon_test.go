@@ -78,7 +78,7 @@ func newTestServer(t *testing.T, cfg *config.Config) *Server {
 	c := cache.New(cache.Params{Config: cfg, Index: ix, Blobs: blobs, Remote: remote.Noop{}})
 	t.Cleanup(func() { _ = c.Close() })
 
-	return NewServer(ServerParams{Config: cfg, Cache: c, Index: ix, Version: testVersion})
+	return NewServer(ServerParams{Config: cfg, Cache: c, Index: ix, Blobs: blobs, Version: testVersion})
 }
 
 // testServer is a Server running Serve on a real unix socket.

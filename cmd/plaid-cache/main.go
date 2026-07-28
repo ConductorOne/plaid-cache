@@ -113,7 +113,8 @@ The Go toolchain invokes the first form:
 adopt imports an existing go-cache-plugin local stage: it reconstructs the
 action-to-output mapping from that stage's records and publishes its bodies by
 hardlink, so nothing is copied and the imported bytes count toward this cache's
-size ceiling.
+size ceiling. It asks a running daemon to do the import, so a machine that is
+already building does not have to stop to migrate its old cache.
 
 Both serve and gc accept -max-bytes and -ttl, which override the environment.
 On gc the override applies to that pass only, and is forwarded to a running
