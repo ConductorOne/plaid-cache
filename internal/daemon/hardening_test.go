@@ -319,3 +319,90 @@ func TestServeGivesUpOnAPermanentlyFailingListener(t *testing.T) {
 		t.Fatal("Serve never gave up on a permanently failing listener")
 	}
 }
+
+// TestGCOverrideReachesTheDaemon pins the whole point of GCParams: a limit sent
+// with the request must apply, even though the daemon read its own
+// configuration at startup.
+//
+// Without this, a tighter ceiling asked for on the command line was silently
+// ignored by a running daemon, which reads as eviction being broken.
+func TestGCOverrideReachesTheDaemon(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.MaxBytes = 1 << 30 // the daemon's own ceiling: nothing should be pruned
+	cfg.TTL = time.Hour
+	srv := newTestServer(t, cfg)
+
+	body := bytes.Repeat([]byte("o"), 4096)
+	o := ids.OutputID(sha256.Sum256(body))
+	a := ids.ActionID(sha256.Sum256([]byte("override-action")))
+	putCached(t, srv, a, o, body)
+
+	// Without an override the daemon's generous ceiling prunes nothing.
+	if res := srv.gc(context.Background(), nil); res.ActionsPruned != 0 {
+		t.Fatalf("pruned %d with the daemon's own limits, want 0", res.ActionsPruned)
+	}
+
+	// With one, the pass uses the tighter ceiling.
+	tight := int64(1)
+	res := srv.gc(context.Background(), &GCParams{MaxBytes: &tight})
+	if res.Err != "" {
+		t.Fatalf("gc reported %q", res.Err)
+	}
+	if res.ActionsPruned != 1 {
+		t.Fatalf("pruned %d with max_bytes=1, want 1", res.ActionsPruned)
+	}
+	if res.AppliedMaxBytes != 1 {
+		t.Fatalf("AppliedMaxBytes = %d, want 1; the response must show what was applied", res.AppliedMaxBytes)
+	}
+
+	// The daemon's own policy is unchanged: the override was per pass.
+	if cfg.MaxBytes != 1<<30 {
+		t.Fatalf("the daemon's configured MaxBytes changed to %d; an override must not become policy", cfg.MaxBytes)
+	}
+}
+
+// TestGCOverrideRejectsABadTTL pins that a malformed duration is reported rather
+// than silently falling back to the daemon's TTL, which would prune differently
+// than the caller asked for without saying so.
+func TestGCOverrideRejectsABadTTL(t *testing.T) {
+	cfg := newTestConfig(t)
+	srv := newTestServer(t, cfg)
+
+	bad := "not-a-duration"
+	res := srv.gc(context.Background(), &GCParams{TTL: &bad})
+	if res.Err == "" {
+		t.Fatal("gc accepted a malformed ttl")
+	}
+	if !strings.Contains(res.Err, "not-a-duration") {
+		t.Fatalf("error %q does not name the offending value", res.Err)
+	}
+	if res.ActionsPruned != 0 {
+		t.Fatalf("pruned %d entries despite a rejected request", res.ActionsPruned)
+	}
+}
+
+// TestGCOverrideZeroDisablesAConstraint pins that an explicit zero is honoured
+// as "no constraint" rather than treated as unset.
+func TestGCOverrideZeroDisablesAConstraint(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.MaxBytes = 1 // the daemon would prune everything
+	cfg.TTL = time.Hour
+	srv := newTestServer(t, cfg)
+
+	body := bytes.Repeat([]byte("z"), 4096)
+	o := ids.OutputID(sha256.Sum256(body))
+	a := ids.ActionID(sha256.Sum256([]byte("zero-action")))
+	putCached(t, srv, a, o, body)
+
+	none := int64(0)
+	res := srv.gc(context.Background(), &GCParams{MaxBytes: &none})
+	if res.Err != "" {
+		t.Fatalf("gc reported %q", res.Err)
+	}
+	if res.ActionsPruned != 0 {
+		t.Fatalf("pruned %d with max_bytes=0, want 0: zero must disable the ceiling", res.ActionsPruned)
+	}
+	if res.AppliedMaxBytes != 0 {
+		t.Fatalf("AppliedMaxBytes = %d, want 0", res.AppliedMaxBytes)
+	}
+}

@@ -381,7 +381,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		_ = writeJSONLine(conn, s.status())
 	case OpGC:
 		_ = writeJSONLine(conn, HelloResponse{Version: s.version, OK: true})
-		_ = writeJSONLine(conn, s.gc(ctx))
+		_ = writeJSONLine(conn, s.gc(ctx, h.GC))
 	case OpShutdown:
 		_ = writeJSONLine(conn, HelloResponse{Version: s.version, OK: true})
 		s.logf("shutdown requested by client")
@@ -419,14 +419,34 @@ func (s *Server) status() StatusResponse {
 	return r
 }
 
-// gc forces an eviction pass.
-func (s *Server) gc(ctx context.Context) GCResponse {
-	res, err := s.cache.Evict(ctx)
+// gc forces an eviction pass, honouring any per-pass overrides the client sent.
+//
+// An override applies to this pass only; it does not change what the eviction
+// ticker will do next. That keeps a one-off "prune harder than usual" from
+// silently becoming the daemon's new policy.
+func (s *Server) gc(ctx context.Context, p *GCParams) GCResponse {
+	maxBytes, ttl := s.cfg.MaxBytes, s.cfg.TTL
+	if p != nil {
+		if p.MaxBytes != nil {
+			maxBytes = *p.MaxBytes
+		}
+		if p.TTL != nil {
+			d, perr := time.ParseDuration(*p.TTL)
+			if perr != nil {
+				return GCResponse{Err: fmt.Sprintf("gc: ttl %q: %v", *p.TTL, perr)}
+			}
+			ttl = d
+		}
+		s.logf("gc with overrides: max_bytes=%d ttl=%v", maxBytes, ttl)
+	}
+	res, err := s.cache.EvictWith(ctx, maxBytes, ttl)
 	r := GCResponse{
-		ActionsPruned: res.ActionsPruned,
-		ObjectsPruned: res.ObjectsPruned,
-		BytesFreed:    res.BytesFreed,
-		Elapsed:       res.Elapsed.Round(time.Millisecond).String(),
+		ActionsPruned:   res.ActionsPruned,
+		ObjectsPruned:   res.ObjectsPruned,
+		BytesFreed:      res.BytesFreed,
+		Elapsed:         res.Elapsed.Round(time.Millisecond).String(),
+		AppliedMaxBytes: maxBytes,
+		AppliedTTL:      ttl.String(),
 	}
 	if err != nil {
 		r.Err = err.Error()

@@ -293,7 +293,20 @@ func (c *Cache) Metrics() MetricsSnapshot { return c.metrics.Snapshot() }
 // Evict runs one eviction pass, removing orphaned bodies as the index
 // releases them.
 func (c *Cache) Evict(ctx context.Context) (index.EvictResult, error) {
-	res, err := c.idx.Evict(ctx, c.cfg.MaxBytes, c.cfg.TTL, time.Now().UnixNano(), func(o ids.OutputID) error {
+	return c.EvictWith(ctx, c.cfg.MaxBytes, c.cfg.TTL)
+}
+
+// EvictWith runs one eviction pass against explicit limits rather than the
+// configured ones.
+//
+// It exists so a caller can prune harder than the daemon's own settings for a
+// single pass. The daemon reads its configuration once at startup, so without
+// this the only way to apply a tighter ceiling was to restart it — and a
+// request that appeared to be ignored was easy to misread as eviction being
+// broken. Zero still means "no constraint" for either limit, so a caller can
+// deliberately drop one.
+func (c *Cache) EvictWith(ctx context.Context, maxBytes int64, ttl time.Duration) (index.EvictResult, error) {
+	res, err := c.idx.Evict(ctx, maxBytes, ttl, time.Now().UnixNano(), func(o ids.OutputID) error {
 		if rerr := c.blobs.Remove(o); rerr != nil {
 			// A body we cannot delete is a leak, not a correctness problem;
 			// keep pruning rather than aborting the whole pass.
@@ -302,7 +315,7 @@ func (c *Cache) Evict(ctx context.Context) (index.EvictResult, error) {
 		return nil
 	})
 	if err != nil {
-		return res, fmt.Errorf("Evict: %w", err)
+		return res, fmt.Errorf("EvictWith: %w", err)
 	}
 	c.maybeCompact(res.ActionsPruned)
 	return res, nil

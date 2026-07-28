@@ -94,9 +94,18 @@ func openStores(ctx context.Context, cfg *config.Config) (*stores, error) {
 
 // runServe runs the daemon in the foreground.
 func (a *app) runServe(ctx context.Context) int {
+	var limits limitFlags
+	if _, err := a.parseFlags("serve", limits.register, a.args[1:]); err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		return exitUsage
+	}
 	cfg, ok := a.loadConfig()
 	if !ok {
 		return exitError
+	}
+	if err := limits.applyTo(cfg); err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		return exitUsage
 	}
 	logf := a.logger(cfg, config.LogInfo)
 
@@ -352,12 +361,24 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 
 // runGC forces an eviction pass.
 func (a *app) runGC(ctx context.Context) int {
+	var limits limitFlags
+	if _, err := a.parseFlags("gc", limits.register, a.args[1:]); err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		return exitUsage
+	}
 	cfg, ok := a.loadConfig()
 	if !ok {
 		return exitError
 	}
+	params, err := limits.gcParams()
+	if err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		return exitUsage
+	}
 
-	if conn, err := dialExisting(cfg, buildVersion(), daemon.OpGC); err == nil {
+	// A running daemon reads its configuration once at startup, so an override
+	// has to travel with the request; otherwise it would appear to be ignored.
+	if conn, err := dialExistingGC(cfg, buildVersion(), params); err == nil {
 		defer conn.Close()
 		var resp daemon.GCResponse
 		if err := conn.ReadJSONLine(&resp); err != nil {
@@ -369,9 +390,19 @@ func (a *app) runGC(ctx context.Context) int {
 			return exitError
 		}
 		a.printGC(resp.ActionsPruned, resp.ObjectsPruned, resp.BytesFreed, resp.Elapsed)
+		if params != nil {
+			fmt.Fprintf(a.stdout, "applied      max-bytes %s, ttl %s (this pass only)\n",
+				config.FormatBytes(resp.AppliedMaxBytes), resp.AppliedTTL)
+		}
 		return exitOK
 	}
 
+	// No daemon: this process owns the index, so the flags simply override the
+	// configuration it is about to use.
+	if err := limits.applyTo(cfg); err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		return exitUsage
+	}
 	st, err := openStores(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
@@ -429,15 +460,26 @@ func (a *app) runClean(ctx context.Context) int {
 	return exitOK
 }
 
+// dialExistingGC is dialExisting for OpGC, carrying the per-pass overrides in
+// the hello so they reach a daemon that already read its own configuration.
+func dialExistingGC(cfg *config.Config, version string, params *daemon.GCParams) (*daemon.Conn, error) {
+	return dialExistingWith(cfg, daemon.Hello{Version: version, Op: daemon.OpGC, GC: params})
+}
+
 // dialExisting connects to a daemon that is already running, without
 // spawning one. Status, gc, and clean must not start a daemon as a side
 // effect of asking a question.
 func dialExisting(cfg *config.Config, version string, op daemon.Op) (*daemon.Conn, error) {
+	return dialExistingWith(cfg, daemon.Hello{Version: version, Op: op})
+}
+
+// dialExistingWith performs the control exchange for an already-composed hello.
+func dialExistingWith(cfg *config.Config, hello daemon.Hello) (*daemon.Conn, error) {
 	conn, err := daemon.Dial(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("dialExisting: %w", err)
 	}
-	if err := writeLine(conn, daemon.Hello{Version: version, Op: op}); err != nil {
+	if err := writeLine(conn, hello); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("dialExisting: %w", err)
 	}

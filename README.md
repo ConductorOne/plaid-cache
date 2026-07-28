@@ -81,6 +81,36 @@ plaid-cache serve
 
 Subcommands are `serve`, `status`, `clean`, `gc`, and `version`.
 
+### Overriding the limits
+
+The two eviction limits can be set by environment variable, or by flag on `serve`
+and `gc`. A flag wins over the environment, which wins over the default:
+
+```sh
+plaid-cache serve -max-bytes=50GiB -ttl=72h    # for the daemon's lifetime
+plaid-cache gc -max-bytes=1GiB                 # for one pass only
+```
+
+`gc` forwards the override to a running daemon rather than applying it locally,
+which matters because the daemon reads its configuration once at startup. Before
+this it would read its own, generous ceiling and prune nothing, and a request
+that appeared to be ignored was easy to misread as eviction being broken. The
+response reports the limits the pass actually applied:
+
+```
+$ plaid-cache gc -max-bytes=1MiB
+pruned 267 actions, 201 objects, freed 34.8 MiB in 12ms
+applied      max-bytes 1.0 MiB, ttl 168h0m0s (this pass only)
+```
+
+The override lasts for that pass. The daemon's own policy, and what its eviction
+ticker does next, are unchanged — a one-off sweep does not silently become the
+new configuration. To change the policy itself, restart the daemon with the flag
+or the environment variable set.
+
+Zero is a meaningful value for either limit and disables that constraint, so
+`-max-bytes=0` prunes on age alone and `-ttl=0` on size alone.
+
 ## Configuration
 
 Configuration is environment variables only. There are no defaults for the bucket, region, prefix, or endpoint: leaving `PLAID_GOCACHE_S3_BUCKET` empty runs the cache entirely locally.

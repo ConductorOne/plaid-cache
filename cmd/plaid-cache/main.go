@@ -107,6 +107,10 @@ Usage:
 The Go toolchain invokes the first form:
   GOCACHEPROG=plaid-cache go build ./...
 
+Both serve and gc accept -max-bytes and -ttl, which override the environment.
+On gc the override applies to that pass only, and is forwarded to a running
+daemon rather than being silently ignored by it.
+
 Configuration is read from the environment; see the README for the full list.
 `)
 }

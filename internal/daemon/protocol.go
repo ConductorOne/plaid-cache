@@ -48,6 +48,21 @@ type Hello struct {
 	Version string `json:"version"`
 
 	Op Op `json:"op"`
+
+	// GC carries per-pass eviction overrides for OpGC. Nil means use the
+	// daemon's own configuration.
+	GC *GCParams `json:"gc,omitempty"`
+}
+
+// GCParams overrides the daemon's eviction limits for a single pass.
+//
+// The fields are pointers because zero is a meaningful value for both — it
+// disables that constraint — so "unset" has to be distinguishable from "set to
+// zero". TTL is a string so it travels in the same Go duration syntax the
+// configuration uses, rather than as a bare count of nanoseconds.
+type GCParams struct {
+	MaxBytes *int64  `json:"max_bytes,omitempty"`
+	TTL      *string `json:"ttl,omitempty"`
 }
 
 // HelloResponse is the daemon's reply to Hello.
@@ -78,7 +93,13 @@ type GCResponse struct {
 	ObjectsPruned int64  `json:"objects_pruned"`
 	BytesFreed    int64  `json:"bytes_freed"`
 	Elapsed       string `json:"elapsed"`
-	Err           string `json:"err,omitempty"`
+
+	// The limits the pass actually applied, so a caller can see that an
+	// override took effect rather than having to infer it from the outcome.
+	AppliedMaxBytes int64  `json:"applied_max_bytes"`
+	AppliedTTL      string `json:"applied_ttl"`
+
+	Err string `json:"err,omitempty"`
 }
 
 // writeJSONLine emits one newline-delimited JSON value.
