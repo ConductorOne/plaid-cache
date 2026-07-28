@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/conductorone/plaid-cache/internal/adopt"
+	"github.com/conductorone/plaid-cache/internal/blob"
 	"github.com/conductorone/plaid-cache/internal/cache"
 	"github.com/conductorone/plaid-cache/internal/config"
 	"github.com/conductorone/plaid-cache/internal/ids"
@@ -27,6 +29,7 @@ type Server struct {
 	cfg     *config.Config
 	cache   *cache.Cache
 	idx     *index.Index
+	blobs   *blob.Store
 	logf    cache.Logf
 	version string
 	started time.Time
@@ -51,9 +54,14 @@ type Server struct {
 
 // ServerParams carries the daemon's dependencies.
 type ServerParams struct {
-	Config  *config.Config
-	Cache   *cache.Cache
-	Index   *index.Index
+	Config *config.Config
+	Cache  *cache.Cache
+	Index  *index.Index
+
+	// Blobs is the body store. It is passed separately from Cache because
+	// adoption publishes bodies directly rather than through a get or a put.
+	Blobs *blob.Store
+
 	Logf    cache.Logf
 	Version string
 
@@ -100,6 +108,7 @@ func NewServer(p ServerParams) *Server {
 		cfg:         p.Config,
 		cache:       p.Cache,
 		idx:         p.Index,
+		blobs:       p.Blobs,
 		logf:        logf,
 		version:     p.Version,
 		started:     time.Now(),
@@ -382,6 +391,9 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	case OpGC:
 		_ = writeJSONLine(conn, HelloResponse{Version: s.version, OK: true})
 		_ = writeJSONLine(conn, s.gc(ctx, h.GC))
+	case OpAdopt:
+		_ = writeJSONLine(conn, HelloResponse{Version: s.version, OK: true})
+		_ = writeJSONLine(conn, s.adopt(ctx, h.Adopt))
 	case OpShutdown:
 		_ = writeJSONLine(conn, HelloResponse{Version: s.version, OK: true})
 		s.logf("shutdown requested by client")
@@ -389,7 +401,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	default:
 		_ = writeJSONLine(conn, HelloResponse{
 			Version: s.version,
-			Err:     fmt.Sprintf("unknown op %q, want one of: session, status, gc, shutdown", h.Op),
+			Err:     fmt.Sprintf("unknown op %q, want one of: session, status, gc, adopt, shutdown", h.Op),
 		})
 	}
 }
@@ -424,6 +436,49 @@ func (s *Server) status() StatusResponse {
 // An override applies to this pass only; it does not change what the eviction
 // ticker will do next. That keeps a one-off "prune harder than usual" from
 // silently becoming the daemon's new policy.
+// adopt imports a go-cache-plugin stage into the index this daemon holds.
+//
+// The connection stays counted as active for the duration, so a long import
+// cannot be cut short by the idle timer, and the eviction ticker may run
+// alongside it: an entry adopted and then immediately pruned is a correct
+// outcome, not a conflict, and a body that is linked but not yet indexed is
+// invisible to eviction because references live in the index rather than on the
+// filesystem.
+func (s *Server) adopt(ctx context.Context, p *AdoptParams) AdoptResponse {
+	if p == nil || p.Dir == "" {
+		return AdoptResponse{Err: "adopt: no stage directory given"}
+	}
+	if s.blobs == nil {
+		// A daemon assembled without a body store cannot publish one. Saying so
+		// beats a nil dereference that takes every build on the machine with it.
+		return AdoptResponse{Err: "adopt: this daemon has no body store"}
+	}
+	s.logf("adopting go-cache-plugin stage %s (dry-run=%v)", p.Dir, p.DryRun)
+	res, err := adopt.Run(ctx, adopt.Params{
+		LegacyDir: p.Dir,
+		Index:     s.idx,
+		Blobs:     s.blobs,
+		DryRun:    p.DryRun,
+		Logf:      s.logf,
+	})
+	r := AdoptResponse{
+		Records:        res.Records,
+		Adopted:        res.Adopted,
+		AlreadyPresent: res.AlreadyPresent,
+		MissingBody:    res.MissingBody,
+		SizeMismatch:   res.SizeMismatch,
+		Malformed:      res.Malformed,
+		Linked:         res.Linked,
+		Copied:         res.Copied,
+		Bytes:          res.Bytes,
+		Elapsed:        res.Elapsed.Round(time.Millisecond).String(),
+	}
+	if err != nil {
+		r.Err = err.Error()
+	}
+	return r
+}
+
 func (s *Server) gc(ctx context.Context, p *GCParams) GCResponse {
 	maxBytes, ttl := s.cfg.MaxBytes, s.cfg.TTL
 	if p != nil {

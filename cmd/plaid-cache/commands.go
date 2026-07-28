@@ -137,7 +137,7 @@ func (a *app) runServe(ctx context.Context) int {
 	}
 
 	srv := daemon.NewServer(daemon.ServerParams{
-		Config: cfg, Cache: c, Index: st.idx, Logf: logf, Version: buildVersion(),
+		Config: cfg, Cache: c, Index: st.idx, Blobs: st.blobs, Logf: logf, Version: buildVersion(),
 	})
 	logf("serving on %s (pid %d)", cfg.SocketPath(), os.Getpid())
 
@@ -538,10 +538,37 @@ func (a *app) runAdopt(ctx context.Context) int {
 	if !ok {
 		return exitError
 	}
+
+	// Ask a running daemon to do the import rather than requiring it to be
+	// stopped. Exactly one process may hold the index, and on the machine that
+	// actually needs a stage migrated that process is busy serving builds — an
+	// env switching to plaid-cache starts using the daemon at the same moment its
+	// old stage becomes dead weight. Requiring a stop meant the migration lost a
+	// race it could not win on a busy machine.
+	params := &daemon.AdoptParams{Dir: legacyDir, DryRun: dryRun}
+	if conn, derr := dialExistingAdopt(cfg, buildVersion(), params); derr == nil {
+		defer conn.Close()
+		var resp daemon.AdoptResponse
+		if err := conn.ReadJSONLine(&resp); err != nil {
+			fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+			return exitError
+		}
+		if resp.Err != "" {
+			fmt.Fprintf(a.stderr, "plaid-cache: %s\n", resp.Err)
+			return exitError
+		}
+		a.printAdopt(adoptResultFrom(resp), dryRun)
+		return exitOK
+	}
+
+	// No daemon: this process can hold the index itself.
 	st, err := openStores(ctx, cfg)
 	if err != nil {
 		if errors.Is(err, index.ErrLocked) {
-			fmt.Fprintf(a.stderr, "plaid-cache: a daemon owns the index; stop it before adopting\n")
+			// A daemon took the index between the dial above and here, or one is
+			// starting up. Retrying is the caller's business; saying which
+			// process to blame is ours.
+			fmt.Fprintf(a.stderr, "plaid-cache: another process took the index mid-adopt; try again\n")
 			return exitError
 		}
 		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
@@ -560,10 +587,39 @@ func (a *app) runAdopt(ctx context.Context) int {
 		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
 		return exitError
 	}
+	a.printAdopt(res, dryRun)
+	return exitOK
+}
+
+// printAdopt renders an import, from either path.
+func (a *app) printAdopt(res adopt.Result, dryRun bool) {
 	prefix := ""
 	if dryRun {
 		prefix = "would adopt: "
 	}
 	fmt.Fprintf(a.stdout, "%s%s\n", prefix, res)
-	return exitOK
+}
+
+// adoptResultFrom rebuilds a Result from a daemon's response, so that both paths
+// print through one formatter rather than two that can drift.
+func adoptResultFrom(r daemon.AdoptResponse) adopt.Result {
+	// An unparseable duration is not worth failing an import that succeeded; it
+	// costs the elapsed time in the output and nothing else.
+	d, _ := time.ParseDuration(r.Elapsed)
+	return adopt.Result{
+		Records:        r.Records,
+		Adopted:        r.Adopted,
+		AlreadyPresent: r.AlreadyPresent,
+		MissingBody:    r.MissingBody,
+		SizeMismatch:   r.SizeMismatch,
+		Malformed:      r.Malformed,
+		Linked:         r.Linked,
+		Copied:         r.Copied,
+		Bytes:          r.Bytes,
+		Elapsed:        d,
+	}
+}
+
+func dialExistingAdopt(cfg *config.Config, version string, params *daemon.AdoptParams) (*daemon.Conn, error) {
+	return dialExistingWith(cfg, daemon.Hello{Version: version, Op: daemon.OpAdopt, Adopt: params})
 }

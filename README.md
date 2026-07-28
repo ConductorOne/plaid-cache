@@ -114,8 +114,14 @@ originally produced, so an entry in daily use can have a months-old body; its ow
 prune keys off the action file for the same reason. The body's time becomes the
 entry's creation time.
 
-Adoption needs the index, so stop any running daemon first. It is idempotent:
-records already indexed are left alone.
+Adoption writes to the index, which exactly one process may hold, so `adopt` asks
+a running daemon to do the import and only holds the index itself when no daemon
+answers. That is not a detail: on the machine that actually needs a stage
+migrated, the daemon is busy serving builds — the switch to `plaid-cache` and the
+stage becoming dead weight are the same event — so requiring the daemon to be
+stopped meant the migration had to win a race it loses on a busy machine.
+
+It is idempotent: records already indexed are left alone.
 
 Bodies are only linkable within one filesystem. Two mounts of the same ZFS
 dataset report the same device and still refuse a link, so a cross-device stage
