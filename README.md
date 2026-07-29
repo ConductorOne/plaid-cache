@@ -52,6 +52,7 @@ directory   /home/you/.cache/plaid-cache
 config      /home/you/.config/plaid-cache/config
 entries     274 actions, 206 objects (1.33x dedup, 173.1 KiB avg)
 size        34.8 MiB of 64.0 MiB (54.4%, 29.2 MiB free)
+volume      12.1 GiB used of 50.0 GiB (24.2%, 37.9 GiB free)
 ttl         168h0m0s
 age         oldest 4s, newest 1s
 remote      s3://example-bucket--usw2-az1--x-s3/arm64
@@ -209,6 +210,36 @@ or the environment variable set.
 
 Zero is a meaningful value for either limit and disables that constraint, so
 `-max-bytes=0` prunes on age alone and `-ttl=0` on size alone.
+
+### What `max-bytes` counts
+
+Allocated bytes on disk, not the lengths of the files.
+
+The distinction is not academic on a compressing filesystem. A body's cost is
+first recorded the moment it is written, which is the one moment it cannot be
+measured — ZFS defers allocation to the next transaction group, so a file written
+a second ago reports a single block however large it is — so the figure taken then
+is deliberately an overestimate. It is corrected once the allocation is real:
+before a size-driven eviction, bodies past the settle window are re-measured and
+their recorded costs replaced.
+
+Without that correction the budget stays at the logical lengths forever, and on a
+dataset compressing 3x a 40 GiB ceiling starts evicting at about 13 GiB of actual
+disk. That was [issue #5](https://github.com/conductorone/plaid-cache/issues/5):
+34748 entries pruned while two thirds of the budget sat unused.
+
+The re-measure runs only when the recorded total is within 10% of the ceiling,
+since below that the difference cannot change any decision, and it costs one stat
+per body — tens of milliseconds for tens of thousands of files. `status` reports
+the volume alongside the budget, so the two can be compared:
+
+```
+size        10.5 GiB of 40.0 GiB (26.3%, 29.5 GiB free)
+volume      16.0 GiB used of 50.0 GiB (32.0%, 34.0 GiB free)
+```
+
+On platforms without `st_blocks` the budget is the logical length, which is all
+that is available there.
 
 ## Configuration
 

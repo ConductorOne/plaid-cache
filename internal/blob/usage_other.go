@@ -5,7 +5,10 @@
 
 package blob
 
-import "io/fs"
+import (
+	"io/fs"
+	"time"
+)
 
 // diskBytes reports what a file actually costs the filesystem.
 //
@@ -15,3 +18,10 @@ import "io/fs"
 // generous here — acceptable, since the budget is an operational ceiling
 // rather than a correctness invariant.
 func diskBytes(fi fs.FileInfo) int64 { return fi.Size() }
+
+// settledBytes reports the logical size and that it is not an allocation figure.
+//
+// Reporting it as untrusted keeps the re-measuring pass from replacing a
+// provisional figure with the same number it already has, so on these platforms
+// the budget stays logical — which is all it can be without st_blocks.
+func settledBytes(fi fs.FileInfo, _ time.Time) (int64, bool) { return fi.Size(), false }

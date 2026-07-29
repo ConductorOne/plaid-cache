@@ -322,6 +322,17 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 		fmt.Fprintf(a.stdout, "size        %s (no limit)\n", config.FormatBytes(diskBytes))
 	}
 
+	// What the budget thinks is not what the disk has. Compression, other users
+	// of the volume, and snapshots all move the two apart, and the number an
+	// operator needs to judge whether a ceiling is set sensibly is the second
+	// one: a cache can report itself full with most of the volume idle.
+	if total, avail, err := blob.VolumeUsage(cfg.Dir); err == nil && total > 0 {
+		used := total - avail
+		fmt.Fprintf(a.stdout, "volume      %s used of %s (%.1f%%, %s free)\n",
+			config.FormatBytes(int64(used)), config.FormatBytes(int64(total)),
+			100*float64(used)/float64(total), config.FormatBytes(int64(avail)))
+	}
+
 	if ttl != "" && ttl != "0s" {
 		fmt.Fprintf(a.stdout, "ttl         %s\n", ttl)
 	} else {

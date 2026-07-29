@@ -306,6 +306,10 @@ func (c *Cache) Evict(ctx context.Context) (index.EvictResult, error) {
 // broken. Zero still means "no constraint" for either limit, so a caller can
 // deliberately drop one.
 func (c *Cache) EvictWith(ctx context.Context, maxBytes int64, ttl time.Duration) (index.EvictResult, error) {
+	// Decide on measured bytes, not on the estimate taken before the filesystem
+	// had allocated anything.
+	c.reconcileBeforeEvicting(ctx, maxBytes)
+
 	res, err := c.idx.Evict(ctx, maxBytes, ttl, time.Now().UnixNano(), func(o ids.OutputID) error {
 		if rerr := c.blobs.Remove(o); rerr != nil {
 			// A body we cannot delete is a leak, not a correctness problem;
