@@ -34,6 +34,13 @@ const (
 var (
 	metaCounters      = metaKey("counters")
 	metaCleanShutdown = metaKey("clean-shutdown")
+
+	// metaActivity holds the lifetime activity counters, and
+	// activityBucketPrefix the per-hour history. The trailing separator matters:
+	// it keeps the bucket keys out of a lookup of the total, which would
+	// otherwise be a prefix of every one of them.
+	metaActivity         = metaKey("activity")
+	activityBucketPrefix = metaKey("activity/")
 )
 
 // metaKey builds a key in the 'm' table.

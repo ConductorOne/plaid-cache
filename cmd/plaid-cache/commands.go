@@ -257,7 +257,7 @@ func (a *app) runStatus(ctx context.Context) int {
 			fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
 			return exitError
 		}
-		a.printStatus(cfg, resp.Actions, resp.Objects, resp.DiskBytes, &resp)
+		a.printStatus(cfg, resp.Actions, resp.Objects, resp.DiskBytes, &resp, resp.Lifetime, resp.LifetimeSince)
 		return exitOK
 	}
 
@@ -273,7 +273,12 @@ func (a *app) runStatus(ctx context.Context) int {
 		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
 		return exitError
 	}
-	a.printStatus(cfg, s.Actions, s.Objects, s.DiskBytes, nil)
+	life, since, err := st.idx.TotalActivity()
+	if err != nil {
+		// A report is still worth printing without its history.
+		fmt.Fprintf(a.stderr, "plaid-cache: lifetime activity: %v\n", err)
+	}
+	a.printStatus(cfg, s.Actions, s.Objects, s.DiskBytes, nil, life, since)
 	return exitOK
 }
 
@@ -283,7 +288,7 @@ func (a *app) runStatus(ctx context.Context) int {
 // process's environment. The daemon read its configuration when it started,
 // and that is what actually governs the cache; printing the caller's own
 // environment would show limits that nothing is enforcing.
-func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64, d *daemon.StatusResponse) {
+func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64, d *daemon.StatusResponse, life cache.MetricsSnapshot, lifeSince int64) {
 	maxBytes, ttl := cfg.MaxBytes, cfg.TTL.String()
 	if d != nil {
 		maxBytes, ttl = d.MaxBytes, d.TTL
@@ -334,7 +339,12 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 		fmt.Fprintf(a.stdout, "remote      disabled\n")
 	}
 	if d == nil {
+		// Not the end of the report any more. The counters outlive the process
+		// that produced them, so a cache nothing is currently using still has a
+		// history worth reading — and this is the state anyone asking about a
+		// quiet machine finds it in.
 		fmt.Fprintf(a.stdout, "daemon      not running\n")
+		a.printLifetime(cfg, life, lifeSince)
 		return
 	}
 	fmt.Fprintf(a.stdout, "daemon      pid %d, up %s\n", d.PID, d.Uptime)
@@ -362,6 +372,26 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 		fmt.Fprintf(a.stdout, "uploads     %d ok, %d failed, %d dropped, %d skipped\n",
 			m.UploadOK, m.UploadFail, m.UploadDrop, m.UploadSkip)
 	}
+	a.printLifetime(cfg, life, lifeSince)
+}
+
+// printLifetime reports the persisted counters.
+//
+// Everything above it describes one process. A daemon exits after its idle
+// timeout and a plugin invocation lasts one build, so those numbers answer "what
+// has this process seen", which for a cache that has been quiet for half an hour
+// is nothing — and reading that as the cache's hit rate is exactly the mistake
+// this line exists to prevent.
+func (a *app) printLifetime(cfg *config.Config, life cache.MetricsSnapshot, since int64) {
+	if life.Lookups() == 0 {
+		return
+	}
+	rate, _ := life.HitRate()
+	fmt.Fprintf(a.stdout, "lifetime    %.1f%% of %d lookups", 100*rate, life.Lookups())
+	if since > 0 {
+		fmt.Fprintf(a.stdout, " since %s", time.Unix(0, since).UTC().Format("2006-01-02 15:04 UTC"))
+	}
+	fmt.Fprintf(a.stdout, " (every process; see `plaid-cache stats`)\n")
 }
 
 // runGC forces an eviction pass.

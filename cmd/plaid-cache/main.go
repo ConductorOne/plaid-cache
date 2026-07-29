@@ -75,6 +75,8 @@ func (a *app) run() int {
 		return a.runServe(ctx)
 	case "status":
 		return a.runStatus(ctx)
+	case "stats":
+		return a.runStats(ctx)
 	case "gc":
 		return a.runGC(ctx)
 	case "adopt":
@@ -102,6 +104,7 @@ Usage:
   plaid-cache              speak the GOCACHEPROG protocol on stdin/stdout
   plaid-cache serve        run the cache daemon in the foreground
   plaid-cache status       report cache contents and counters
+  plaid-cache stats        report the persisted activity history
   plaid-cache gc           force one eviction pass
   plaid-cache adopt DIR    import a go-cache-plugin stage into this cache
   plaid-cache clean        remove the entire local cache
@@ -109,6 +112,11 @@ Usage:
 
 The Go toolchain invokes the first form:
   GOCACHEPROG=plaid-cache go build ./...
+
+status describes the cache now; stats describes what it has done. The counters
+are persisted, so they survive the daemon's idle exit and cover every process
+that has used this cache rather than whichever one answers. -json emits the
+whole history for a tool to read.
 
 adopt imports an existing go-cache-plugin local stage: it reconstructs the
 action-to-output mapping from that stage's records and publishes its bodies by

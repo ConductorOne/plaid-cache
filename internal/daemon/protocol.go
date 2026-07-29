@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/conductorone/plaid-cache/internal/cache"
+	"github.com/conductorone/plaid-cache/internal/index"
 )
 
 // Op selects what a connection is for. It is exchanged once, before any
@@ -38,6 +39,9 @@ const (
 
 	// OpGC forces an eviction pass.
 	OpGC Op = "gc"
+
+	// OpStats reports the persisted activity history.
+	OpStats Op = "stats"
 
 	// OpAdopt imports a go-cache-plugin stage.
 	//
@@ -64,6 +68,29 @@ type Hello struct {
 
 	// Adopt names the stage to import, for OpAdopt.
 	Adopt *AdoptParams `json:"adopt,omitempty"`
+
+	// Stats bounds the history requested, for OpStats.
+	Stats *StatsParams `json:"stats,omitempty"`
+}
+
+// StatsParams selects how much history to report.
+type StatsParams struct {
+	// Since is a Go duration; the report covers the hours at or after it.
+	Since string `json:"since"`
+}
+
+// StatsResponse reports the persisted counters.
+//
+// Lifetime is every hour ever recorded, including those already pruned from the
+// per-hour history, so a total does not shrink when the window rolls over.
+type StatsResponse struct {
+	Lifetime      cache.MetricsSnapshot  `json:"lifetime"`
+	LifetimeSince int64                  `json:"lifetime_since"`
+	Window        cache.MetricsSnapshot  `json:"window"`
+	WindowSince   int64                  `json:"window_since"`
+	Buckets       []index.ActivityBucket `json:"buckets"`
+
+	Err string `json:"err,omitempty"`
 }
 
 // AdoptParams names the go-cache-plugin stage a daemon should import.
@@ -94,6 +121,13 @@ type HelloResponse struct {
 
 // StatusResponse reports the daemon's view of the cache.
 type StatusResponse struct {
+	// Lifetime is the persisted activity across every process that has used this
+	// cache, and LifetimeSince when the first of it was recorded. Metrics below
+	// is this daemon's own tally, which describes only however much of the day
+	// this process happened to be up for.
+	Lifetime      cache.MetricsSnapshot `json:"lifetime"`
+	LifetimeSince int64                 `json:"lifetime_since"`
+
 	PID       int                   `json:"pid"`
 	Actions   int64                 `json:"actions"`
 	Objects   int64                 `json:"objects"`
