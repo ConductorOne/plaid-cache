@@ -604,8 +604,12 @@ func (s *Server) gc(ctx context.Context, p *GCParams) GCResponse {
 		}
 		s.logf("gc with overrides: max_bytes=%d ttl=%v", maxBytes, ttl)
 	}
-	res, err := s.cache.EvictWith(ctx, maxBytes, ttl)
+	res, rec, err := s.cache.EvictNow(ctx, maxBytes, ttl)
 	r := GCResponse{
+		Measured:        rec.Objects,
+		Corrected:       rec.Corrected,
+		RecordedBefore:  rec.Before,
+		RecordedAfter:   rec.After,
 		ActionsPruned:   res.ActionsPruned,
 		ObjectsPruned:   res.ObjectsPruned,
 		BytesFreed:      res.BytesFreed,

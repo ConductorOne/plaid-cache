@@ -228,9 +228,17 @@ dataset compressing 3x a 40 GiB ceiling starts evicting at about 13 GiB of actua
 disk. That was [issue #5](https://github.com/conductorone/plaid-cache/issues/5):
 34748 entries pruned while two thirds of the budget sat unused.
 
-The re-measure runs only when the recorded total is within 10% of the ceiling,
-since below that the difference cannot change any decision, and it costs one stat
-per body — tens of milliseconds for tens of thousands of files. `status` reports
+The re-measure runs on the automatic path only when the recorded total is within
+10% of the ceiling, since below that the difference cannot change any decision,
+and it costs one stat per body — tens of milliseconds for tens of thousands of
+files. `gc` measures whatever the pressure, because a pass someone asked for by
+hand should be decided on current numbers, and it reports what changed:
+
+```
+$ plaid-cache gc
+pruned 0 actions, 0 objects, freed 0 B in 29ms
+measured     780 of 786 objects re-measured, recorded size 320.4 MiB -> 123.3 MiB
+``` `status` reports
 the volume alongside the budget, so the two can be compared:
 
 ```

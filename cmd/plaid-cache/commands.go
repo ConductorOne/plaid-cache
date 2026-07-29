@@ -436,6 +436,7 @@ func (a *app) runGC(ctx context.Context) int {
 			return exitError
 		}
 		a.printGC(resp.ActionsPruned, resp.ObjectsPruned, resp.BytesFreed, resp.Elapsed)
+		a.printMeasured(resp.Measured, resp.Corrected, resp.RecordedBefore, resp.RecordedAfter)
 		if params != nil {
 			fmt.Fprintf(a.stdout, "applied      max-bytes %s, ttl %s (this pass only)\n",
 				config.FormatBytes(resp.AppliedMaxBytes), resp.AppliedTTL)
@@ -462,7 +463,7 @@ func (a *app) runGC(ctx context.Context) int {
 	})
 	defer c.Close()
 
-	res, err := c.Evict(ctx)
+	res, rec, err := c.EvictNow(ctx, cfg.MaxBytes, cfg.TTL)
 	if err != nil {
 		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
 		return exitError
@@ -471,7 +472,21 @@ func (a *app) runGC(ctx context.Context) int {
 		fmt.Fprintf(a.stderr, "plaid-cache: compact: %v\n", err)
 	}
 	a.printGC(res.ActionsPruned, res.ObjectsPruned, res.BytesFreed, res.Elapsed.String())
+	a.printMeasured(rec.Objects, rec.Corrected, rec.Before, rec.After)
 	return exitOK
+}
+
+// printMeasured reports what re-measuring the bodies changed.
+//
+// Without it a pass that pruned nothing because the recorded size was wrong looks
+// identical to a pass that had nothing to do, and the correction — which is the
+// reason it pruned nothing — goes unmentioned.
+func (a *app) printMeasured(objects, corrected, before, after int64) {
+	if corrected == 0 {
+		return
+	}
+	fmt.Fprintf(a.stdout, "measured     %d of %d objects re-measured, recorded size %s -> %s\n",
+		corrected, objects, config.FormatBytes(before), config.FormatBytes(after))
 }
 
 // printGC renders an eviction result.

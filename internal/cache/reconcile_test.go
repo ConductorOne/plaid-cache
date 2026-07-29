@@ -234,3 +234,41 @@ func TestReconcileIsIdempotent(t *testing.T) {
 		t.Fatalf("second pass corrected %d objects, want 0", res.Corrected)
 	}
 }
+
+// TestEvictNowMeasuresRegardlessOfPressure pins the manual lever.
+//
+// The automatic path deliberately skips measuring when there is room, so a cache
+// well under its ceiling can carry a wrong recorded size indefinitely — and
+// status would keep reporting it. An operator running gc is asking for the sweep
+// and for the numbers it is decided on, so this path measures whatever the
+// pressure.
+func TestEvictNowMeasuresRegardlessOfPressure(t *testing.T) {
+	tc := newTestCache(t)
+	a, o := mkAction(8), mkOutput(8)
+	tc.put(t, a, o, []byte("a body under a ceiling it is nowhere near"))
+	age(t, tc, o)
+
+	truth, _, err := tc.blobs.Measure(o, time.Now())
+	if err != nil {
+		t.Fatalf("Measure: %v", err)
+	}
+	inflate(t, tc, o, truth*100)
+	inflated, _ := tc.idx.Stats()
+
+	// A ceiling so far above the inflated figure that the automatic path would
+	// not look.
+	res, rec, err := tc.cache.EvictNow(t.Context(), inflated.DiskBytes*100, time.Hour)
+	if err != nil {
+		t.Fatalf("EvictNow: %v", err)
+	}
+	if rec.Corrected != 1 {
+		t.Fatalf("corrected %d objects, want 1 — gc did not measure", rec.Corrected)
+	}
+	if res.ActionsPruned != 0 {
+		t.Fatalf("pruned %d actions with room to spare", res.ActionsPruned)
+	}
+	after, _ := tc.idx.Stats()
+	if after.DiskBytes != truth {
+		t.Fatalf("recorded %d after gc, want the measured %d", after.DiskBytes, truth)
+	}
+}
