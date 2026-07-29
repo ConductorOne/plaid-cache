@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/conductorone/plaid-cache/internal/ids"
+	"github.com/conductorone/plaid-cache/internal/index"
 )
 
 // ReconcileResult reports what a re-measuring pass found.
@@ -92,6 +93,23 @@ func (c *Cache) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		r.After = st.DiskBytes
 	}
 	return r, nil
+}
+
+// EvictNow is EvictWith for a pass someone asked for by hand.
+//
+// It measures first regardless of how much room appears to be left. The threshold
+// below exists to keep the stats off the automatic path, where nothing is at stake
+// until the budget is tight; an operator running gc is asking for the sweep and for
+// the numbers it is decided on, and telling them "not until you are at 90%" would
+// be a strange answer to give.
+func (c *Cache) EvictNow(ctx context.Context, maxBytes int64, ttl time.Duration) (index.EvictResult, ReconcileResult, error) {
+	rec, err := c.Reconcile(ctx)
+	if err != nil {
+		// Evict on the figures we have rather than refusing the request.
+		c.logf("gc: reconcile: %v", err)
+	}
+	res, err := c.EvictWith(ctx, maxBytes, ttl)
+	return res, rec, err
 }
 
 // reconcileAtShare is the fraction of the budget at which eviction re-measures

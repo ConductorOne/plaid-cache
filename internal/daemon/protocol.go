@@ -153,6 +153,13 @@ type GCResponse struct {
 	AppliedMaxBytes int64  `json:"applied_max_bytes"`
 	AppliedTTL      string `json:"applied_ttl"`
 
+	// What re-measuring the bodies changed, so a pass that pruned nothing
+	// because the recorded size was wrong says so rather than looking inert.
+	Measured       int64 `json:"measured"`
+	Corrected      int64 `json:"corrected"`
+	RecordedBefore int64 `json:"recorded_before"`
+	RecordedAfter  int64 `json:"recorded_after"`
+
 	Err string `json:"err,omitempty"`
 }
 
