@@ -90,6 +90,16 @@ func parseLRUKey(k []byte) (lastUsedAt int64, a ids.ActionID, err error) {
 	return lastUsedAt, a, nil
 }
 
+// outputIDFromObjKey recovers the output id an 'o' key names.
+func outputIDFromObjKey(k []byte) (ids.OutputID, bool) {
+	if len(k) != objKeyLen || k[0] != prefixObj {
+		return ids.OutputID{}, false
+	}
+	var o ids.OutputID
+	copy(o[:], k[1:])
+	return o, true
+}
+
 // prefixRange returns the [lower, upper) bounds covering every key under p,
 // for use as Pebble iterator bounds.
 func prefixRange(p byte) (lower, upper []byte) {
