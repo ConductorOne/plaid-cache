@@ -61,7 +61,14 @@ hits        205 local, 0 remote
 misses      139
 puts        275
 uploads     205 ok, 0 failed, 0 dropped, 0 skipped
+lifetime    71.2% of 128443 lookups since 2026-07-14 09:00 UTC (every process; see `plaid-cache stats`)
 ```
+
+The counters above `lifetime` are this daemon's own. The one below is every
+process that has ever used this cache, which is usually the number you want:
+a daemon exits after its idle timeout and a plugin invocation lasts one build,
+so a process counter for a machine that has been quiet for half an hour
+describes almost nothing that happened on it.
 
 Two of those lines answer questions the raw counters do not. The dedup ratio is
 actions per stored body, which is what refcounting outputs buys: many actions
@@ -80,7 +87,52 @@ Run the daemon in the foreground, for a container or a supervised service:
 plaid-cache serve
 ```
 
-Subcommands are `serve`, `status`, `clean`, `gc`, `adopt`, and `version`.
+### Activity history
+
+`status` describes the cache now; `stats` describes what it has done:
+
+```
+$ plaid-cache stats -since 24h
+window      last 24h0m0s, 9 hours with activity
+hit rate    73.4% of 51203 lookups
+hits        38200 local, 1382 remote
+misses      11621
+puts        4021
+uploads     4021 ok, 0 failed, 0 dropped, 0 skipped
+lifetime    71.2% of 128443 lookups since 2026-07-14 09:00 UTC
+
+hour (UTC)          lookups   hit%    local  remote   misses   puts
+2026-07-28 09:00      12043  81.2%     9600     180     2263     900
+2026-07-28 10:00       8110  64.9%     5100     164     2846     612
+```
+
+The counters are persisted in the index, so they survive the daemon's idle exit
+and cover every process that has used the cache. Without that, a hit rate is a
+statement about whichever process happens to answer — which for a machine that
+has been idle is a fresh daemon that has seen one build, or no daemon at all.
+
+The per-hour rows are the reason to keep history rather than one running total:
+a total cannot distinguish a cache that is working now from one that worked well
+last week, and a hit rate that is falling looks identical to a healthy one when
+it is averaged over a fortnight. Hours with no activity are simply absent.
+
+`-json` emits the whole response, including every bucket, for a tool to read:
+
+```sh
+plaid-cache stats -since 168h -json
+```
+
+Two weeks of hourly buckets are kept, which is a few hundred bytes an hour and
+under a megabyte in total; older ones are dropped by the same write that records
+new activity. A cache that exists to bound growth should not accumulate its own
+telemetry forever.
+
+Counters are written a few seconds after the work they describe, and on a clean
+exit — including the idle timeout. A process killed outright, by an OOM or a
+container teardown, loses at most those few seconds.
+
+Subcommands are `serve`, `status`, `stats`, `clean`, `gc`, `adopt`, and
+`version`.
 
 ### Adopting an existing go-cache-plugin stage
 

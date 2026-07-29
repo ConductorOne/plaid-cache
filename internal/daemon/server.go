@@ -180,9 +180,19 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Both loops touch the index, and the caller closes the index once Serve
+	// returns, so Serve must not return while either is mid-write. Cancelling
+	// first and waiting second is the whole of it; the wait is registered as one
+	// closure rather than a second defer because the accept-failure path returns
+	// without cancelling, and a bare wait ahead of the cancel would hang there.
+	var bg sync.WaitGroup
 	if !s.cfg.DisableEviction && s.cfg.EvictInterval > 0 {
-		go s.evictLoop(ctx)
+		bg.Add(1)
+		go func() { defer bg.Done(); s.evictLoop(ctx) }()
 	}
+	bg.Add(1)
+	go func() { defer bg.Done(); s.metricsLoop(ctx) }()
+	defer func() { cancel(); bg.Wait() }()
 	s.armIdleTimer()
 
 	// Unblock Accept when we are asked to stop: a unix listener has no other
@@ -391,6 +401,9 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	case OpGC:
 		_ = writeJSONLine(conn, HelloResponse{Version: s.version, OK: true})
 		_ = writeJSONLine(conn, s.gc(ctx, h.GC))
+	case OpStats:
+		_ = writeJSONLine(conn, HelloResponse{Version: s.version, OK: true})
+		_ = writeJSONLine(conn, s.stats(h.Stats))
 	case OpAdopt:
 		_ = writeJSONLine(conn, HelloResponse{Version: s.version, OK: true})
 		_ = writeJSONLine(conn, s.adopt(ctx, h.Adopt))
@@ -401,7 +414,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	default:
 		_ = writeJSONLine(conn, HelloResponse{
 			Version: s.version,
-			Err:     fmt.Sprintf("unknown op %q, want one of: session, status, gc, adopt, shutdown", h.Op),
+			Err:     fmt.Sprintf("unknown op %q, want one of: session, status, stats, gc, adopt, shutdown", h.Op),
 		})
 	}
 }
@@ -414,6 +427,18 @@ func (s *Server) status() StatusResponse {
 		TTL:      s.cfg.TTL.String(),
 		Uptime:   time.Since(s.started).Round(time.Second).String(),
 		Metrics:  s.cache.Metrics(),
+	}
+	// The lifetime figures include what this process has counted but not yet
+	// flushed, so the two sets cannot disagree about activity that just
+	// happened — a lifetime total smaller than the session's would be a
+	// puzzle worth nobody's time.
+	if err := s.cache.FlushMetrics(); err != nil {
+		s.logf("status: flush metrics: %v", err)
+	}
+	if total, since, err := s.idx.TotalActivity(); err != nil {
+		s.logf("status: lifetime activity: %v", err)
+	} else {
+		r.Lifetime, r.LifetimeSince = total, since
 	}
 	st, err := s.idx.Stats()
 	if err != nil {
@@ -436,6 +461,91 @@ func (s *Server) status() StatusResponse {
 // An override applies to this pass only; it does not change what the eviction
 // ticker will do next. That keeps a one-off "prune harder than usual" from
 // silently becoming the daemon's new policy.
+// defaultStatsWindow is the history a stats request covers when it asks for no
+// particular span.
+const defaultStatsWindow = 24 * time.Hour
+
+// stats reports the persisted history.
+//
+// It flushes first, so that a report asked for immediately after a build does
+// not omit that build. The counters are otherwise written on a timer, which is
+// the right trade for a path that runs beside every compile but the wrong one
+// for somebody watching the number.
+func (s *Server) stats(p *StatsParams) StatsResponse {
+	window := defaultStatsWindow
+	if p != nil && p.Since != "" {
+		d, err := time.ParseDuration(p.Since)
+		if err != nil {
+			return StatsResponse{Err: fmt.Sprintf("stats: since %q: %v", p.Since, err)}
+		}
+		if d < 0 {
+			return StatsResponse{Err: fmt.Sprintf("stats: since %v is negative", d)}
+		}
+		window = d
+	}
+	if err := s.cache.FlushMetrics(); err != nil {
+		s.logf("stats: flush: %v", err)
+	}
+
+	total, since, err := s.idx.TotalActivity()
+	if err != nil {
+		return StatsResponse{Err: fmt.Sprintf("stats: %v", err)}
+	}
+	cutoff := time.Now().Add(-window)
+	buckets, err := s.idx.ActivitySince(cutoff)
+	if err != nil {
+		return StatsResponse{Err: fmt.Sprintf("stats: %v", err)}
+	}
+	var windowed cache.MetricsSnapshot
+	for _, b := range buckets {
+		windowed = windowed.Add(b.Activity)
+	}
+	return StatsResponse{
+		Lifetime:      total,
+		LifetimeSince: since,
+		Window:        windowed,
+		WindowSince:   cutoff.UTC().Truncate(time.Hour).Unix(),
+		Buckets:       buckets,
+	}
+}
+
+// metricsFlushInterval is how often the daemon persists its counters.
+//
+// It bounds what an abrupt kill loses, which is why it is seconds rather than
+// the minute it started as. A clean exit flushes on the way out, including the
+// idle timeout, so the interval only matters when the process is killed — and a
+// container being torn down takes the daemon with it. Measured before this was
+// shortened: a daemon killed seven seconds into its first build lost every one
+// of the 1277 lookups it had counted.
+//
+// The cost of ticking this often is close to nothing, because a tick with
+// nothing to report writes nothing at all: the flush compares against what was
+// last persisted and returns early on an empty delta. During a build it is one
+// small write every few seconds, against the thousands the build itself makes.
+const metricsFlushInterval = 5 * time.Second
+
+// metricsLoop persists the counters periodically.
+//
+// Without it the record would only be written when the daemon closes, which is
+// exactly the moment least likely to be reached — an idle exit runs it, a kill
+// or an OOM does not.
+func (s *Server) metricsLoop(ctx context.Context) {
+	t := time.NewTicker(metricsFlushInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.stopped:
+			return
+		case <-t.C:
+			if err := s.cache.FlushMetrics(); err != nil {
+				s.logf("flush metrics: %v", err)
+			}
+		}
+	}
+}
+
 // adopt imports a go-cache-plugin stage into the index this daemon holds.
 //
 // The connection stays counted as active for the duration, so a long import

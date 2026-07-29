@@ -48,6 +48,11 @@ type Cache struct {
 	// small evictions leave as many tombstones as a single large one, and a
 	// per-pass threshold would never fire for the eviction ticker.
 	prunedSinceCompact atomic.Int64
+
+	// flushMu guards flushed, which records the counters as of the last
+	// persistence so that a flush writes only what has happened since.
+	flushMu sync.Mutex
+	flushed MetricsSnapshot
 }
 
 // Metrics counts what happened, for the status command and the daemon log.
@@ -67,18 +72,13 @@ type Metrics struct {
 }
 
 // MetricsSnapshot is a value copy of Metrics for reporting.
-type MetricsSnapshot struct {
-	GetLocalHit  int64 `json:"get_local_hit"`
-	GetRemoteHit int64 `json:"get_remote_hit"`
-	GetMiss      int64 `json:"get_miss"`
-	GetRepair    int64 `json:"get_repair"`
-	Put          int64 `json:"put"`
-	UploadOK     int64 `json:"upload_ok"`
-	UploadFail   int64 `json:"upload_fail"`
-	UploadDrop   int64 `json:"upload_drop"`
-	UploadSkip   int64 `json:"upload_skip"`
-	Compactions  int64 `json:"compactions"`
-}
+//
+// It is the index's Activity type rather than a copy of its fields. The two are
+// the same ten counters — one set reported, the same set persisted — and a
+// second declaration would be a second place to forget when a counter is added,
+// with the failure showing up as a number that is always zero in whichever half
+// was missed.
+type MetricsSnapshot = index.Activity
 
 // Snapshot returns a consistent-enough copy of the counters.
 func (m *Metrics) Snapshot() MetricsSnapshot {
@@ -362,6 +362,38 @@ func (c *Cache) maybeCompact(pruned int64) {
 // index, body store, or remote backend.
 func (c *Cache) Close() error {
 	c.uploads.close()
+	// Persist before going away. The daemon exits on an idle timeout and a
+	// plugin invocation lasts one build, so without this the last stretch of
+	// activity — for a short build, all of it — is simply lost.
+	if err := c.FlushMetrics(); err != nil {
+		c.logf("flush metrics: %v", err)
+	}
+	return nil
+}
+
+// FlushMetrics folds everything counted since the previous flush into the
+// index's persistent totals.
+//
+// Only the delta is written, so repeated flushes accumulate rather than
+// overwrite, and several processes counting at once — a daemon and a direct-mode
+// plugin that could not reach it — add up instead of clobbering each other.
+//
+// A failure is returned rather than retried. The counters stay unflushed and the
+// next flush carries them, because the delta is measured against what was last
+// persisted rather than against zero.
+func (c *Cache) FlushMetrics() error {
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
+
+	now := c.metrics.Snapshot()
+	delta := now.Sub(c.flushed)
+	if delta.IsZero() {
+		return nil
+	}
+	if err := c.idx.RecordActivity(delta, time.Now()); err != nil {
+		return fmt.Errorf("FlushMetrics: %w", err)
+	}
+	c.flushed = now
 	return nil
 }
 

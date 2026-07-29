@@ -110,11 +110,15 @@ func TestHelpExitsZero(t *testing.T) {
 // TestUnknownSubcommandIsUsageError pins that a typo is a usage error, not a
 // silent success, and that it names the offending word.
 func TestUnknownSubcommandIsUsageError(t *testing.T) {
-	a, _, errb := newApp(t, "stats")
+	// Not a plausible future subcommand: this test used to say "stats", which
+	// then became one, and the test kept passing for a while by asserting that a
+	// real command was rejected.
+	const unknown = "zzz-not-a-subcommand"
+	a, _, errb := newApp(t, unknown)
 	if code := a.run(); code != exitUsage {
-		t.Fatalf("run(\"stats\") = %d, want %d", code, exitUsage)
+		t.Fatalf("run(%q) = %d, want %d", unknown, code, exitUsage)
 	}
-	if !strings.Contains(errb.String(), "stats") {
+	if !strings.Contains(errb.String(), unknown) {
 		t.Fatalf("stderr does not name the unknown subcommand: %s", errb)
 	}
 }
