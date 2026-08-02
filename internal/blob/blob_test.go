@@ -527,3 +527,103 @@ func TestAdoptIsIdempotent(t *testing.T) {
 		}
 	}
 }
+
+// TestStagePublishesByLink pins the path a caller takes when it cannot name a
+// body until it has read it: write to a staging file, then adopt it. The bytes
+// must not be copied, so the published body and the staged one are one inode.
+func TestStagePublishesByLink(t *testing.T) {
+	s := newStore(t)
+	body := []byte("hashed on the way past")
+
+	f, err := s.Stage()
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	if _, err := f.Write(body); err != nil {
+		t.Fatalf("write staged body: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close staged body: %v", err)
+	}
+	defer os.Remove(f.Name())
+
+	id := sha256.Sum256(body)
+	path, _, linked, err := s.Adopt(id, f.Name(), int64(len(body)))
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if !linked {
+		t.Fatal("a staged body was copied rather than linked; staging is in the wrong filesystem")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("published body = %q (%v), want %q", got, err, body)
+	}
+}
+
+// TestStageNamesAreUnique pins that concurrent uploads do not write over each
+// other. The store publishes by content address, so two callers staging
+// different bodies at once is the normal case rather than a race to avoid.
+func TestStageNamesAreUnique(t *testing.T) {
+	s := newStore(t)
+	seen := map[string]bool{}
+	for range 16 {
+		f, err := s.Stage()
+		if err != nil {
+			t.Fatalf("Stage: %v", err)
+		}
+		if seen[f.Name()] {
+			t.Fatalf("Stage handed out %s twice", f.Name())
+		}
+		seen[f.Name()] = true
+		_ = f.Close()
+		defer os.Remove(f.Name())
+	}
+}
+
+// TestCleanStagingRemovesAbandonedBodies pins the recovery from a process that
+// died mid-upload. A staged body is referenced by nothing, so it is invisible
+// to the byte budget and no eviction pass would ever reclaim it.
+func TestCleanStagingRemovesAbandonedBodies(t *testing.T) {
+	s := newStore(t)
+	for range 3 {
+		f, err := s.Stage()
+		if err != nil {
+			t.Fatalf("Stage: %v", err)
+		}
+		if _, err := f.Write([]byte("abandoned")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		_ = f.Close()
+	}
+
+	n, err := s.CleanStaging()
+	if err != nil {
+		t.Fatalf("CleanStaging: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("removed %d staged bodies, want 3", n)
+	}
+	// A second pass has nothing to do and must still not be an error: it runs
+	// on every start, and most starts follow a clean shutdown.
+	if n, err := s.CleanStaging(); err != nil || n != 0 {
+		t.Fatalf("second CleanStaging = %d, %v, want 0, nil", n, err)
+	}
+}
+
+// TestCleanStagingLeavesPublishedBodies pins that the sweep is scoped to the
+// staging area. Reaching into the output tree would delete the cache.
+func TestCleanStagingLeavesPublishedBodies(t *testing.T) {
+	s := newStore(t)
+	body := []byte("published")
+	id := sha256.Sum256(body)
+	if _, _, err := s.Put(id, bytes.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if _, err := s.CleanStaging(); err != nil {
+		t.Fatalf("CleanStaging: %v", err)
+	}
+	if _, _, err := s.Get(id); err != nil {
+		t.Fatalf("CleanStaging removed a published body: %v", err)
+	}
+}

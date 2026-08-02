@@ -42,6 +42,12 @@ const (
 // share the cache root without a name collision.
 const outputDir = "output"
 
+// stagingDir holds bodies being written by a caller that does not yet know
+// their content address. It is a sibling of outputDir rather than a directory
+// under it so that a staged file can never be mistaken for a published body by
+// anything walking the store.
+const stagingDir = "staging"
+
 // Store is a directory of content-addressed bodies. It holds no in-memory
 // state and no locks: every operation is a filesystem syscall, so multiple
 // Stores over one root, in one process or many, are safe concurrently.
@@ -144,6 +150,65 @@ func (s *Store) Remove(id ids.OutputID) error {
 		return fmt.Errorf("Remove: %w", err)
 	}
 	return nil
+}
+
+// Stage opens an empty file for a body whose content address is not yet known.
+//
+// Put addresses a body before reading it, which a caller that has to hash the
+// bytes first cannot do: an entry keyed by something other than its own content
+// — a Bazel action-cache record is keyed by the action it describes — only
+// becomes addressable once it has been read. Such a caller streams into this
+// file, hashes as it goes, and publishes with Adopt, which hardlinks. The bytes
+// therefore cross the disk once rather than twice, which is what makes it
+// affordable for a body of several hundred megabytes.
+//
+// The file lives in the store's own directory so the later link(2) stays
+// intra-filesystem; link across mount points fails with EXDEV.
+//
+// The caller owns the file and must remove it on every path, including after a
+// successful Adopt, where it is a second name for a now-published inode. A
+// process killed mid-write leaves one behind, which is what CleanStaging is
+// for.
+func (s *Store) Stage() (*os.File, error) {
+	dir := filepath.Join(s.root, stagingDir)
+	if err := os.MkdirAll(dir, dirPerm); err != nil {
+		return nil, fmt.Errorf("Stage: %w", err)
+	}
+	f, err := createTemp(filepath.Join(dir, "body"))
+	if err != nil {
+		return nil, fmt.Errorf("Stage: %w", err)
+	}
+	return f, nil
+}
+
+// CleanStaging removes staged bodies left behind by a process that died before
+// it could publish or remove them.
+//
+// They are invisible to the byte budget — nothing in the index references a
+// body that was never published — so without this a repeatedly killed daemon
+// leaks disk that no eviction pass will ever reclaim. It is safe only because
+// exactly one process holds the index lock, and therefore the store, at a time.
+func (s *Store) CleanStaging() (removed int, err error) {
+	dir := filepath.Join(s.root, stagingDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("CleanStaging: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if rerr := os.Remove(filepath.Join(dir, e.Name())); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+			// One undeletable file is a leak, not a reason to leave the rest.
+			err = fmt.Errorf("CleanStaging: %w", rerr)
+			continue
+		}
+		removed++
+	}
+	return removed, err
 }
 
 // tempAttempts bounds the retry loop for an O_EXCL tmp name. A collision
