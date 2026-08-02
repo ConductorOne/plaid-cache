@@ -9,10 +9,16 @@
 // knows Bazel's two keyspaces and how they map onto this cache, and nothing
 // about how a request arrived. [Handler] is the transport: it knows request
 // paths, status codes and streaming, and nothing about how anything is stored.
-// Bazel's other cache protocol — the gRPC Remote Execution API — addresses the
-// same two keyspaces with the same digests, so a second transport would be a
-// new front end over this same [Store] rather than a second storage design.
-// HTTP first is therefore a reversible bet.
+//
+// Bazel's other cache protocol — the gRPC Remote Execution API, served by
+// package reapi — addresses the same two keyspaces with the same digests, and
+// is a second front end over this same [Store] rather than a second storage
+// design. What that protocol needed of the storage layer, and this one did not,
+// was a presence probe ([Store.Has], for FindMissingBlobs) and the ability to
+// receive a body in pieces across broken connections ([Store.Begin] and
+// [Upload], for a resumable ByteStream write). Both are in terms of the same
+// keyspaces and the same publish path, which is what keeps the two transports
+// storing one thing rather than two.
 //
 // # Mapping onto the existing index
 //
@@ -55,7 +61,6 @@ package bazel
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -156,6 +161,21 @@ func (s *Store) Open(ctx context.Context, k Kind, d Digest) (*os.File, int64, bo
 	return f, fi.Size(), true
 }
 
+// Has reports whether a digest already resolves to a readable body in a
+// keyspace, and refreshes its last use if it does.
+//
+// It is the whole of what FindMissingBlobs needs, and it is an index lookup and
+// a stat rather than a read: a presence answer must stay cheap enough to give
+// for every output of a build at once.
+//
+// The refresh is not incidental. A client told that a blob is present will not
+// upload it, and may not read it until much later in the build, so a presence
+// answer is a promise about the near future that eviction would otherwise be
+// free to break. Counting the probe as active use is what keeps the promise.
+func (s *Store) Has(ctx context.Context, k Kind, d Digest) bool {
+	return s.cache.Has(ctx, k.actionID(d))
+}
+
 // Put stores a body under a digest, streaming it and hashing it on the way
 // past. It never holds the body in memory, and publishes by hardlink rather
 // than by copy, so the bytes cross the disk once however large they are.
@@ -180,46 +200,16 @@ func (s *Store) Put(ctx context.Context, k Kind, d Digest, body io.Reader) error
 		return nil
 	}
 
-	staged, err := s.blobs.Stage()
+	u, err := s.Begin(k, d)
 	if err != nil {
 		return fmt.Errorf("Put: %w", err)
 	}
-	// The staging name must not survive this call on any path. After a
-	// successful publish it is a second name for the published inode; after a
-	// failure it is bytes nothing will ever look for.
-	defer func() {
-		_ = staged.Close()
-		if rerr := os.Remove(staged.Name()); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
-			s.logf("bazel unstage %s: %v", staged.Name(), rerr)
-		}
-	}()
+	defer u.Discard()
 
-	sum := sha256.New()
-	size, err := io.Copy(io.MultiWriter(staged, sum), body)
-	if err != nil {
+	if _, err := io.Copy(u, body); err != nil {
 		return fmt.Errorf("Put: receive: %w", err)
 	}
-	if err := staged.Close(); err != nil {
-		return fmt.Errorf("Put: %w", err)
-	}
-
-	var computed Digest
-	copy(computed[:], sum.Sum(nil))
-
-	// A CAS blob is named by its own content, so a mismatch is a caller sending
-	// bytes that are not what it says they are. An action-cache entry is named
-	// by the action rather than by its body, so its body is stored under the
-	// hash just computed and there is nothing to disagree with.
-	output := computed.outputID()
-	if k == KindCAS {
-		if s.verify && computed != d {
-			s.logf("bazel put cas/%s: body hashes to %s", d, computed)
-			return fmt.Errorf("Put: %w", ErrDigestMismatch)
-		}
-		output = d.outputID()
-	}
-
-	if _, err := s.cache.PutStaged(ctx, k.actionID(d), output, staged.Name(), size); err != nil {
+	if err := u.Commit(ctx); err != nil {
 		return fmt.Errorf("Put: %w", err)
 	}
 	return nil

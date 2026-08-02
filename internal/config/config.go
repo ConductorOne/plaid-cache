@@ -138,6 +138,16 @@ type Config struct {
 	// the difference between a private cache and a public one.
 	BazelAddr string
 
+	// BazelGRPCAddr is the TCP address the daemon serves the cache half of
+	// Bazel's Remote Execution API on, e.g. "localhost:9096". Empty, the
+	// default, serves it not at all.
+	//
+	// It is separate from BazelAddr rather than a mode of it because the two
+	// protocols can run at once over one cache, and a build pointed at either
+	// reads what the other stored. The same reasoning about which interface to
+	// bind applies, and for the same reason.
+	BazelGRPCAddr string
+
 	// DisableBazelVerify stops the Bazel listener from checking that an
 	// uploaded CAS body hashes to the digest naming it. It exists for a client
 	// whose digest function is not SHA-256, since only the bare hash appears in
@@ -197,6 +207,7 @@ func Load() (*Config, error) {
 		S3Prefix:          src("PLAID_GOCACHE_S3_PREFIX"),
 		S3EndpointURL:     src("PLAID_GOCACHE_S3_ENDPOINT_URL"),
 		BazelAddr:         src("PLAID_GOCACHE_BAZEL_ADDR"),
+		BazelGRPCAddr:     src("PLAID_GOCACHE_BAZEL_GRPC_ADDR"),
 		UploadConcurrency: runtime.NumCPU(),
 	}
 
@@ -275,6 +286,7 @@ var settingNames = map[string]bool{
 	"PLAID_GOCACHE_EVICT_INTERVAL":       true,
 	"PLAID_GOCACHE_COMPACT_AFTER":        true,
 	"PLAID_GOCACHE_BAZEL_ADDR":           true,
+	"PLAID_GOCACHE_BAZEL_GRPC_ADDR":      true,
 	"PLAID_GOCACHE_DISABLE_BAZEL_VERIFY": true,
 	"PLAID_GOCACHE_DISABLE_EVICTION":     true,
 	"PLAID_GOCACHE_DISABLE_DAEMON":       true,

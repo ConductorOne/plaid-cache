@@ -64,10 +64,16 @@ drive-by.
   exclusive directory lock.
 - `internal/remote/` — S3 Express One Zone backend plus a no-op implementation
   so the tool is fully usable with the local cache only.
-- `internal/bazel/` — Bazel's HTTP remote-cache protocol as an `http.Handler`
-  over the same tiers. Four routes, opaque bodies, no protobuf and no gRPC.
+- `internal/bazel/` — the storage adapter for Bazel's two keyspaces, plus
+  Bazel's HTTP remote-cache protocol as an `http.Handler` over the same tiers.
+  Four routes, opaque bodies, no protobuf and no gRPC in this package.
+- `internal/reapi/` — the cache half of Bazel's gRPC Remote Execution API over
+  the same `bazel.Store`. This is the only package that imports gRPC or
+  protobuf; the generated bindings come from `github.com/bazelbuild/remote-apis`
+  and `google.golang.org/genproto/googleapis/bytestream`, so there is still
+  nothing to generate here.
 - `internal/daemon/` — the socket server and the auto-spawning client, plus the
-  optional Bazel HTTP listener that runs beside it.
+  optional Bazel HTTP and gRPC listeners that run beside it.
 - `internal/config/` — environment-variable resolution.
 
 ## Module + build conventions
@@ -141,8 +147,10 @@ organization. In particular:
   `-mod=vendor`, no `-buildvcs=false`, no project-specific build tags, no
   wrapper script that has to set the environment up first. Default toolchain
   settings work.
-- No code generation, no protobufs, no frontend, no container orchestration for
-  local development.
+- No code generation, no frontend, no container orchestration for local
+  development. Protocol buffers appear only as pre-generated bindings pulled in
+  as ordinary modules for `internal/reapi`; there is no `protoc` step, no
+  `.proto` file in the tree, and nothing to regenerate.
 - No dependency on any private repository, registry, or credential to build and
   test. The only optional external dependency at runtime is an S3-compatible
   bucket you supply yourself.

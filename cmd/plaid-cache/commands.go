@@ -99,11 +99,13 @@ func openStores(ctx context.Context, cfg *config.Config) (*stores, error) {
 // runServe runs the daemon in the foreground.
 func (a *app) runServe(ctx context.Context) int {
 	var limits limitFlags
-	var bazelAddr string
+	var bazelAddr, bazelGRPCAddr string
 	register := func(fs *flag.FlagSet) {
 		limits.register(fs)
 		fs.StringVar(&bazelAddr, "bazel-addr", "",
 			"also serve Bazel's HTTP remote-cache protocol on this address, e.g. localhost:9095 (default: PLAID_GOCACHE_BAZEL_ADDR)")
+		fs.StringVar(&bazelGRPCAddr, "bazel-grpc-addr", "",
+			"also serve Bazel's gRPC remote-cache protocol on this address, e.g. localhost:9096 (default: PLAID_GOCACHE_BAZEL_GRPC_ADDR)")
 	}
 	if _, err := a.parseFlags("serve", register, a.args[1:]); err != nil {
 		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
@@ -119,6 +121,9 @@ func (a *app) runServe(ctx context.Context) int {
 	}
 	if bazelAddr != "" {
 		cfg.BazelAddr = bazelAddr
+	}
+	if bazelGRPCAddr != "" {
+		cfg.BazelGRPCAddr = bazelGRPCAddr
 	}
 	logf := a.logger(cfg, config.LogInfo)
 
@@ -176,6 +181,22 @@ func (a *app) runServe(ctx context.Context) int {
 			defer bazelWG.Done()
 			if err := srv.ServeBazel(ctx, bazelLn); err != nil && !errors.Is(err, context.Canceled) {
 				logf("bazel listener: %v", err)
+			}
+		}()
+	}
+
+	if cfg.BazelGRPCAddr != "" {
+		grpcLn, lerr := net.Listen("tcp", cfg.BazelGRPCAddr)
+		if lerr != nil {
+			fmt.Fprintf(a.stderr, "plaid-cache: bazel grpc listener: %v\n", lerr)
+			return exitError
+		}
+		logf("serving the Bazel gRPC cache on grpc://%s", grpcLn.Addr())
+		bazelWG.Add(1)
+		go func() {
+			defer bazelWG.Done()
+			if err := srv.ServeBazelGRPC(ctx, grpcLn); err != nil && !errors.Is(err, context.Canceled) {
+				logf("bazel grpc listener: %v", err)
 			}
 		}()
 	}

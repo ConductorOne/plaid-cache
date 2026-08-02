@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/conductorone/plaid-cache.svg)](https://pkg.go.dev/github.com/conductorone/plaid-cache)
 
-`plaid-cache` is a `GOCACHEPROG`-compatible build cache for the Go toolchain, backed by a content-addressed local body store with a Pebble-backed index and an optional S3 Express One Zone remote tier shared across machines. It also speaks [Bazel's HTTP remote-cache protocol](#bazel), so a Bazel build can share the same store and the same shared tier.
+`plaid-cache` is a `GOCACHEPROG`-compatible build cache for the Go toolchain, backed by a content-addressed local body store with a Pebble-backed index and an optional S3 Express One Zone remote tier shared across machines. It also speaks both of [Bazel's remote-cache protocols](#bazel) — the gRPC Remote Execution API and the HTTP one — so a Bazel build can share the same store and the same shared tier.
 
 The index gives the local cache bounded growth — entries are pruned oldest-first by last use until both a TTL and a total-size ceiling hold — so a long-lived workspace cache stops growing without a periodic manual wipe. The remote tier lets a cold machine or a fresh CI runner start warm.
 
@@ -90,7 +90,15 @@ plaid-cache serve
 
 ### Bazel
 
-The daemon can also serve [Bazel's HTTP remote-cache protocol](https://bazel.build/remote/caching), so a Bazel build shares the local store, the byte budget, and the shared remote tier with the Go builds beside it:
+The daemon can also serve Bazel's remote cache, so a Bazel build shares the local store, the byte budget, and the shared remote tier with the Go builds beside it. Both of Bazel's cache protocols are available, over one store:
+
+```sh
+plaid-cache serve -bazel-grpc-addr localhost:9096
+```
+
+```sh
+bazel build --remote_cache=grpc://localhost:9096 //...
+```
 
 ```sh
 plaid-cache serve -bazel-addr localhost:9095
@@ -100,25 +108,78 @@ plaid-cache serve -bazel-addr localhost:9095
 bazel build --remote_cache=http://localhost:9095 //...
 ```
 
-The listener is off unless asked for, and `-bazel-addr` takes a full address rather than a port so that the choice between loopback and every interface is explicit. `PLAID_GOCACHE_BAZEL_ADDR` is the same setting from the environment or the configuration file.
+Both listeners are off unless asked for, and both take a full address rather than a port so that the choice between loopback and every interface is explicit. `PLAID_GOCACHE_BAZEL_GRPC_ADDR` and `PLAID_GOCACHE_BAZEL_ADDR` are the same settings from the environment or the configuration file. They may run at once: a build that uploads over one reads its own outputs back over the other.
 
-It speaks HTTP/1.1 and nothing else — four routes, `GET` and `PUT` on `/ac/<hex-digest>` and `/cas/<hex-digest>`, with each body treated as opaque bytes. That is a complete implementation of the protocol Bazel documents for `--remote_cache=http://…`, and it is deliberately not the gRPC Remote Execution API, which is a far larger surface for a deployment that only wants a cache.
+**Prefer gRPC.** It is the only one of the two whose client can ask the server which blobs it already holds, and that one question is worth more than everything else on this page put together — see [choosing a protocol](#choosing-a-protocol).
 
-The code keeps the two apart on purpose. The storage adapter knows Bazel's two keyspaces and how they map onto this cache; the HTTP handler knows paths, statuses and streaming. Both cache protocols address the same keyspaces with the same digests, so a second front end would be new transport code over the same storage rather than a second storage design.
+The code keeps storage and transport apart on purpose. The storage adapter knows Bazel's two keyspaces and how they map onto this cache; each transport knows only its own wire format. Both protocols address the same keyspaces with the same digests, so the second front end is transport code over the same storage rather than a second storage design.
 
 Bazel's two keyspaces map onto what the index already stores. A CAS blob is addressed by the SHA-256 of its own content, which is exactly an output id, so a blob uploaded by Bazel and the same bytes produced by a Go build occupy one file locally and one object remotely. An action-cache entry maps an action digest to an `ActionResult` message; storing that message *as* a body makes it the same shape as every other entry, so nothing here parses a protocol buffer and no new record type, table, or refcounting rule was needed. The two keyspaces are namespaced apart before they reach the index, because one digest legitimately names an entry in both — Bazel stores an action's `Action` message in the CAS under the digest that keys its `ActionResult` in the action cache.
 
 Bazel traffic shows up in `plaid-cache status` and `plaid-cache stats` beside the toolchain's, since both go through the same tiers.
 
+#### Choosing a protocol
+
+The two protocols reach the same store, so the choice is about what a client can say over each.
+
+Bazel gates output uploads on an existence check: `UploadManifest.upload` asks the cache which of the digests it is about to send are missing, and sends only those. Over gRPC that is a real `FindMissingBlobs` call with a real answer. Over HTTP there is no such call, and Bazel's HTTP client answers the question for itself by declaring every digest missing — so every action that re-runs re-uploads outputs the server already holds.
+
+Measured against Bazel 9.2.0, on a throwaway workspace whose four actions each produce an 8 MiB output (32 MiB total). Bytes are counted on the wire, client to server, by a proxy in front of the listener:
+
+| | HTTP | gRPC |
+| --- | ---: | ---: |
+| Cold build, nothing cached | 33,561,200 | 33,625,080 |
+| Fresh output base, cache hit — nothing re-runs | 1,708 | 3,967 |
+| **Fresh output base, actions re-run and produce identical outputs** | **33,561,200** | **8,495** |
+
+The third row is the one that matters, and it is the common case in any workflow where action keys change more often than action outputs do — a compiler flag, an environment variable, a timestamp in an input. HTTP re-sends all 32 MiB. gRPC sends 8 KB, a reduction of about 3,950×, because `FindMissingBlobs` told it not to bother.
+
+That the saving comes from `FindMissingBlobs` and not from somewhere else was checked by breaking it: a build against a server whose `FindMissingBlobs` was stubbed to report everything missing — the answer Bazel's HTTP client assumes — uploaded 1,879,253 bytes for the same third row, 221× more. (It is not the full 32 MiB because the ByteStream write of a blob the server already has is terminated as soon as the server sees which blob it is, which catches what is already in flight. That backstop is real, but it is a backstop; the question is worth asking a step earlier.)
+
+gRPC brings three smaller things with it:
+
+- **Batching.** `BatchReadBlobs` and `BatchUpdateBlobs` carry many small blobs per round trip, which matters for the many-small-outputs shape that HTTP pays a request each for.
+- **Resumable uploads.** A ByteStream write that breaks part-way is resumed from where it stopped rather than restarted. Over HTTP a retried `PUT` starts a several-hundred-megabyte body again from byte zero.
+- **Compression.** `--remote_cache_compression` is gRPC-only in Bazel, and is supported here.
+
+HTTP remains fully supported and is the simpler thing to operate: one port, one protocol, no protobuf. If your outputs are small, or your actions rarely re-run, it costs you little.
+
+#### The gRPC listener
+
+`-bazel-grpc-addr` serves the cache half of the [Remote Execution API](https://github.com/bazelbuild/remote-apis) v2:
+
+- `Capabilities.GetCapabilities` — advertises SHA-256, an updatable action cache, the batch size limit, and `identity` and `zstd` compressors.
+- `ActionCache.GetActionResult` / `UpdateActionResult`.
+- `ContentAddressableStorage.FindMissingBlobs` / `BatchUpdateBlobs` / `BatchReadBlobs`.
+- `ByteStream.Read` / `Write` / `QueryWriteStatus`.
+
+What is deliberately absent:
+
+- **Remote execution.** `GetCapabilities` returns no execution capabilities at all, so a client pointed here with `--remote_executor` is told at connection time rather than one failed call at a time.
+- **`GetTree`.** It walks a `Directory` tree inside blobs this cache treats as opaque, on behalf of a client that has been handed the root and can walk it with the blob reads it is making anyway. A cache client never calls it. It returns `UNIMPLEMENTED` with a message saying so.
+- **Digest functions other than SHA-256.** A 32-byte SHA-256 digest is already this cache's identifier for a body, which is what lets a Bazel output and the same bytes from a Go build be one file. A client naming another function is refused with `INVALID_ARGUMENT` unless `PLAID_GOCACHE_DISABLE_BAZEL_VERIFY=1` is set, which is the same escape hatch the HTTP listener offers and means the same thing: the operator has decided to trust its clients' addressing.
+- **Named instances.** Only the empty instance name is served. Serving several out of one keyspace would let two logically separate caches share entries without either being told.
+
+**Compression.** `--remote_cache_compression` works. A compressed upload is decoded as it streams in and stored as the plain body, and a compressed download is encoded as it streams out, so one stored copy serves a compressing client, a plain one, the HTTP listener and a Go build that produced the same bytes. Encoding runs at zstd's fastest setting: a cache serves a blob many times and stores it once, so time spent squeezing it is paid on every read. Measured with Bazel 9.2.0 on a single 256 MiB output, the cold upload fell from 268,985,383 bytes to 2,196,171.
+
+**Timeouts.** The server imposes no deadline on a transfer, on purpose — a cache blob can be hundreds of megabytes, and the only honest bound is the client's own patience. What it bounds is idleness: a connection with no active stream is closed after ten minutes, and there is deliberately no `MaxConnectionAge`, which would tear down a connection mid-transfer at an age unrelated to whether the transfer is progressing. Its keepalive enforcement is permissive — a client may ping every ten seconds, with or without an active stream — because a client checking whether the server is still there is exactly what lets it tell a stalled transfer from a slow one.
+
+The matching client-side setting is worth knowing about, because it differs sharply between the two protocols. Bazel's HTTP client applies `--remote_timeout` as an idle timeout: a bound on the longest no-progress gap, so a slow-but-moving transfer of any size completes. Its gRPC client applies the same flag as `withDeadlineAfter` on every stub including ByteStream — a deadline on the *whole* call. **Size `--remote_timeout` for your largest blob divided by your slowest realistic throughput, not for your longest expected stall.** A 700 MB output at 25 MB/s needs more than 28 seconds, and will hard-fail rather than stall if it does not get them.
+
+**Memory.** Nothing buffers a whole blob. A read streams from the open file to the wire and a write streams from the wire to a staging file. Measured: the daemon's peak resident memory while a 256 MiB output was uploaded, downloaded and re-offered was 39.5 MB, and 41.3 MB with compression on.
+
+**Resumable writes.** A `ByteStream.Write` that breaks leaves what it delivered on disk, registered under its resource name. `QueryWriteStatus` reports how far it got, and the next `Write` at that offset continues into the same body. A partial upload nobody resumes is released after ten minutes; at most 256 are held at once, and the longest-idle is dropped to make room rather than refusing a new one. Anything left staged by a process that died is swept at the next start.
+
+
 #### Build without the bytes
 
 `--remote_download_outputs` works over this cache. It is implemented above Bazel's cache-client abstraction — the decision about which outputs to materialise, and the on-demand fetch when something later needs one, are the same code whichever protocol carries the bytes — so an HTTP cache inherits it in full. Measured against Bazel 9.2.0 with a warm cache: `--remote_download_outputs=all` materialised every output, `=minimal` materialised none of them and still took every cache hit, and asking for one afterwards fetched a 400 MB output on demand without re-running the action. The default, `toplevel`, downloads what you asked to build and nothing underneath it.
 
-The one caveat is `--experimental_remote_cache_lease_extension` (off by default), which renews the leases on remote outputs by asking the server which blobs it still has. There is no way to ask that over HTTP, and Bazel's HTTP client answers the question for itself by reporting every blob as absent, so no lease is ever renewed and remote metadata expires on `--experimental_remote_cache_ttl` regardless. Leaving the flag off loses nothing.
+The one caveat is `--experimental_remote_cache_lease_extension` (off by default), which renews the leases on remote outputs by asking the server which blobs it still has. There is no way to ask that over HTTP, and Bazel's HTTP client answers the question for itself by reporting every blob as absent, so no lease is ever renewed and remote metadata expires on `--experimental_remote_cache_ttl` regardless. Leaving the flag off loses nothing. Over gRPC the question has a real answer: a probe that finds a blob present also refreshes its position in the eviction order, so an entry a build has just decided it need not re-send is one eviction has been told is in use.
 
-#### Re-uploads, and the absent blobs Bazel cannot ask about
+#### Re-uploads over HTTP
 
-The gRPC protocol lets Bazel ask which of a set of digests the server already has, and skip uploading those. The HTTP protocol has no such call, and Bazel's HTTP client reports every digest as absent rather than probing: a traced build shows it issue `PUT` for every output of every action it ran, with no `HEAD` or `GET` first. Uploads only follow an action that actually executed — a cache hit uploads nothing — but any action that re-runs re-sends outputs the server already holds, and for a several-hundred-megabyte output that is not free.
+The HTTP protocol has no way for Bazel to ask which digests the server already has, and Bazel's HTTP client reports every digest as absent rather than probing: a traced build shows it issue `PUT` for every output of every action it ran, with no `HEAD` or `GET` first. Uploads only follow an action that actually executed — a cache hit uploads nothing — but any action that re-runs re-sends outputs the server already holds, and for a several-hundred-megabyte output that is not free. This is the cost the gRPC listener's `FindMissingBlobs` removes; over HTTP the best available answer is later and smaller.
 
 So the server does the skipping instead. A `PUT /cas/<digest>` for a body already stored is drained and dropped: no staging write, no hash, no index write, no upload to the shared tier, and the entry's last-used time is refreshed because a body being offered again is a body in use. The bytes still cross the connection — nothing in the protocol can stop that once the request is sent — but everything after the socket is saved. The bytes on disk stay the ones that were verified when they were first stored, so a later upload that disagrees with them is discarded rather than believed.
 
@@ -375,7 +436,8 @@ be a surprising amount of reach for this one to have.
 | `PLAID_GOCACHE_EVICT_INTERVAL` | Eviction ticker period. | `1m` |
 | `PLAID_GOCACHE_COMPACT_AFTER` | Pruned entries that must accumulate before the index is compacted. Deletes in an LSM are writes, so pruning grows the index until a compaction reclaims it. | `1000` |
 | `PLAID_GOCACHE_BAZEL_ADDR` | Address for the Bazel HTTP remote cache, e.g. `localhost:9095`. Empty serves it not at all. | empty |
-| `PLAID_GOCACHE_DISABLE_BAZEL_VERIFY` | `1` stops the Bazel listener from checking that an uploaded CAS body hashes to the digest naming it. For clients whose digest function is not SHA-256. | unset |
+| `PLAID_GOCACHE_BAZEL_GRPC_ADDR` | Address for the Bazel gRPC remote cache, e.g. `localhost:9096`. Empty serves it not at all. | empty |
+| `PLAID_GOCACHE_DISABLE_BAZEL_VERIFY` | `1` stops both Bazel listeners from checking that an uploaded CAS body hashes to the digest naming it, and lets a gRPC client name a digest function this cache cannot compute. For clients whose digest function is not SHA-256. | unset |
 | `PLAID_GOCACHE_DISABLE_EVICTION` | `1` disables eviction entirely. | unset |
 | `PLAID_GOCACHE_DISABLE_DAEMON` | `1` forces direct in-process mode. | unset |
 | `PLAID_GOCACHE_LOG` | Verbosity: `off`, `error`, `info`, `debug`. | `error` |
