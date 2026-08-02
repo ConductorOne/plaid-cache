@@ -10,7 +10,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/conductorone/plaid-cache/internal/adopt"
@@ -97,7 +99,13 @@ func openStores(ctx context.Context, cfg *config.Config) (*stores, error) {
 // runServe runs the daemon in the foreground.
 func (a *app) runServe(ctx context.Context) int {
 	var limits limitFlags
-	if _, err := a.parseFlags("serve", limits.register, a.args[1:]); err != nil {
+	var bazelAddr string
+	register := func(fs *flag.FlagSet) {
+		limits.register(fs)
+		fs.StringVar(&bazelAddr, "bazel-addr", "",
+			"also serve Bazel's HTTP remote-cache protocol on this address, e.g. localhost:9095 (default: PLAID_GOCACHE_BAZEL_ADDR)")
+	}
+	if _, err := a.parseFlags("serve", register, a.args[1:]); err != nil {
 		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
 		return exitUsage
 	}
@@ -108,6 +116,9 @@ func (a *app) runServe(ctx context.Context) int {
 	if err := limits.applyTo(cfg); err != nil {
 		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
 		return exitUsage
+	}
+	if bazelAddr != "" {
+		cfg.BazelAddr = bazelAddr
 	}
 	logf := a.logger(cfg, config.LogInfo)
 
@@ -140,6 +151,34 @@ func (a *app) runServe(ctx context.Context) int {
 		Config: cfg, Cache: c, Index: st.idx, Blobs: st.blobs, Logf: logf, Version: buildVersion(),
 	})
 	logf("serving on %s (pid %d)", cfg.SocketPath(), os.Getpid())
+
+	// The Bazel listener runs beside the socket rather than instead of it, and
+	// it holds the index the deferred closes above release. Stopping the daemon
+	// and waiting for it therefore has to happen before those run, which is
+	// what the ordering of these two defers buys.
+	var bazelWG sync.WaitGroup
+	defer bazelWG.Wait()
+	defer srv.Stop()
+
+	if cfg.BazelAddr != "" {
+		bazelLn, lerr := net.Listen("tcp", cfg.BazelAddr)
+		if lerr != nil {
+			// Refusing to start is the point. A daemon that quietly served only
+			// half of what it was asked for would leave Bazel with a refused
+			// connection on every action, which it reports as an error rather
+			// than as a miss.
+			fmt.Fprintf(a.stderr, "plaid-cache: bazel listener: %v\n", lerr)
+			return exitError
+		}
+		logf("serving the Bazel HTTP cache on http://%s", bazelLn.Addr())
+		bazelWG.Add(1)
+		go func() {
+			defer bazelWG.Done()
+			if err := srv.ServeBazel(ctx, bazelLn); err != nil && !errors.Is(err, context.Canceled) {
+				logf("bazel listener: %v", err)
+			}
+		}()
+	}
 
 	if err := srv.Serve(ctx, ln); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)

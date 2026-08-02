@@ -11,11 +11,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/conductorone/plaid-cache/internal/adopt"
+	"github.com/conductorone/plaid-cache/internal/bazel"
 	"github.com/conductorone/plaid-cache/internal/blob"
 	"github.com/conductorone/plaid-cache/internal/cache"
 	"github.com/conductorone/plaid-cache/internal/config"
@@ -245,6 +247,88 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			s.handle(ctx, conn)
 		}()
 	}
+}
+
+// Bazel HTTP listener timeouts.
+//
+// There is deliberately no whole-request deadline. A cache blob can be hundreds
+// of megabytes, so the only honest bound on a transfer is the client's own
+// patience; a read or write timeout tuned for a small request would kill
+// exactly the uploads worth caching. What is bounded is the shape a request can
+// take before it is one: headers must arrive promptly, and an idle kept-alive
+// connection is closed rather than held.
+const (
+	bazelReadHeaderTimeout = 30 * time.Second
+	bazelIdleTimeout       = 10 * time.Minute
+	bazelShutdownGrace     = 30 * time.Second
+)
+
+// ServeBazel serves the Bazel HTTP remote-cache protocol on ln until the daemon
+// is asked to stop or the context is cancelled.
+//
+// The listener counts as one connection for the whole of its life, which
+// suppresses the idle exit. A GOCACHEPROG client that finds no daemon spawns
+// one; Bazel cannot, and would see a refused connection instead of a miss. A
+// daemon told to serve Bazel is therefore a daemon that has been asked to stay,
+// and this is where that decision lives rather than in a second timeout setting
+// nobody would know to change.
+func (s *Server) ServeBazel(ctx context.Context, ln net.Listener) error {
+	if s.blobs == nil {
+		// Every upload is staged in the body store before it is published, so a
+		// daemon assembled without one cannot serve this protocol at all.
+		// Saying so beats a nil dereference on the first upload.
+		_ = ln.Close()
+		return errors.New("ServeBazel: this daemon has no body store")
+	}
+
+	s.enter()
+	defer s.leave()
+
+	// A process killed mid-upload leaves a staged body that nothing references
+	// and no eviction pass accounts for. Exactly one process holds the index,
+	// and therefore the store, so anything still here is from a previous one.
+	if n, err := s.blobs.CleanStaging(); err != nil {
+		s.logf("bazel: clean staging: %v", err)
+	} else if n > 0 {
+		s.logf("bazel: removed %d staged bodies left by a previous process", n)
+	}
+
+	bstore := bazel.NewStore(bazel.StoreParams{
+		Cache:  s.cache,
+		Blobs:  s.blobs,
+		Logf:   s.logf,
+		Verify: !s.cfg.DisableBazelVerify,
+	})
+	srv := &http.Server{
+		Handler:           bazel.NewHandler(bstore, s.logf),
+		ReadHeaderTimeout: bazelReadHeaderTimeout,
+		IdleTimeout:       bazelIdleTimeout,
+		// Request contexts derive from ctx, so a cancelled daemon cancels the
+		// remote fetches its in-flight handlers are waiting on.
+		BaseContext: func(net.Listener) context.Context { return ctx },
+	}
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-s.stopped:
+		case <-done:
+			return
+		}
+		// Shutdown lets in-flight transfers finish, so the grace period is
+		// what stops one stalled upload from holding the process open. It must
+		// not inherit ctx, which is already cancelled on that path.
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bazelShutdownGrace)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	}()
+
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("ServeBazel: %w", err)
+	}
+	return nil
 }
 
 // drain waits for in-flight connections to finish.

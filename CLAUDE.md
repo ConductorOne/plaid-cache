@@ -64,7 +64,10 @@ drive-by.
   exclusive directory lock.
 - `internal/remote/` — S3 Express One Zone backend plus a no-op implementation
   so the tool is fully usable with the local cache only.
-- `internal/daemon/` — the socket server and the auto-spawning client.
+- `internal/bazel/` — Bazel's HTTP remote-cache protocol as an `http.Handler`
+  over the same tiers. Four routes, opaque bodies, no protobuf and no gRPC.
+- `internal/daemon/` — the socket server and the auto-spawning client, plus the
+  optional Bazel HTTP listener that runs beside it.
 - `internal/config/` — environment-variable resolution.
 
 ## Module + build conventions

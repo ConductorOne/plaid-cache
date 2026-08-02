@@ -360,3 +360,40 @@ func TestPutStagedRejectsAMissingBody(t *testing.T) {
 		t.Fatal("a failed PutStaged still indexed an entry")
 	}
 }
+
+// TestHasReportsPresenceWithoutCountingALookup pins that a write-side presence
+// probe stays out of the hit counters. Folding probes into the hit rate would
+// make that number describe something other than how often a read was served.
+func TestHasReportsPresenceWithoutCountingALookup(t *testing.T) {
+	tc := newTestCache(t)
+	a, o := mkAction(20), mkOutput(20)
+
+	if tc.cache.Has(t.Context(), a) {
+		t.Fatal("Has = true on an empty cache")
+	}
+	tc.put(t, a, o, []byte("stored"))
+	if !tc.cache.Has(t.Context(), a) {
+		t.Fatal("Has = false for an action that was just stored")
+	}
+
+	m := tc.cache.Metrics()
+	if m.GetLocalHit != 0 || m.GetMiss != 0 {
+		t.Fatalf("Has moved the lookup counters: %+v", m)
+	}
+}
+
+// TestHasReportsAMissingBodyAsAbsent pins that the probe checks the body rather
+// than only the index, so that a caller reacting by storing it repairs the
+// dangling entry instead of skipping the write that would have.
+func TestHasReportsAMissingBodyAsAbsent(t *testing.T) {
+	tc := newTestCache(t)
+	a, o := mkAction(21), mkOutput(21)
+	tc.put(t, a, o, []byte("about to go missing"))
+
+	if err := os.Remove(tc.blobs.Path(o)); err != nil {
+		t.Fatalf("removing the body: %v", err)
+	}
+	if tc.cache.Has(t.Context(), a) {
+		t.Fatal("Has = true for an entry whose body is gone")
+	}
+}

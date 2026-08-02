@@ -4,6 +4,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -100,6 +101,14 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if c.Log != LogError {
 		t.Fatalf("Log = %v, want error", c.Log)
+	}
+	// The Bazel listener is opt-in: a second listener is something to ask for
+	// rather than something to find running.
+	if c.BazelAddr != "" {
+		t.Fatalf("BazelAddr = %q by default, want it empty", c.BazelAddr)
+	}
+	if c.DisableBazelVerify {
+		t.Fatalf("DisableBazelVerify = true by default, want uploads verified")
 	}
 }
 
@@ -264,6 +273,8 @@ func clearEnv(t *testing.T) {
 		"PLAID_GOCACHE_DISABLE_DAEMON",
 		"PLAID_GOCACHE_LOG",
 		"PLAID_GOCACHE_COMPACT_AFTER",
+		"PLAID_GOCACHE_BAZEL_ADDR",
+		"PLAID_GOCACHE_DISABLE_BAZEL_VERIFY",
 		"XDG_CACHE_HOME",
 	} {
 		// Setting to empty is equivalent to unset for every reader here,
@@ -277,4 +288,50 @@ func clearEnv(t *testing.T) {
 	// clearing exists to prevent.
 	t.Setenv("PLAID_GOCACHE_CONFIG", "")
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+}
+
+// TestLoadBazelSettings pins that the Bazel listener is configurable from the
+// environment as well as from the serve flag, since a supervised daemon is
+// started from a unit file rather than by hand.
+func TestLoadBazelSettings(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PLAID_GOCACHE_DIR", t.TempDir())
+	t.Setenv("PLAID_GOCACHE_BAZEL_ADDR", "localhost:9095")
+	t.Setenv("PLAID_GOCACHE_DISABLE_BAZEL_VERIFY", "1")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.BazelAddr != "localhost:9095" {
+		t.Fatalf("BazelAddr = %q, want %q", c.BazelAddr, "localhost:9095")
+	}
+	if !c.DisableBazelVerify {
+		t.Fatalf("DisableBazelVerify = false, want true")
+	}
+}
+
+// TestBazelSettingsAreValidFileKeys pins that both settings can be written to
+// the configuration file. An unknown key there is a hard error, so a setting
+// missing from the accepted set is one a user cannot persist.
+func TestBazelSettingsAreValidFileKeys(t *testing.T) {
+	clearEnv(t)
+	dir := t.TempDir()
+	t.Setenv("PLAID_GOCACHE_DIR", dir)
+	path := filepath.Join(dir, "config")
+	if err := os.WriteFile(path, []byte("bazel-addr = localhost:9096\ndisable-bazel-verify = 1\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv(configFileEnvVar, path)
+
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.BazelAddr != "localhost:9096" {
+		t.Fatalf("BazelAddr = %q, want %q", c.BazelAddr, "localhost:9096")
+	}
+	if !c.DisableBazelVerify {
+		t.Fatalf("DisableBazelVerify = false, want true")
+	}
 }

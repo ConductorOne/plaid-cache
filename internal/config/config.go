@@ -127,6 +127,23 @@ type Config struct {
 	// compactions are driven by level fill, which a small index never reaches.
 	CompactAfterPruned int64
 
+	// BazelAddr is the TCP address the daemon serves Bazel's HTTP remote-cache
+	// protocol on, e.g. "localhost:9095". Empty, the default, serves it not at
+	// all: a second listener is something to ask for rather than something to
+	// find running.
+	//
+	// It is a full address rather than a port so that "which interface" is an
+	// explicit decision. A cache accepts bodies that later become the binaries
+	// a machine runs, so the difference between loopback and every interface is
+	// the difference between a private cache and a public one.
+	BazelAddr string
+
+	// DisableBazelVerify stops the Bazel listener from checking that an
+	// uploaded CAS body hashes to the digest naming it. It exists for a client
+	// whose digest function is not SHA-256, since only the bare hash appears in
+	// the request path and a server cannot tell which function produced it.
+	DisableBazelVerify bool
+
 	// DisableEviction turns off the eviction ticker entirely. Intended for
 	// debugging; it reintroduces unbounded growth.
 	DisableEviction bool
@@ -179,6 +196,7 @@ func Load() (*Config, error) {
 		S3Region:          src("PLAID_GOCACHE_S3_REGION"),
 		S3Prefix:          src("PLAID_GOCACHE_S3_PREFIX"),
 		S3EndpointURL:     src("PLAID_GOCACHE_S3_ENDPOINT_URL"),
+		BazelAddr:         src("PLAID_GOCACHE_BAZEL_ADDR"),
 		UploadConcurrency: runtime.NumCPU(),
 	}
 
@@ -208,6 +226,9 @@ func Load() (*Config, error) {
 	}
 	if c.UploadConcurrency < 1 {
 		return nil, fmt.Errorf("Load: PLAID_GOCACHE_UPLOAD_CONCURRENCY: got %d, want >= 1", c.UploadConcurrency)
+	}
+	if c.DisableBazelVerify, err = envBool(src, "PLAID_GOCACHE_DISABLE_BAZEL_VERIFY"); err != nil {
+		return nil, fmt.Errorf("Load: %w", err)
 	}
 	if c.DisableEviction, err = envBool(src, "PLAID_GOCACHE_DISABLE_EVICTION"); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
@@ -240,22 +261,24 @@ const configFileName = "config"
 // size ceiling that silently reverts to the default would let the cache grow
 // until it filled the disk — the failure this tool exists to prevent.
 var settingNames = map[string]bool{
-	"PLAID_GOCACHE_DIR":                true,
-	"PLAID_GOCACHE_MAX_BYTES":          true,
-	"PLAID_GOCACHE_TTL":                true,
-	"PLAID_GOCACHE_S3_BUCKET":          true,
-	"PLAID_GOCACHE_S3_REGION":          true,
-	"PLAID_GOCACHE_S3_PREFIX":          true,
-	"PLAID_GOCACHE_S3_ENDPOINT_URL":    true,
-	"PLAID_GOCACHE_MIN_UPLOAD_SIZE":    true,
-	"PLAID_GOCACHE_UPLOAD_CONCURRENCY": true,
-	"PLAID_GOCACHE_TOUCH_GRANULARITY":  true,
-	"PLAID_GOCACHE_IDLE_TIMEOUT":       true,
-	"PLAID_GOCACHE_EVICT_INTERVAL":     true,
-	"PLAID_GOCACHE_COMPACT_AFTER":      true,
-	"PLAID_GOCACHE_DISABLE_EVICTION":   true,
-	"PLAID_GOCACHE_DISABLE_DAEMON":     true,
-	"PLAID_GOCACHE_LOG":                true,
+	"PLAID_GOCACHE_DIR":                  true,
+	"PLAID_GOCACHE_MAX_BYTES":            true,
+	"PLAID_GOCACHE_TTL":                  true,
+	"PLAID_GOCACHE_S3_BUCKET":            true,
+	"PLAID_GOCACHE_S3_REGION":            true,
+	"PLAID_GOCACHE_S3_PREFIX":            true,
+	"PLAID_GOCACHE_S3_ENDPOINT_URL":      true,
+	"PLAID_GOCACHE_MIN_UPLOAD_SIZE":      true,
+	"PLAID_GOCACHE_UPLOAD_CONCURRENCY":   true,
+	"PLAID_GOCACHE_TOUCH_GRANULARITY":    true,
+	"PLAID_GOCACHE_IDLE_TIMEOUT":         true,
+	"PLAID_GOCACHE_EVICT_INTERVAL":       true,
+	"PLAID_GOCACHE_COMPACT_AFTER":        true,
+	"PLAID_GOCACHE_BAZEL_ADDR":           true,
+	"PLAID_GOCACHE_DISABLE_BAZEL_VERIFY": true,
+	"PLAID_GOCACHE_DISABLE_EVICTION":     true,
+	"PLAID_GOCACHE_DISABLE_DAEMON":       true,
+	"PLAID_GOCACHE_LOG":                  true,
 }
 
 // ConfigFilePath returns where the configuration file is looked for, whether or

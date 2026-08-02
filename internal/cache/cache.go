@@ -246,6 +246,32 @@ func (c *Cache) getRemote(ctx context.Context, a ids.ActionID) (Result, error) {
 	return Result{OutputID: outputID, Size: size, DiskPath: path, Time: time.Unix(0, created)}, nil
 }
 
+// Has reports whether an action already resolves to a readable body,
+// refreshing its last-used time if it does.
+//
+// It is a presence probe rather than a lookup, and is counted as neither a hit
+// nor a miss: the caller is deciding whether to write, not trying to read, and
+// folding write-side probes into the hit rate would make that number describe
+// something else. The refresh is the point of doing it here rather than in the
+// caller — a body being offered again is a body in active use, and eviction
+// should hear about that.
+//
+// A missing or unreadable body is reported as absent, so a caller that reacts
+// by storing it repairs the dangling entry as a side effect.
+func (c *Cache) Has(ctx context.Context, a ids.ActionID) bool {
+	e, ok, err := c.idx.Get(a)
+	if err != nil || !ok {
+		return false
+	}
+	if _, _, err := c.blobs.Get(e.OutputID); err != nil {
+		return false
+	}
+	if _, err := c.idx.Touch(a, time.Now().UnixNano(), c.cfg.TouchGranularity); err != nil {
+		c.logf("index touch %s: %v", a, err)
+	}
+	return true
+}
+
 // Put records an action's output.
 //
 // The body is written to the local store synchronously, because the toolchain
