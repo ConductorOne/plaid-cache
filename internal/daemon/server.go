@@ -52,6 +52,14 @@ type Server struct {
 	conns    sync.WaitGroup
 	stopped  chan struct{}
 	stopOnce sync.Once
+
+	// bazelOnce guards the storage adapter the Bazel transports share. Both
+	// listeners may run at once, and the startup sweep of leftover staging
+	// files must happen before either serves and never again: a second sweep
+	// would delete the bodies the first listener's uploads are streaming into.
+	bazelOnce  sync.Once
+	bazelStore *bazel.Store
+	bazelErr   error
 }
 
 // ServerParams carries the daemon's dependencies.
@@ -273,32 +281,15 @@ const (
 // and this is where that decision lives rather than in a second timeout setting
 // nobody would know to change.
 func (s *Server) ServeBazel(ctx context.Context, ln net.Listener) error {
-	if s.blobs == nil {
-		// Every upload is staged in the body store before it is published, so a
-		// daemon assembled without one cannot serve this protocol at all.
-		// Saying so beats a nil dereference on the first upload.
+	bstore, err := s.bazelAdapter()
+	if err != nil {
 		_ = ln.Close()
-		return errors.New("ServeBazel: this daemon has no body store")
+		return fmt.Errorf("ServeBazel: %w", err)
 	}
 
 	s.enter()
 	defer s.leave()
 
-	// A process killed mid-upload leaves a staged body that nothing references
-	// and no eviction pass accounts for. Exactly one process holds the index,
-	// and therefore the store, so anything still here is from a previous one.
-	if n, err := s.blobs.CleanStaging(); err != nil {
-		s.logf("bazel: clean staging: %v", err)
-	} else if n > 0 {
-		s.logf("bazel: removed %d staged bodies left by a previous process", n)
-	}
-
-	bstore := bazel.NewStore(bazel.StoreParams{
-		Cache:  s.cache,
-		Blobs:  s.blobs,
-		Logf:   s.logf,
-		Verify: !s.cfg.DisableBazelVerify,
-	})
 	srv := &http.Server{
 		Handler:           bazel.NewHandler(bstore, s.logf),
 		ReadHeaderTimeout: bazelReadHeaderTimeout,
@@ -329,6 +320,40 @@ func (s *Server) ServeBazel(ctx context.Context, ln net.Listener) error {
 		return fmt.Errorf("ServeBazel: %w", err)
 	}
 	return nil
+}
+
+// bazelAdapter returns the storage adapter both Bazel transports serve over,
+// building it on first use.
+//
+// One adapter rather than one per listener, so that the sweep of staging files
+// left by a previous process happens exactly once. It has to happen before
+// anything serves — a body staged by a process that was killed is referenced by
+// nothing and accounted for by no eviction pass — and it must not happen again
+// afterwards, because by then the staging directory holds uploads in flight.
+func (s *Server) bazelAdapter() (*bazel.Store, error) {
+	s.bazelOnce.Do(func() {
+		if s.blobs == nil {
+			// Every upload is staged in the body store before it is published,
+			// so a daemon assembled without one cannot serve these protocols at
+			// all. Saying so beats a nil dereference on the first upload.
+			s.bazelErr = errors.New("this daemon has no body store")
+			return
+		}
+		// Exactly one process holds the index, and therefore the store, so
+		// anything still staged is from a previous one.
+		if n, err := s.blobs.CleanStaging(); err != nil {
+			s.logf("bazel: clean staging: %v", err)
+		} else if n > 0 {
+			s.logf("bazel: removed %d staged bodies left by a previous process", n)
+		}
+		s.bazelStore = bazel.NewStore(bazel.StoreParams{
+			Cache:  s.cache,
+			Blobs:  s.blobs,
+			Logf:   s.logf,
+			Verify: !s.cfg.DisableBazelVerify,
+		})
+	})
+	return s.bazelStore, s.bazelErr
 }
 
 // drain waits for in-flight connections to finish.

@@ -274,6 +274,7 @@ func clearEnv(t *testing.T) {
 		"PLAID_GOCACHE_LOG",
 		"PLAID_GOCACHE_COMPACT_AFTER",
 		"PLAID_GOCACHE_BAZEL_ADDR",
+		"PLAID_GOCACHE_BAZEL_GRPC_ADDR",
 		"PLAID_GOCACHE_DISABLE_BAZEL_VERIFY",
 		"XDG_CACHE_HOME",
 	} {
@@ -297,6 +298,7 @@ func TestLoadBazelSettings(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("PLAID_GOCACHE_DIR", t.TempDir())
 	t.Setenv("PLAID_GOCACHE_BAZEL_ADDR", "localhost:9095")
+	t.Setenv("PLAID_GOCACHE_BAZEL_GRPC_ADDR", "localhost:9096")
 	t.Setenv("PLAID_GOCACHE_DISABLE_BAZEL_VERIFY", "1")
 
 	c, err := Load()
@@ -305,6 +307,9 @@ func TestLoadBazelSettings(t *testing.T) {
 	}
 	if c.BazelAddr != "localhost:9095" {
 		t.Fatalf("BazelAddr = %q, want %q", c.BazelAddr, "localhost:9095")
+	}
+	if c.BazelGRPCAddr != "localhost:9096" {
+		t.Fatalf("BazelGRPCAddr = %q, want %q", c.BazelGRPCAddr, "localhost:9096")
 	}
 	if !c.DisableBazelVerify {
 		t.Fatalf("DisableBazelVerify = false, want true")
@@ -319,7 +324,7 @@ func TestBazelSettingsAreValidFileKeys(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PLAID_GOCACHE_DIR", dir)
 	path := filepath.Join(dir, "config")
-	if err := os.WriteFile(path, []byte("bazel-addr = localhost:9096\ndisable-bazel-verify = 1\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("bazel-addr = localhost:9096\nbazel-grpc-addr = localhost:9097\ndisable-bazel-verify = 1\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	t.Setenv(configFileEnvVar, path)
@@ -330,6 +335,9 @@ func TestBazelSettingsAreValidFileKeys(t *testing.T) {
 	}
 	if c.BazelAddr != "localhost:9096" {
 		t.Fatalf("BazelAddr = %q, want %q", c.BazelAddr, "localhost:9096")
+	}
+	if c.BazelGRPCAddr != "localhost:9097" {
+		t.Fatalf("BazelGRPCAddr = %q, want %q", c.BazelGRPCAddr, "localhost:9097")
 	}
 	if !c.DisableBazelVerify {
 		t.Fatalf("DisableBazelVerify = false, want true")
