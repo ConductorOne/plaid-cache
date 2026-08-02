@@ -271,3 +271,129 @@ func TestCloseIsIdempotent(t *testing.T) {
 		t.Fatalf("UploadOK = %d, want 1: the second Close must not re-drain", got)
 	}
 }
+
+// TestPutStagedPublishesWithoutCopying pins the put path for a body that was
+// already written to disk before its address was known: it is indexed, served
+// on the next get, and hardlinked rather than copied.
+func TestPutStagedPublishesWithoutCopying(t *testing.T) {
+	tc := newTestCache(t)
+	body := []byte("an opaque record, addressed by something other than itself")
+
+	f, err := tc.blobs.Stage()
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	if _, err := f.Write(body); err != nil {
+		t.Fatalf("write staged body: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close staged body: %v", err)
+	}
+	defer os.Remove(f.Name())
+
+	a := mkAction(10)
+	o := mkOutput(10)
+	path, err := tc.cache.PutStaged(t.Context(), a, o, f.Name(), int64(len(body)))
+	if err != nil {
+		t.Fatalf("PutStaged: %v", err)
+	}
+
+	res := tc.get(t, a)
+	if res.Miss {
+		t.Fatal("PutStaged stored nothing")
+	}
+	if res.DiskPath != path {
+		t.Fatalf("DiskPath = %q, want %q", res.DiskPath, path)
+	}
+	if res.Size != int64(len(body)) {
+		t.Fatalf("Size = %d, want %d", res.Size, len(body))
+	}
+	got, err := os.ReadFile(res.DiskPath)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("stored body = %q (%v), want %q", got, err, body)
+	}
+	tc.wantStats(t, 1, 1)
+}
+
+// TestPutStagedUploadsToTheSharedTier pins that a staged put reaches the remote
+// tier the same way an ordinary one does. The two paths differ only in how the
+// bytes arrived on disk, and a shared cache that silently held back half its
+// entries would be worse than one that held back none.
+func TestPutStagedUploadsToTheSharedTier(t *testing.T) {
+	tc := newTestCache(t, withRemote())
+	body := []byte("shared")
+
+	f, err := tc.blobs.Stage()
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	if _, err := f.Write(body); err != nil {
+		t.Fatalf("write staged body: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close staged body: %v", err)
+	}
+	defer os.Remove(f.Name())
+
+	a := mkAction(11)
+	o := mkOutput(11)
+	if _, err := tc.cache.PutStaged(t.Context(), a, o, f.Name(), int64(len(body))); err != nil {
+		t.Fatalf("PutStaged: %v", err)
+	}
+	if err := tc.cache.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, ok := tc.rem.storedAction(a); !ok {
+		t.Fatal("PutStaged did not upload an action record")
+	}
+}
+
+// TestPutStagedRejectsAMissingBody pins that a staging file that is not there
+// is an error rather than an index entry pointing at nothing.
+func TestPutStagedRejectsAMissingBody(t *testing.T) {
+	tc := newTestCache(t)
+	a := mkAction(12)
+	if _, err := tc.cache.PutStaged(t.Context(), a, ids.OutputID{}, t.TempDir()+"/gone", 1); err == nil {
+		t.Fatal("PutStaged accepted a staging path that does not exist")
+	}
+	if res := tc.get(t, a); !res.Miss {
+		t.Fatal("a failed PutStaged still indexed an entry")
+	}
+}
+
+// TestHasReportsPresenceWithoutCountingALookup pins that a write-side presence
+// probe stays out of the hit counters. Folding probes into the hit rate would
+// make that number describe something other than how often a read was served.
+func TestHasReportsPresenceWithoutCountingALookup(t *testing.T) {
+	tc := newTestCache(t)
+	a, o := mkAction(20), mkOutput(20)
+
+	if tc.cache.Has(t.Context(), a) {
+		t.Fatal("Has = true on an empty cache")
+	}
+	tc.put(t, a, o, []byte("stored"))
+	if !tc.cache.Has(t.Context(), a) {
+		t.Fatal("Has = false for an action that was just stored")
+	}
+
+	m := tc.cache.Metrics()
+	if m.GetLocalHit != 0 || m.GetMiss != 0 {
+		t.Fatalf("Has moved the lookup counters: %+v", m)
+	}
+}
+
+// TestHasReportsAMissingBodyAsAbsent pins that the probe checks the body rather
+// than only the index, so that a caller reacting by storing it repairs the
+// dangling entry instead of skipping the write that would have.
+func TestHasReportsAMissingBodyAsAbsent(t *testing.T) {
+	tc := newTestCache(t)
+	a, o := mkAction(21), mkOutput(21)
+	tc.put(t, a, o, []byte("about to go missing"))
+
+	if err := os.Remove(tc.blobs.Path(o)); err != nil {
+		t.Fatalf("removing the body: %v", err)
+	}
+	if tc.cache.Has(t.Context(), a) {
+		t.Fatal("Has = true for an entry whose body is gone")
+	}
+}

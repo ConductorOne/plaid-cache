@@ -246,6 +246,32 @@ func (c *Cache) getRemote(ctx context.Context, a ids.ActionID) (Result, error) {
 	return Result{OutputID: outputID, Size: size, DiskPath: path, Time: time.Unix(0, created)}, nil
 }
 
+// Has reports whether an action already resolves to a readable body,
+// refreshing its last-used time if it does.
+//
+// It is a presence probe rather than a lookup, and is counted as neither a hit
+// nor a miss: the caller is deciding whether to write, not trying to read, and
+// folding write-side probes into the hit rate would make that number describe
+// something else. The refresh is the point of doing it here rather than in the
+// caller — a body being offered again is a body in active use, and eviction
+// should hear about that.
+//
+// A missing or unreadable body is reported as absent, so a caller that reacts
+// by storing it repairs the dangling entry as a side effect.
+func (c *Cache) Has(ctx context.Context, a ids.ActionID) bool {
+	e, ok, err := c.idx.Get(a)
+	if err != nil || !ok {
+		return false
+	}
+	if _, _, err := c.blobs.Get(e.OutputID); err != nil {
+		return false
+	}
+	if _, err := c.idx.Touch(a, time.Now().UnixNano(), c.cfg.TouchGranularity); err != nil {
+		c.logf("index touch %s: %v", a, err)
+	}
+	return true
+}
+
 // Put records an action's output.
 //
 // The body is written to the local store synchronously, because the toolchain
@@ -256,7 +282,37 @@ func (c *Cache) Put(ctx context.Context, a ids.ActionID, o ids.OutputID, body io
 	if err != nil {
 		return "", fmt.Errorf("Put: %w", err)
 	}
+	c.record(a, o, path, size, diskBytes)
+	return path, nil
+}
 
+// PutStaged records an action whose body is already written to a staging file
+// in the body store.
+//
+// It serves callers that cannot name a body until they have read it: an entry
+// addressed by something other than its own content — a Bazel action-cache
+// record is addressed by the action it describes — has no content address to
+// pass to Put beforehand. Such a caller streams into blob.Store.Stage, hashes
+// as it goes, and hands the file here, where it is published by hardlink rather
+// than copied.
+//
+// The staging file remains the caller's to remove; after a successful publish
+// it is a second name for the same inode.
+func (c *Cache) PutStaged(ctx context.Context, a ids.ActionID, o ids.OutputID, stagedPath string, size int64) (diskPath string, err error) {
+	path, diskBytes, _, err := c.blobs.Adopt(o, stagedPath, size)
+	if err != nil {
+		return "", fmt.Errorf("PutStaged: %w", err)
+	}
+	c.record(a, o, path, size, diskBytes)
+	return path, nil
+}
+
+// record indexes a body that is already published and queues its upload.
+//
+// It is shared by the two put paths so that they cannot drift on the parts that
+// are not about how the bytes reached the disk: what the index records, what
+// the counters say, and which uploads the shared tier is offered.
+func (c *Cache) record(a ids.ActionID, o ids.OutputID, path string, size, diskBytes int64) {
 	now := time.Now().UnixNano()
 	if err := c.idx.Put(a, index.Entry{
 		OutputID:   o,
@@ -264,27 +320,27 @@ func (c *Cache) Put(ctx context.Context, a ids.ActionID, o ids.OutputID, body io
 		CreatedAt:  now,
 		LastUsedAt: now,
 	}, diskBytes); err != nil {
-		// The body is on disk and the path is valid, so the toolchain can
+		// The body is on disk and the path is valid, so the caller can
 		// proceed. Only our accounting suffered.
 		c.logf("index put %s: %v", a, err)
 	}
 	c.metrics.Put.Add(1)
 
-	if c.cfg.RemoteEnabled() {
-		if size < c.cfg.MinUploadSize {
-			c.metrics.UploadSkip.Add(1)
-		} else {
-			c.uploads.submit(uploadJob{
-				action:  a,
-				output:  o,
-				path:    path,
-				size:    size,
-				mtime:   time.Unix(0, now),
-				backend: c.rem,
-			})
-		}
+	if !c.cfg.RemoteEnabled() {
+		return
 	}
-	return path, nil
+	if size < c.cfg.MinUploadSize {
+		c.metrics.UploadSkip.Add(1)
+		return
+	}
+	c.uploads.submit(uploadJob{
+		action:  a,
+		output:  o,
+		path:    path,
+		size:    size,
+		mtime:   time.Unix(0, now),
+		backend: c.rem,
+	})
 }
 
 // Metrics returns a snapshot of the counters.

@@ -128,6 +128,12 @@ Both serve and gc accept -max-bytes and -ttl, which override the environment.
 On gc the override applies to that pass only, and is forwarded to a running
 daemon rather than being silently ignored by it.
 
+serve also accepts -bazel-addr, which serves Bazel's HTTP remote-cache protocol
+on that address beside the GOCACHEPROG socket, over the same local store and
+shared tier:
+  plaid-cache serve -bazel-addr localhost:9095
+  bazel build --remote_cache=http://localhost:9095 //...
+
 Configuration is read from the environment; see the README for the full list.
 `)
 }
