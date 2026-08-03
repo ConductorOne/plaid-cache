@@ -629,3 +629,100 @@ func TestDecoderRejectsBodyOnNonPutCommand(t *testing.T) {
 		t.Fatal("Next = nil error, want a rejected body on get")
 	}
 }
+
+// repeatReader yields n copies of c without allocating them, standing in for a
+// peer that streams an oversized line rather than one a test could hold.
+type repeatReader struct {
+	c byte
+	n int64
+}
+
+func (r *repeatReader) Read(p []byte) (int, error) {
+	if r.n <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.n {
+		p = p[:r.n]
+	}
+	for i := range p {
+		p[i] = r.c
+	}
+	r.n -= int64(len(p))
+	return len(p), nil
+}
+
+// TestDecoderRejectsOversizedBodyLineForZeroBodySize pins the bound on the line
+// accumulator against the peer that can reach it.
+//
+// A put declaring BodySize 0 sends its body line, if it sends one at all, as an
+// ordinary frame rather than through the streaming body reader. Without a cap
+// the length of that frame is the peer's to choose, and the daemon every build
+// on the machine depends on would grow one []byte until it died.
+func TestDecoderRejectsOversizedBodyLineForZeroBodySize(t *testing.T) {
+	action, output := testActionID(20), testOutputID(21)
+	head := requestLine(t, &Request{ID: 1, Command: CmdPut, ActionID: action[:], OutputID: output[:]}) + `"`
+	in := io.MultiReader(
+		strings.NewReader(head),
+		&repeatReader{c: 'A', n: 8 * maxLineBytes},
+		strings.NewReader("\"\n"),
+	)
+
+	d := NewDecoder(in)
+	if _, _, err := d.Next(); err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	_, _, err := d.Next()
+	if err == nil {
+		t.Fatal("Next = nil error, want the line cap to reject an oversized body line")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("error = %q, want it to name the exceeded bound", err)
+	}
+}
+
+// TestDecoderRejectsUnterminatedRequestLine pins that a peer which never sends
+// a newline is refused rather than allowed to allocate until the process dies.
+func TestDecoderRejectsUnterminatedRequestLine(t *testing.T) {
+	d := NewDecoder(&repeatReader{c: 'x', n: 8 * maxLineBytes})
+	_, _, err := d.Next()
+	if err == nil {
+		t.Fatal("Next = nil error, want the line cap to reject an unterminated line")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("error = %q, want it to name the exceeded bound", err)
+	}
+}
+
+// TestDecoderLineCapDoesNotBoundBodies pins that the cap is on the accumulator
+// and not on a transfer: a put whose declared body dwarfs maxLineBytes is
+// streamed, so it must round-trip untouched.
+func TestDecoderLineCapDoesNotBoundBodies(t *testing.T) {
+	size := int64(4 * maxLineBytes)
+	action, output := testActionID(22), testOutputID(23)
+	head := requestLine(t, &Request{
+		ID: 1, Command: CmdPut, ActionID: action[:], OutputID: output[:], BodySize: size,
+	}) + `"`
+
+	enc := new(bytes.Buffer)
+	b64 := base64.NewEncoder(base64.StdEncoding, enc)
+	if _, err := io.Copy(b64, &repeatReader{c: 'z', n: size}); err != nil {
+		t.Fatalf("encode body: %v", err)
+	}
+	if err := b64.Close(); err != nil {
+		t.Fatalf("close encoder: %v", err)
+	}
+	in := io.MultiReader(strings.NewReader(head), enc, strings.NewReader("\"\n"))
+
+	d := NewDecoder(in)
+	_, body, err := d.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	n, err := io.Copy(io.Discard, body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if n != size {
+		t.Fatalf("body length = %d, want %d", n, size)
+	}
+}

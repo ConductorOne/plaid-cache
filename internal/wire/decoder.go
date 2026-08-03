@@ -130,11 +130,30 @@ func readFrame(br *bufio.Reader) ([]byte, error) {
 	}
 }
 
+// maxLineBytes caps the accumulator in readLine.
+//
+// A body never reaches that accumulator: a put declaring BodySize > 0 is
+// streamed by bodyReader, which decodes through a fixed bufio window however
+// many hundreds of megabytes the body runs to. What does reach it is a request
+// line — a small JSON object holding two 32-byte identifiers and three integers
+// — and the optional empty body line, which is two bytes. A megabyte is three
+// orders of magnitude of headroom, not a tuning parameter.
+//
+// The cap exists because without one the size of that accumulator is the peer's
+// to choose. A put declaring BodySize 0 and then sending a body line anyway
+// lands the whole encoded line here, and a peer that never sends a newline at
+// all grows it until the process dies — and this process is the daemon every
+// build on the machine is waiting on. Failing the connection loudly costs one
+// build its cache; growing without bound costs all of them.
+const maxLineBytes = 1 << 20
+
 // readLine returns one line with its terminator stripped.
 //
 // bufio.Scanner is deliberately not used: its default 64KiB token limit would
-// silently fail on the multi-megabyte base64 body lines this protocol carries.
-// ReadSlice plus an accumulator has no ceiling beyond available memory.
+// silently fail on the request lines of a protocol that also carries
+// multi-megabyte body lines. ReadSlice plus an accumulator bounded by
+// maxLineBytes sets the ceiling here instead, where the reason for it can be
+// written down.
 func readLine(br *bufio.Reader) ([]byte, error) {
 	var line []byte
 	for {
@@ -143,6 +162,9 @@ func readLine(br *bufio.Reader) ([]byte, error) {
 			chunk = chunk[:len(chunk)-1]
 		}
 		if len(chunk) > 0 {
+			if len(line)+len(chunk) > maxLineBytes {
+				return nil, fmt.Errorf("readLine: line exceeds %d bytes", maxLineBytes)
+			}
 			line = append(line, chunk...)
 		}
 		switch {

@@ -33,7 +33,7 @@ import (
 // tier, so the tests exercise the code that actually runs rather than a fake of
 // it. Verification is on, matching the default, and the monitoring routes are
 // off, also matching the default.
-func newHandler(t *testing.T) (*Handler, *blob.Store) {
+func newHandler(t testing.TB) (*Handler, *blob.Store) {
 	st, _, blobs := newStore(t)
 	return NewHandler(HandlerParams{Store: st, Logf: t.Logf}), blobs
 }
@@ -47,7 +47,7 @@ func newMonitoredHandler(t *testing.T, status StatusFunc, metrics MetricsFunc) *
 
 // newStore builds the storage adapter the handler sits on, and hands back the
 // cache underneath it so a test can assert on what was actually stored.
-func newStore(t *testing.T) (*Store, *cache.Cache, *blob.Store) {
+func newStore(t testing.TB) (*Store, *cache.Cache, *blob.Store) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := &config.Config{

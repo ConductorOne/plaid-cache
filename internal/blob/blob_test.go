@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -581,10 +582,10 @@ func TestStageNamesAreUnique(t *testing.T) {
 	}
 }
 
-// TestCleanStagingRemovesAbandonedBodies pins the recovery from a process that
-// died mid-upload. A staged body is referenced by nothing, so it is invisible
-// to the byte budget and no eviction pass would ever reclaim it.
-func TestCleanStagingRemovesAbandonedBodies(t *testing.T) {
+// TestCleanTempRemovesAbandonedStagedBodies pins the recovery from a process
+// that died mid-upload. A staged body is referenced by nothing, so it is
+// invisible to the byte budget and no eviction pass would ever reclaim it.
+func TestCleanTempRemovesAbandonedStagedBodies(t *testing.T) {
 	s := newStore(t)
 	for range 3 {
 		f, err := s.Stage()
@@ -597,33 +598,128 @@ func TestCleanStagingRemovesAbandonedBodies(t *testing.T) {
 		_ = f.Close()
 	}
 
-	n, err := s.CleanStaging()
+	n, err := s.CleanTemp()
 	if err != nil {
-		t.Fatalf("CleanStaging: %v", err)
+		t.Fatalf("CleanTemp: %v", err)
 	}
 	if n != 3 {
 		t.Fatalf("removed %d staged bodies, want 3", n)
 	}
 	// A second pass has nothing to do and must still not be an error: it runs
 	// on every start, and most starts follow a clean shutdown.
-	if n, err := s.CleanStaging(); err != nil || n != 0 {
-		t.Fatalf("second CleanStaging = %d, %v, want 0, nil", n, err)
+	if n, err := s.CleanTemp(); err != nil || n != 0 {
+		t.Fatalf("second CleanTemp = %d, %v, want 0, nil", n, err)
 	}
 }
 
-// TestCleanStagingLeavesPublishedBodies pins that the sweep is scoped to the
-// staging area. Reaching into the output tree would delete the cache.
-func TestCleanStagingLeavesPublishedBodies(t *testing.T) {
+// TestCleanTempRemovesAbandonedPutTemporaries pins that the sweep reaches Put's
+// own temporary, which lives among the published bodies rather than in the
+// staging area. A process killed mid-write leaves one behind at the full size
+// of whatever it was writing, and nothing else ever looks at it again.
+func TestCleanTempRemovesAbandonedPutTemporaries(t *testing.T) {
+	s := newStore(t)
+
+	// Stand in for the dead writer: createTemp is what Put calls, and the file
+	// it leaves is exactly what a kill between the copy and the link leaves.
+	id := sha256.Sum256([]byte("interrupted"))
+	final := s.Path(id)
+	if err := os.MkdirAll(filepath.Dir(final), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	f, err := createTemp(final)
+	if err != nil {
+		t.Fatalf("createTemp: %v", err)
+	}
+	if _, err := f.Write([]byte("half a body")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = f.Close()
+
+	n, err := s.CleanTemp()
+	if err != nil {
+		t.Fatalf("CleanTemp: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("removed %d temporaries, want 1", n)
+	}
+	if _, serr := os.Stat(f.Name()); !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatalf("temporary %s survived the sweep: %v", f.Name(), serr)
+	}
+}
+
+// TestCleanTempLeavesPublishedBodies pins that the sweep is scoped to
+// temporaries. It walks the output tree, so a name test that was any looser
+// would delete the cache.
+func TestCleanTempLeavesPublishedBodies(t *testing.T) {
 	s := newStore(t)
 	body := []byte("published")
 	id := sha256.Sum256(body)
 	if _, _, err := s.Put(id, bytes.NewReader(body), int64(len(body))); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if _, err := s.CleanStaging(); err != nil {
-		t.Fatalf("CleanStaging: %v", err)
+	n, err := s.CleanTemp()
+	if err != nil {
+		t.Fatalf("CleanTemp: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("removed %d files from a store holding only a published body, want 0", n)
 	}
 	if _, _, err := s.Get(id); err != nil {
-		t.Fatalf("CleanStaging removed a published body: %v", err)
+		t.Fatalf("CleanTemp removed a published body: %v", err)
+	}
+}
+
+// TestPutRemovesItsTemporaryOnFailure pins that a transfer that fails partway
+// leaves nothing behind. The body store is where a large payload lands, so a
+// temporary orphaned per failed upload is a disk leak in proportion to the
+// traffic that failed.
+func TestPutRemovesItsTemporaryOnFailure(t *testing.T) {
+	s := newStore(t)
+	id := sha256.Sum256([]byte("never published"))
+
+	// A reader that dies partway is what a cancelled client looks like from
+	// here: some bytes copied, then an error instead of io.EOF.
+	body := io.MultiReader(bytes.NewReader([]byte("the first half")), errReader{errors.New("connection reset")})
+	if _, _, err := s.Put(id, body, 1<<20); err == nil {
+		t.Fatal("Put succeeded on a reader that failed partway")
+	}
+	assertNoTemporaries(t, s)
+
+	// The same again for a body that ends early: the declared size is not met,
+	// so nothing may be published and nothing may be left over either.
+	if _, _, err := s.Put(id, bytes.NewReader([]byte("short")), 1<<20); err == nil {
+		t.Fatal("Put succeeded on a body shorter than its declared size")
+	}
+	assertNoTemporaries(t, s)
+
+	if _, _, err := s.Get(id); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a failed Put published a body: %v", err)
+	}
+}
+
+// errReader fails on every read, standing in for a peer that went away.
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+// assertNoTemporaries fails the test if any of createTemp's files survive
+// anywhere in the store.
+func assertNoTemporaries(t *testing.T, s *Store) {
+	t.Helper()
+	var left []string
+	err := filepath.WalkDir(s.Root(), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && isTempName(d.Name()) {
+			left = append(left, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WalkDir: %v", err)
+	}
+	if len(left) > 0 {
+		t.Fatalf("temporaries left behind: %v", left)
 	}
 }
