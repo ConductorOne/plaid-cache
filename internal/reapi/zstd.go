@@ -131,6 +131,9 @@ func encodeAll(p []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encodeAll: %w", err)
 	}
-	defer enc.Close()
+	// EncodeAll returns a complete frame on its own, so Close here releases the
+	// encoder's workers rather than flushing anything; a streaming encoder's
+	// Close, which does flush, is checked where one is used.
+	defer func() { _ = enc.Close() }()
 	return enc.EncodeAll(p, nil), nil
 }

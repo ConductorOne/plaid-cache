@@ -344,7 +344,7 @@ func (s *Store) Adopt(id ids.OutputID, srcPath string, size int64) (path string,
 	if err != nil {
 		return "", 0, false, fmt.Errorf("Adopt: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	p, db, err := s.Put(id, f, size)
 	if err != nil {
 		return "", 0, false, fmt.Errorf("Adopt: %w", err)

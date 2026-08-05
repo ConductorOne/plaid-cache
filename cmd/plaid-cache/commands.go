@@ -32,7 +32,7 @@ import (
 func (a *app) loadConfig() (*config.Config, bool) {
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return nil, false
 	}
 	return cfg, true
@@ -44,7 +44,7 @@ func (a *app) logger(cfg *config.Config, min config.LogLevel) cache.Logf {
 		return func(string, ...any) {}
 	}
 	return func(format string, args ...any) {
-		fmt.Fprintf(a.stderr, "plaid-cache: "+format+"\n", args...)
+		a.errf("plaid-cache: "+format+"\n", args...)
 	}
 }
 
@@ -115,7 +115,7 @@ func (a *app) runServe(ctx context.Context) int {
 			"also serve "+bazel.StatusPath+" and "+bazel.MetricsPath+" on the Bazel HTTP address (default: PLAID_GOCACHE_BAZEL_MONITORING)")
 	}
 	if _, err := a.parseFlags("serve", register, a.args[1:]); err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitUsage
 	}
 	cfg, ok := a.loadConfig()
@@ -123,7 +123,7 @@ func (a *app) runServe(ctx context.Context) int {
 		return exitError
 	}
 	if err := limits.applyTo(cfg); err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitUsage
 	}
 	if bazelAddr != "" {
@@ -149,7 +149,7 @@ func (a *app) runServe(ctx context.Context) int {
 			logf("another daemon owns the index, exiting")
 			return exitOK
 		}
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
 	defer st.close()
@@ -157,11 +157,11 @@ func (a *app) runServe(ctx context.Context) int {
 	c := cache.New(cache.Params{
 		Config: cfg, Index: st.idx, Blobs: st.blobs, Remote: st.rem, Logf: logf,
 	})
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	ln, err := daemon.Listen(cfg)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
 
@@ -185,7 +185,7 @@ func (a *app) runServe(ctx context.Context) int {
 			// half of what it was asked for would leave Bazel with a refused
 			// connection on every action, which it reports as an error rather
 			// than as a miss.
-			fmt.Fprintf(a.stderr, "plaid-cache: bazel listener: %v\n", lerr)
+			a.errf("plaid-cache: bazel listener: %v\n", lerr)
 			return exitError
 		}
 		logf("serving the Bazel HTTP cache on http://%s", bazelLn.Addr())
@@ -208,7 +208,7 @@ func (a *app) runServe(ctx context.Context) int {
 	if cfg.BazelGRPCAddr != "" {
 		grpcLn, lerr := net.Listen("tcp", cfg.BazelGRPCAddr)
 		if lerr != nil {
-			fmt.Fprintf(a.stderr, "plaid-cache: bazel grpc listener: %v\n", lerr)
+			a.errf("plaid-cache: bazel grpc listener: %v\n", lerr)
 			return exitError
 		}
 		logf("serving the Bazel gRPC cache on grpc://%s", grpcLn.Addr())
@@ -222,7 +222,7 @@ func (a *app) runServe(ctx context.Context) int {
 	}
 
 	if err := srv.Serve(ctx, ln); err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
 	logf("stopped")
@@ -267,7 +267,7 @@ func (a *app) runDirect(ctx context.Context, cfg *config.Config, logf cache.Logf
 	c := cache.New(cache.Params{
 		Config: cfg, Index: st.idx, Blobs: st.blobs, Remote: st.rem, Logf: logf,
 	})
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	srv := daemon.NewServer(daemon.ServerParams{
 		Config: cfg, Cache: c, Index: st.idx, Logf: logf, Version: buildVersion(),
@@ -315,7 +315,7 @@ func (a *app) evictOnExit(ctx context.Context, cfg *config.Config, c *cache.Cach
 // nothing. The toolchain rebuilds everything, which is slow but correct.
 func (a *app) serveMisses() int {
 	if err := daemon.ServeMisses(a.stdin, a.stdout); err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
 	return exitOK
@@ -332,7 +332,7 @@ func (a *app) runStatus(ctx context.Context) int {
 		fs.StringVar(&from, "from", "",
 			"read the report from another daemon's monitoring endpoint, e.g. cache-host:9095 (default: this machine's own cache)")
 	}, a.args[1:]); err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitUsage
 	}
 	if from != "" {
@@ -351,10 +351,10 @@ func (a *app) runStatus(ctx context.Context) int {
 	// Ask a running daemon first: it holds the index lock and has live
 	// counters. Only if none is running do we open the index ourselves.
 	if conn, err := dialExisting(cfg, buildVersion(), daemon.OpStatus); err == nil {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var resp daemon.StatusResponse
 		if err := conn.ReadJSONLine(&resp); err != nil {
-			fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+			a.errf("plaid-cache: %v\n", err)
 			return exitError
 		}
 		a.printStatus(cfg, resp.Actions, resp.Objects, resp.DiskBytes, &resp, resp.Lifetime, resp.LifetimeSince)
@@ -363,20 +363,20 @@ func (a *app) runStatus(ctx context.Context) int {
 
 	st, err := openStores(ctx, cfg)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
 	defer st.close()
 
 	s, err := st.idx.Stats()
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
 	life, since, err := st.idx.TotalActivity()
 	if err != nil {
 		// A report is still worth printing without its history.
-		fmt.Fprintf(a.stderr, "plaid-cache: lifetime activity: %v\n", err)
+		a.errf("plaid-cache: lifetime activity: %v\n", err)
 	}
 	a.printStatus(cfg, s.Actions, s.Objects, s.DiskBytes, nil, life, since)
 	return exitOK
@@ -406,54 +406,54 @@ const maxStatusBody = 1 << 20
 func (a *app) runStatusFrom(ctx context.Context, addr string) int {
 	endpoint, err := statusEndpoint(addr)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitUsage
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
 	resp, err := (&http.Client{Timeout: statusFetchTimeout}).Do(req)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %s: %v\n", endpoint, err)
+		a.errf("plaid-cache: %s: %v\n", endpoint, err)
 		return exitError
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(a.stderr, "plaid-cache: %s: %s\n", endpoint, resp.Status)
+		a.errf("plaid-cache: %s: %s\n", endpoint, resp.Status)
 		if resp.StatusCode == http.StatusNotFound {
 			// The likeliest cause by some distance, and the one whose fix is not
 			// guessable: a daemon serving Bazel with monitoring left off answers
 			// this path exactly as it answers any path it does not serve.
-			fmt.Fprintf(a.stderr, "plaid-cache: that daemon may be serving Bazel without -bazel-monitoring\n")
+			a.errf("plaid-cache: that daemon may be serving Bazel without -bazel-monitoring\n")
 		}
 		return exitError
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxStatusBody))
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %s: %v\n", endpoint, err)
+		a.errf("plaid-cache: %s: %v\n", endpoint, err)
 		return exitError
 	}
 	var r daemon.StatusResponse
 	if err := json.Unmarshal(body, &r); err != nil {
 		// Truncated JSON and a proxy's error page arrive here alike, and neither
 		// is worth quoting back in full at somebody's terminal.
-		fmt.Fprintf(a.stderr, "plaid-cache: %s: not a status report: %v\n", endpoint, err)
+		a.errf("plaid-cache: %s: not a status report: %v\n", endpoint, err)
 		return exitError
 	}
 	if r.PID == 0 {
 		// Well-formed JSON from something that is not a daemon. Every real report
 		// names the process that produced it, and printing a report of zeros
 		// would describe an empty cache rather than a wrong address.
-		fmt.Fprintf(a.stderr, "plaid-cache: %s: not a status report: no daemon in it\n", endpoint)
+		a.errf("plaid-cache: %s: not a status report: no daemon in it\n", endpoint)
 		return exitError
 	}
 	if r.Err != "" {
-		fmt.Fprintf(a.stderr, "plaid-cache: %s: %s\n", endpoint, r.Err)
+		a.errf("plaid-cache: %s: %s\n", endpoint, r.Err)
 		return exitError
 	}
 	a.printStatusFrom(endpoint, &r)
@@ -501,9 +501,9 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 	if d != nil {
 		maxBytes, ttl = d.MaxBytes, d.TTL
 	}
-	fmt.Fprintf(a.stdout, "directory   %s\n", cfg.Dir)
+	a.outf("directory   %s\n", cfg.Dir)
 	if cfg.ConfigFile != "" {
-		fmt.Fprintf(a.stdout, "config      %s\n", cfg.ConfigFile)
+		a.outf("config      %s\n", cfg.ConfigFile)
 	}
 	a.printEntries(actions, objects, diskBytes)
 	a.printSize(diskBytes, maxBytes)
@@ -515,7 +515,7 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 	// this machine's volume, so it belongs to this report and to no other.
 	if total, avail, err := blob.VolumeUsage(cfg.Dir); err == nil && total > 0 {
 		used := total - avail
-		fmt.Fprintf(a.stdout, "volume      %s used of %s (%.1f%%, %s free)\n",
+		a.outf("volume      %s used of %s (%.1f%%, %s free)\n",
 			config.FormatBytes(int64(used)), config.FormatBytes(int64(total)),
 			100*float64(used)/float64(total), config.FormatBytes(int64(avail)))
 	}
@@ -525,20 +525,20 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 		a.printAge(d.OldestAge, d.NewestAge)
 	}
 	if cfg.RemoteEnabled() {
-		fmt.Fprintf(a.stdout, "remote      s3://%s/%s\n", cfg.S3Bucket, cfg.S3Prefix)
+		a.outf("remote      s3://%s/%s\n", cfg.S3Bucket, cfg.S3Prefix)
 	} else {
-		fmt.Fprintf(a.stdout, "remote      disabled\n")
+		a.outf("remote      disabled\n")
 	}
 	if d == nil {
 		// Not the end of the report any more. The counters outlive the process
 		// that produced them, so a cache nothing is currently using still has a
 		// history worth reading — and this is the state anyone asking about a
 		// quiet machine finds it in.
-		fmt.Fprintf(a.stdout, "daemon      not running\n")
+		a.outf("daemon      not running\n")
 		a.printLifetime(life, lifeSince)
 		return
 	}
-	fmt.Fprintf(a.stdout, "daemon      pid %d, up %s\n", d.PID, d.Uptime)
+	a.outf("daemon      pid %d, up %s\n", d.PID, d.Uptime)
 	a.printCounters(d.Metrics, cfg.RemoteEnabled())
 	a.printLifetime(life, lifeSince)
 }
@@ -554,9 +554,9 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 // endpoint leads the report so that there is no reading of it that leaves which
 // cache it describes in doubt.
 func (a *app) printStatusFrom(endpoint string, r *daemon.StatusResponse) {
-	fmt.Fprintf(a.stdout, "endpoint    %s\n", endpoint)
+	a.outf("endpoint    %s\n", endpoint)
 	if r.Version != "" {
-		fmt.Fprintf(a.stdout, "version     %s\n", r.Version)
+		a.outf("version     %s\n", r.Version)
 	}
 	a.printEntries(r.Actions, r.Objects, r.DiskBytes)
 	a.printSize(r.DiskBytes, r.MaxBytes)
@@ -568,11 +568,11 @@ func (a *app) printStatusFrom(endpoint string, r *daemon.StatusResponse) {
 	// it. Whether uploads mean anything is the part a reader needs, and that is
 	// what this says.
 	if r.RemoteEnabled {
-		fmt.Fprintf(a.stdout, "remote      enabled\n")
+		a.outf("remote      enabled\n")
 	} else {
-		fmt.Fprintf(a.stdout, "remote      disabled\n")
+		a.outf("remote      disabled\n")
 	}
-	fmt.Fprintf(a.stdout, "daemon      pid %d, up %s\n", r.PID, r.Uptime)
+	a.outf("daemon      pid %d, up %s\n", r.PID, r.Uptime)
 	a.printCounters(r.Metrics, r.RemoteEnabled)
 	a.printLifetime(r.Lifetime, r.LifetimeSince)
 }
@@ -583,26 +583,26 @@ func (a *app) printStatusFrom(endpoint string, r *daemon.StatusResponse) {
 // is the dedup ratio that refcounting outputs exists to produce.
 func (a *app) printEntries(actions, objects, diskBytes int64) {
 	if objects > 0 {
-		fmt.Fprintf(a.stdout, "entries     %d actions, %d objects (%.2fx dedup, %s avg)\n",
+		a.outf("entries     %d actions, %d objects (%.2fx dedup, %s avg)\n",
 			actions, objects, float64(actions)/float64(objects),
 			config.FormatBytes(diskBytes/objects))
 		return
 	}
-	fmt.Fprintf(a.stdout, "entries     %d actions, %d objects\n", actions, objects)
+	a.outf("entries     %d actions, %d objects\n", actions, objects)
 }
 
 // printSize reports the bytes held against the ceiling, since the share of the
 // budget in use is what says whether eviction is about to start biting.
 func (a *app) printSize(diskBytes, maxBytes int64) {
 	if maxBytes <= 0 {
-		fmt.Fprintf(a.stdout, "size        %s (no limit)\n", config.FormatBytes(diskBytes))
+		a.outf("size        %s (no limit)\n", config.FormatBytes(diskBytes))
 		return
 	}
 	headroom := maxBytes - diskBytes
 	if headroom < 0 {
 		headroom = 0
 	}
-	fmt.Fprintf(a.stdout, "size        %s of %s (%.1f%%, %s free)\n",
+	a.outf("size        %s of %s (%.1f%%, %s free)\n",
 		config.FormatBytes(diskBytes), config.FormatBytes(maxBytes),
 		100*float64(diskBytes)/float64(maxBytes), config.FormatBytes(headroom))
 }
@@ -611,17 +611,17 @@ func (a *app) printSize(diskBytes, maxBytes int64) {
 // printing a zero duration nobody reads as "off".
 func (a *app) printTTL(ttl string) {
 	if ttl != "" && ttl != "0s" {
-		fmt.Fprintf(a.stdout, "ttl         %s\n", ttl)
+		a.outf("ttl         %s\n", ttl)
 		return
 	}
-	fmt.Fprintf(a.stdout, "ttl         none\n")
+	a.outf("ttl         none\n")
 }
 
 // printAge reports the age span, which says whether the TTL is doing anything:
 // if the oldest entry is younger than the TTL, only the size ceiling is
 // evicting.
 func (a *app) printAge(oldest, newest string) {
-	fmt.Fprintf(a.stdout, "age         oldest %s, newest %s\n", oldest, newest)
+	a.outf("age         oldest %s, newest %s\n", oldest, newest)
 }
 
 // printCounters reports one daemon's own tally.
@@ -633,20 +633,20 @@ func (a *app) printAge(oldest, newest string) {
 func (a *app) printCounters(m cache.MetricsSnapshot, remoteEnabled bool) {
 	lookups := m.GetLocalHit + m.GetRemoteHit + m.GetMiss
 	if lookups > 0 {
-		fmt.Fprintf(a.stdout, "hit rate    %.1f%% of %d lookups\n",
+		a.outf("hit rate    %.1f%% of %d lookups\n",
 			100*float64(m.GetLocalHit+m.GetRemoteHit)/float64(lookups), lookups)
 	}
-	fmt.Fprintf(a.stdout, "hits        %d local, %d remote\n", m.GetLocalHit, m.GetRemoteHit)
-	fmt.Fprintf(a.stdout, "misses      %d\n", m.GetMiss)
-	fmt.Fprintf(a.stdout, "puts        %d\n", m.Put)
+	a.outf("hits        %d local, %d remote\n", m.GetLocalHit, m.GetRemoteHit)
+	a.outf("misses      %d\n", m.GetMiss)
+	a.outf("puts        %d\n", m.Put)
 	if m.GetRepair > 0 {
-		fmt.Fprintf(a.stdout, "repairs     %d (index entries dropped for missing bodies)\n", m.GetRepair)
+		a.outf("repairs     %d (index entries dropped for missing bodies)\n", m.GetRepair)
 	}
 	if m.Compactions > 0 {
-		fmt.Fprintf(a.stdout, "compactions %d (index reclaimed after pruning)\n", m.Compactions)
+		a.outf("compactions %d (index reclaimed after pruning)\n", m.Compactions)
 	}
 	if remoteEnabled {
-		fmt.Fprintf(a.stdout, "uploads     %d ok, %d failed, %d dropped, %d skipped\n",
+		a.outf("uploads     %d ok, %d failed, %d dropped, %d skipped\n",
 			m.UploadOK, m.UploadFail, m.UploadDrop, m.UploadSkip)
 	}
 }
@@ -663,18 +663,18 @@ func (a *app) printLifetime(life cache.MetricsSnapshot, since int64) {
 		return
 	}
 	rate, _ := life.HitRate()
-	fmt.Fprintf(a.stdout, "lifetime    %.1f%% of %d lookups", 100*rate, life.Lookups())
+	a.outf("lifetime    %.1f%% of %d lookups", 100*rate, life.Lookups())
 	if since > 0 {
-		fmt.Fprintf(a.stdout, " since %s", time.Unix(0, since).UTC().Format("2006-01-02 15:04 UTC"))
+		a.outf(" since %s", time.Unix(0, since).UTC().Format("2006-01-02 15:04 UTC"))
 	}
-	fmt.Fprintf(a.stdout, " (every process; see `plaid-cache stats`)\n")
+	a.outf(" (every process; see `plaid-cache stats`)\n")
 }
 
 // runGC forces an eviction pass.
 func (a *app) runGC(ctx context.Context) int {
 	var limits limitFlags
 	if _, err := a.parseFlags("gc", limits.register, a.args[1:]); err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitUsage
 	}
 	cfg, ok := a.loadConfig()
@@ -683,27 +683,27 @@ func (a *app) runGC(ctx context.Context) int {
 	}
 	params, err := limits.gcParams()
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitUsage
 	}
 
 	// A running daemon reads its configuration once at startup, so an override
 	// has to travel with the request; otherwise it would appear to be ignored.
 	if conn, err := dialExistingGC(cfg, buildVersion(), params); err == nil {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var resp daemon.GCResponse
 		if err := conn.ReadJSONLine(&resp); err != nil {
-			fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+			a.errf("plaid-cache: %v\n", err)
 			return exitError
 		}
 		if resp.Err != "" {
-			fmt.Fprintf(a.stderr, "plaid-cache: %s\n", resp.Err)
+			a.errf("plaid-cache: %s\n", resp.Err)
 			return exitError
 		}
 		a.printGC(resp.ActionsPruned, resp.ObjectsPruned, resp.BytesFreed, resp.Elapsed)
 		a.printMeasured(resp.Measured, resp.Corrected, resp.RecordedBefore, resp.RecordedAfter)
 		if params != nil {
-			fmt.Fprintf(a.stdout, "applied      max-bytes %s, ttl %s (this pass only)\n",
+			a.outf("applied      max-bytes %s, ttl %s (this pass only)\n",
 				config.FormatBytes(resp.AppliedMaxBytes), resp.AppliedTTL)
 		}
 		return exitOK
@@ -712,12 +712,12 @@ func (a *app) runGC(ctx context.Context) int {
 	// No daemon: this process owns the index, so the flags simply override the
 	// configuration it is about to use.
 	if err := limits.applyTo(cfg); err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitUsage
 	}
 	st, err := openStores(ctx, cfg)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
 	defer st.close()
@@ -726,15 +726,15 @@ func (a *app) runGC(ctx context.Context) int {
 		Config: cfg, Index: st.idx, Blobs: st.blobs, Remote: st.rem,
 		Logf: a.logger(cfg, config.LogInfo),
 	})
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	res, rec, err := c.EvictNow(ctx, cfg.MaxBytes, cfg.TTL)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
 	if err := st.idx.Compact(); err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: compact: %v\n", err)
+		a.errf("plaid-cache: compact: %v\n", err)
 	}
 	a.printGC(res.ActionsPruned, res.ObjectsPruned, res.BytesFreed, res.Elapsed.String())
 	a.printMeasured(rec.Objects, rec.Corrected, rec.Before, rec.After)
@@ -750,13 +750,13 @@ func (a *app) printMeasured(objects, corrected, before, after int64) {
 	if corrected == 0 {
 		return
 	}
-	fmt.Fprintf(a.stdout, "measured     %d of %d objects re-measured, recorded size %s -> %s\n",
+	a.outf("measured     %d of %d objects re-measured, recorded size %s -> %s\n",
 		corrected, objects, config.FormatBytes(before), config.FormatBytes(after))
 }
 
 // printGC renders an eviction result.
 func (a *app) printGC(actions, objects, bytes int64, elapsed string) {
-	fmt.Fprintf(a.stdout, "pruned %d actions, %d objects, freed %s in %s\n",
+	a.outf("pruned %d actions, %d objects, freed %s in %s\n",
 		actions, objects, config.FormatBytes(bytes), elapsed)
 }
 
@@ -771,18 +771,18 @@ func (a *app) runClean(ctx context.Context) int {
 	// directory out from under a live process leaves it writing into unlinked
 	// files rather than failing loudly.
 	if conn, err := dialExisting(cfg, buildVersion(), daemon.OpShutdown); err == nil {
-		conn.Close()
+		_ = conn.Close()
 		if err := waitGone(cfg.SocketPath()); err != nil {
-			fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+			a.errf("plaid-cache: %v\n", err)
 			return exitError
 		}
 	}
 
 	if err := os.RemoveAll(cfg.Dir); err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
-	fmt.Fprintf(a.stdout, "removed %s\n", cfg.Dir)
+	a.outf("removed %s\n", cfg.Dir)
 	return exitOK
 }
 
@@ -806,16 +806,16 @@ func dialExistingWith(cfg *config.Config, hello daemon.Hello) (*daemon.Conn, err
 		return nil, fmt.Errorf("dialExisting: %w", err)
 	}
 	if err := writeLine(conn, hello); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("dialExisting: %w", err)
 	}
 	var resp daemon.HelloResponse
 	if err := conn.ReadJSONLine(&resp); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("dialExisting: %w", err)
 	}
 	if !resp.OK {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("dialExisting: daemon refused: %s", resp.Err)
 	}
 	return conn, nil
@@ -849,11 +849,11 @@ func (a *app) runAdopt(ctx context.Context) int {
 		f.BoolVar(&dryRun, "dry-run", false, "report what would be adopted without writing anything")
 	}, a.args[1:])
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
-		fmt.Fprintf(a.stderr, "plaid-cache: adopt needs exactly one directory, the go-cache-plugin stage root\n")
+		a.errf("plaid-cache: adopt needs exactly one directory, the go-cache-plugin stage root\n")
 		return exitUsage
 	}
 	legacyDir := fs.Arg(0)
@@ -871,14 +871,14 @@ func (a *app) runAdopt(ctx context.Context) int {
 	// race it could not win on a busy machine.
 	params := &daemon.AdoptParams{Dir: legacyDir, DryRun: dryRun}
 	if conn, derr := dialExistingAdopt(cfg, buildVersion(), params); derr == nil {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var resp daemon.AdoptResponse
 		if err := conn.ReadJSONLine(&resp); err != nil {
-			fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+			a.errf("plaid-cache: %v\n", err)
 			return exitError
 		}
 		if resp.Err != "" {
-			fmt.Fprintf(a.stderr, "plaid-cache: %s\n", resp.Err)
+			a.errf("plaid-cache: %s\n", resp.Err)
 			return exitError
 		}
 		a.printAdopt(adoptResultFrom(resp), dryRun)
@@ -892,10 +892,10 @@ func (a *app) runAdopt(ctx context.Context) int {
 			// A daemon took the index between the dial above and here, or one is
 			// starting up. Retrying is the caller's business; saying which
 			// process to blame is ours.
-			fmt.Fprintf(a.stderr, "plaid-cache: another process took the index mid-adopt; try again\n")
+			a.errf("plaid-cache: another process took the index mid-adopt; try again\n")
 			return exitError
 		}
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
 	defer st.close()
@@ -908,7 +908,7 @@ func (a *app) runAdopt(ctx context.Context) int {
 		Logf:      a.logger(cfg, config.LogInfo),
 	})
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitError
 	}
 	a.printAdopt(res, dryRun)
@@ -921,7 +921,7 @@ func (a *app) printAdopt(res adopt.Result, dryRun bool) {
 	if dryRun {
 		prefix = "would adopt: "
 	}
-	fmt.Fprintf(a.stdout, "%s%s\n", prefix, res)
+	a.outf("%s%s\n", prefix, res)
 }
 
 // adoptResultFrom rebuilds a Result from a daemon's response, so that both paths

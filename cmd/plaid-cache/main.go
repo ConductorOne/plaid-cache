@@ -45,6 +45,26 @@ type app struct {
 	stderr io.Writer
 }
 
+// outf writes to the command's output.
+//
+// It exists so that the error every Fprintf returns is discarded deliberately
+// in one place, with the reason written down, rather than at a hundred call
+// sites where the reason would be assumed. There is nothing a command can do
+// about a failed write to its own stdout: the exit code already says whether
+// the work succeeded, and a diagnostic about being unable to print has nowhere
+// left to go. The common case is not even a fault — `plaid-cache stats | head`
+// closes the pipe, and the report ending early is exactly what was asked for.
+func (a *app) outf(format string, args ...any) {
+	_, _ = fmt.Fprintf(a.stdout, format, args...)
+}
+
+// errf writes one diagnostic, for the same reasons. Callers supply the
+// "plaid-cache: " prefix themselves, so that a message composed from several
+// pieces carries it once rather than once per piece.
+func (a *app) errf(format string, args ...any) {
+	_, _ = fmt.Fprintf(a.stderr, format, args...)
+}
+
 func main() {
 	a := &app{
 		args:   os.Args[1:],
@@ -84,13 +104,13 @@ func (a *app) run() int {
 	case "clean":
 		return a.runClean(ctx)
 	case "version", "-v", "--version":
-		fmt.Fprintln(a.stdout, versionString())
+		a.outf("%s\n", versionString())
 		return exitOK
 	case "help", "-h", "--help":
 		a.usage(a.stdout)
 		return exitOK
 	default:
-		fmt.Fprintf(a.stderr, "plaid-cache: unknown subcommand %q\n\n", sub)
+		a.errf("plaid-cache: unknown subcommand %q\n\n", sub)
 		a.usage(a.stderr)
 		return exitUsage
 	}
@@ -98,7 +118,7 @@ func (a *app) run() int {
 
 // usage prints the command summary.
 func (a *app) usage(w io.Writer) {
-	fmt.Fprint(w, `plaid-cache is a GOCACHEPROG-compatible Go build cache.
+	_, _ = fmt.Fprint(w, `plaid-cache is a GOCACHEPROG-compatible Go build cache.
 
 Usage:
   plaid-cache              speak the GOCACHEPROG protocol on stdin/stdout

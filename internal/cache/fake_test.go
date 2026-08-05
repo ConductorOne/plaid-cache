@@ -173,19 +173,6 @@ func (f *fakeRemote) callOrder() []string {
 	return append([]string(nil), f.calls...)
 }
 
-// callCount reports how many times one method was called.
-func (f *fakeRemote) callCount(name string) int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	n := 0
-	for _, c := range f.calls {
-		if c == name {
-			n++
-		}
-	}
-	return n
-}
-
 // storedObject returns the body stored for o, and whether one exists.
 func (f *fakeRemote) storedObject(o ids.OutputID) ([]byte, bool) {
 	f.mu.Lock()

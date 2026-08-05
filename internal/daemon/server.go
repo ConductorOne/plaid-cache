@@ -148,7 +148,7 @@ func Listen(cfg *config.Config) (net.Listener, error) {
 	path := cfg.SocketPath()
 	if _, err := os.Stat(path); err == nil {
 		if c, derr := net.Dial("unix", path); derr == nil {
-			c.Close()
+			_ = c.Close()
 			return nil, fmt.Errorf("Listen: another daemon is already listening on %s", path)
 		}
 		if rerr := os.Remove(path); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
@@ -178,7 +178,7 @@ func Listen(cfg *config.Config) (net.Listener, error) {
 	// The cache holds build outputs; only its owner should be able to read or
 	// poison them. Belt and braces with the directory mode above.
 	if err := os.Chmod(path, 0o600); err != nil {
-		ln.Close()
+		_ = ln.Close()
 		return nil, fmt.Errorf("Listen: chmod socket: %w", err)
 	}
 	return ln, nil
@@ -187,7 +187,7 @@ func Listen(cfg *config.Config) (net.Listener, error) {
 // Serve accepts connections until the daemon is asked to stop, the context is
 // cancelled, or the idle timeout expires.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -215,7 +215,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		case <-ctx.Done():
 		case <-s.stopped:
 		}
-		ln.Close()
+		_ = ln.Close()
 	}()
 
 	var acceptFails int
@@ -506,7 +506,7 @@ func (s *Server) evictLoop(ctx context.Context) {
 
 // handle serves one connection: a control exchange, then possibly a session.
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	s.enter()
 	defer s.leave()
 

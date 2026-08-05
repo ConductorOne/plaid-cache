@@ -47,7 +47,7 @@ func startFakeDaemon(t *testing.T, cfg *config.Config, reply daemon.AdoptRespons
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		dec := json.NewDecoder(conn)
 		var h daemon.Hello
 		if err := dec.Decode(&h); err != nil {

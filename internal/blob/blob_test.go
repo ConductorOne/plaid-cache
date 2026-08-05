@@ -546,7 +546,7 @@ func TestStagePublishesByLink(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("close staged body: %v", err)
 	}
-	defer os.Remove(f.Name())
+	defer func() { _ = os.Remove(f.Name()) }()
 
 	id := sha256.Sum256(body)
 	path, _, linked, err := s.Adopt(id, f.Name(), int64(len(body)))
@@ -578,7 +578,7 @@ func TestStageNamesAreUnique(t *testing.T) {
 		}
 		seen[f.Name()] = true
 		_ = f.Close()
-		defer os.Remove(f.Name())
+		defer func() { _ = os.Remove(f.Name()) }()
 	}
 }
 

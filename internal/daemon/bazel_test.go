@@ -73,7 +73,7 @@ func TestServeBazelRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET status = %d, want 200", resp.StatusCode)
 	}
@@ -115,7 +115,7 @@ func TestServeBazelSuppressesTheIdleExit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET after the idle timeout: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("GET status = %d, want 404", resp.StatusCode)
 	}
@@ -129,7 +129,7 @@ func getBazel(t *testing.T, url string) (*http.Response, []byte) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read %s: %v", url, err)

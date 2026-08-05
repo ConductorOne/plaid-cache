@@ -35,11 +35,21 @@ the second opener. Scope every test to its own temp directory.
 ### Lint
 
 `golangci-lint` runs with defaults; there is no project config and no lint step
-in CI. Lint the files you touched rather than the whole tree:
+in CI. The tree is clean under those defaults, so anything it reports is
+something you added:
 
 ```
-golangci-lint run ./internal/<package>/...
+golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./...
 ```
+
+Pass both flags. The defaults stop at 50 issues per linter and 3 repeats of the
+same message, so a bare `golangci-lint run ./...` on a tree with work to do
+reports a fraction of it and reports more every time you fix some.
+
+An error this codebase deliberately drops is written `_ = f.Close()` rather than
+left bare, and carries a comment wherever a reader might reasonably expect it to
+be checked — a Close on a write path, an iterator whose error is read somewhere
+else. `_` is a claim that the error cannot matter, so be sure it cannot.
 
 ### Format
 
@@ -115,6 +125,10 @@ drive-by.
   struct carrying `args`, `stdin`, `stdout`, `stderr`; `run() int` returns the
   exit code so tests can drive it with captured buffers. Exit codes are named
   constants.
+- **The CLI prints through `a.outf` and `a.errf`,** not `fmt.Fprintf` on the
+  writers directly. A command can do nothing about a failed write to its own
+  output, and those two are where that is said once instead of at every call
+  site. Diagnostics carry their own `plaid-cache: ` prefix.
 
 ## Correctness rules that outrank convenience
 

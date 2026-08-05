@@ -151,7 +151,7 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request, k Kind, d Digest) 
 		http.Error(w, "plaid-cache: cache miss", http.StatusNotFound)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Bazel rejects a response with no Content-Length outright and truncates
 	// one whose body falls short of it, so the declared length and the bytes

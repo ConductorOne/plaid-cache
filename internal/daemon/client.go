@@ -97,13 +97,13 @@ func Connect(ctx context.Context, cfg *config.Config, version string, op Op, log
 		}
 		resp, err := handshake(conn, version, op)
 		if err != nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil, fmt.Errorf("Connect: %w", err)
 		}
 		if resp.OK {
 			return conn, nil
 		}
-		conn.Close()
+		_ = conn.Close()
 
 		if resp.Version == version || resp.Version == "" {
 			return nil, fmt.Errorf("Connect: daemon refused: %s", resp.Err)
@@ -194,7 +194,9 @@ func spawn(cfg *config.Config, logf cache.Logf) error {
 	if err != nil {
 		return fmt.Errorf("spawn: open log: %w", err)
 	}
-	defer log.Close()
+	// This handle exists to be inherited: the spawned daemon holds its own, and
+	// writes through that one long after this descriptor is gone.
+	defer func() { _ = log.Close() }()
 
 	cmd := exec.Command(self, "serve")
 	cmd.Stdin = nil
@@ -236,7 +238,7 @@ func requestShutdown(ctx context.Context, cfg *config.Config, daemonVersion stri
 		return fmt.Errorf("requestShutdown: %w", err)
 	}
 	conn := newConn(c)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	// Speak the daemon's own version so it does not reject us for mismatch
 	// before it reads the op.
 	if _, err := handshake(conn, daemonVersion, OpShutdown); err != nil {
@@ -276,7 +278,7 @@ func RunPlugin(ctx context.Context, cfg *config.Config, version string, stdin io
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	return relay(conn, stdin, stdout)
 }
 

@@ -180,7 +180,7 @@ func unixPair(t *testing.T) (*Conn, net.Conn) {
 	if err != nil {
 		t.Fatalf("net.Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	type accepted struct {
 		conn net.Conn
