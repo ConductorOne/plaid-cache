@@ -290,8 +290,13 @@ func (s *Server) ServeBazel(ctx context.Context, ln net.Listener) error {
 	s.enter()
 	defer s.leave()
 
+	p := bazel.HandlerParams{Store: bstore, Logf: s.logf}
+	if s.cfg.BazelMonitoring {
+		p.Status, p.Metrics = s.bazelStatus, s.bazelMetrics
+	}
+
 	srv := &http.Server{
-		Handler:           bazel.NewHandler(bstore, s.logf),
+		Handler:           bazel.NewHandler(p),
 		ReadHeaderTimeout: bazelReadHeaderTimeout,
 		IdleTimeout:       bazelIdleTimeout,
 		// Request contexts derive from ctx, so a cancelled daemon cancels the
@@ -354,6 +359,40 @@ func (s *Server) bazelAdapter() (*bazel.Store, error) {
 		})
 	})
 	return s.bazelStore, s.bazelErr
+}
+
+// bazelStatus answers the HTTP listener's status route with the same report the
+// socket's status operation returns.
+//
+// An index this daemon cannot read is an error here rather than a report with an
+// apology inside it. The caller turns that into a 5xx, which is the answer a
+// monitoring reader can act on — and the opposite of what the cache routes beside
+// it do with their own failures, for reasons that belong to those routes and not
+// to this one.
+func (s *Server) bazelStatus(context.Context) (any, error) {
+	r := s.status()
+	if r.Err != "" {
+		return nil, errors.New(r.Err)
+	}
+	return r, nil
+}
+
+// bazelMetrics answers the HTTP listener's metrics route, rendered from that
+// same report so that a scrape and a status report taken together cannot
+// disagree.
+func (s *Server) bazelMetrics(ctx context.Context) ([]byte, error) {
+	r, err := s.bazelStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+	status, ok := r.(StatusResponse)
+	if !ok {
+		// Unreachable while bazelStatus returns what it says it does; a wrong
+		// answer here would be an exposition of zeros, which reads as a healthy
+		// idle cache rather than as a bug.
+		return nil, fmt.Errorf("bazelMetrics: status is a %T", r)
+	}
+	return renderMetrics(status), nil
 }
 
 // drain waits for in-flight connections to finish.
@@ -529,13 +568,22 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 }
 
 // status assembles a StatusResponse.
+//
+// Every reader of the daemon's numbers goes through here — the socket, the
+// monitoring routes, and the metrics rendered from what this returns — so that
+// the three cannot disagree about the same cache at the same instant.
 func (s *Server) status() StatusResponse {
+	uptime := time.Since(s.started).Round(time.Second)
 	r := StatusResponse{
-		PID:      os.Getpid(),
-		MaxBytes: s.cfg.MaxBytes,
-		TTL:      s.cfg.TTL.String(),
-		Uptime:   time.Since(s.started).Round(time.Second).String(),
-		Metrics:  s.cache.Metrics(),
+		PID:           os.Getpid(),
+		Version:       s.version,
+		RemoteEnabled: s.cfg.RemoteEnabled(),
+		MaxBytes:      s.cfg.MaxBytes,
+		TTL:           s.cfg.TTL.String(),
+		TTLSeconds:    s.cfg.TTL.Seconds(),
+		Uptime:        uptime.String(),
+		UptimeSeconds: uptime.Seconds(),
+		Metrics:       s.cache.Metrics(),
 	}
 	// The lifetime figures include what this process has counted but not yet
 	// flushed, so the two sets cannot disagree about activity that just
@@ -559,8 +607,11 @@ func (s *Server) status() StatusResponse {
 		s.logf("age span: %v", err)
 	} else if ok {
 		now := time.Now()
-		r.OldestAge = now.Sub(time.Unix(0, oldest)).Round(time.Second).String()
-		r.NewestAge = now.Sub(time.Unix(0, newest)).Round(time.Second).String()
+		oldestAge := now.Sub(time.Unix(0, oldest)).Round(time.Second)
+		newestAge := now.Sub(time.Unix(0, newest)).Round(time.Second)
+		r.HaveAgeSpan = true
+		r.OldestAge, r.OldestAgeSeconds = oldestAge.String(), oldestAge.Seconds()
+		r.NewestAge, r.NewestAgeSeconds = newestAge.String(), newestAge.Seconds()
 	}
 	return r
 }

@@ -82,6 +82,10 @@ index and the live counters, and opens the index directly when there is not. It
 never starts a daemon just to answer a question, so the metrics lines are absent
 when nothing is running.
 
+For a daemon on another machine there is `plaid-cache status -from <address>`,
+which reads the same report over an endpoint that daemon has to have been asked
+to serve; see [monitoring a shared daemon](#monitoring-a-shared-daemon).
+
 Run the daemon in the foreground, for a container or a supervised service:
 
 ```sh
@@ -201,6 +205,59 @@ An action-cache entry names CAS blobs that are stored, and evicted, separately f
 Bazel treats the resulting dangling reference as a failed download rather than as corruption, and `--experimental_remote_cache_eviction_retries` (5 by default) bounds how many times it will reset its state and retry rather than failing the build. Serving a plain miss for the absent blob is the whole of the server's obligation, and it is enough: evicting the entire cache in between a `--remote_download_outputs=minimal` build and the request for its 400 MB output re-ran the action and completed the build successfully. Verifying the reference at lookup time would mean parsing `ActionResult` and probing every blob it names on the hot path, which costs more than the occasional re-run it would save, so it is documented here rather than implemented.
 
 If you set a lifecycle rule on the bucket, expiring action records earlier than output bodies keeps the dangling reference on the harmless side: an action record with no body is a miss, where a body with no action record is merely unreferenced.
+
+### Monitoring a shared daemon
+
+`plaid-cache status` reads the local daemon over a unix socket, which is the right answer for a cache on the machine you are sitting at and no answer at all for one serving a room full of builders. `-bazel-monitoring` adds two read-only routes to the Bazel HTTP address for that case:
+
+```sh
+plaid-cache serve -bazel-addr localhost:9095 -bazel-monitoring
+```
+
+```sh
+plaid-cache status -from localhost:9095
+curl -s localhost:9095/metrics
+```
+
+`status -from` prints the report a local `status` prints, minus the lines that would describe the machine you ran it on rather than the daemon you asked:
+
+```
+endpoint    http://cache-host:9095/status
+version     plaid-cache v0.4.0
+entries     274 actions, 206 objects (1.33x dedup, 173.1 KiB avg)
+size        34.8 MiB of 64.0 MiB (54.4%, 29.2 MiB free)
+ttl         168h0m0s
+age         oldest 20m0s, newest 4s
+remote      enabled
+daemon      pid 4210, up 3h20m0s
+hit rate    59.9% of 347 lookups
+...
+```
+
+There is no `directory`, no `config`, and no `volume` line, and `remote` says whether a shared tier is configured rather than naming the bucket. The endpoint reports counters and the limits being enforced; it does not report where the cache lives, what file configured it, or what it uploads to. A flag named `-from` and not `-remote` because in this tool "remote" is the S3 tier that every report has a line about.
+
+`/metrics` is Prometheus text exposition, which an OpenTelemetry Collector scrapes as it stands through its `prometheus` receiver — there is no push exporter here, and none is needed to get these numbers into an OTel pipeline. The gauges describe the cache now, the counters are the persisted lifetime tallies that survive the daemon's idle exit, and every number is rendered from the same report `status` prints, so a scrape and a status report taken together cannot disagree:
+
+| Metric | Type | |
+| --- | --- | --- |
+| `plaid_cache_actions`, `plaid_cache_objects` | gauge | Entries and distinct bodies in the index. |
+| `plaid_cache_disk_bytes` | gauge | Bytes of stored bodies the index accounts for. |
+| `plaid_cache_max_bytes`, `plaid_cache_ttl_seconds` | gauge | The limits eviction is enforcing. Zero disables that constraint. |
+| `plaid_cache_oldest_entry_age_seconds`, `plaid_cache_newest_entry_age_seconds` | gauge | The age span, absent for a cache with no entries. |
+| `plaid_cache_uptime_seconds`, `plaid_cache_build_info` | gauge | This daemon and the build serving it. |
+| `plaid_cache_remote_tier_enabled` | gauge | 1 when a shared tier is configured. |
+| `plaid_cache_gets_total{result}` | counter | Lookups by outcome: `local_hit`, `remote_hit`, `miss`. |
+| `plaid_cache_puts_total`, `plaid_cache_repairs_total`, `plaid_cache_compactions_total` | counter | Stores, index entries dropped for a missing body, and compactions. |
+| `plaid_cache_uploads_total{result}` | counter | Uploads by outcome: `ok`, `failed`, `dropped`, `skipped`. |
+| `plaid_cache_activity_start_time_seconds` | gauge | When the counters above started counting. |
+
+Two labels, both with a short fixed set of values. Nothing is ever labelled by digest, key, path, or client: a series is created for every distinct label value and never forgotten, so a per-request label is an unbounded leak in whatever scrapes it.
+
+**These routes are off unless asked for, and that is the conservative default on purpose.** They describe the host — pid, uptime, entry counts, byte budgets — where the cache routes beside them describe only blobs somebody already knew the digest of. `PLAID_GOCACHE_BAZEL_ADDR` takes a full address precisely because the choice between loopback and every interface is the difference between a private cache and a public one, and this is a second disclosure on top of that choice, so it is a second decision. One setting governs both routes, because they disclose the same thing and a split would offer a choice with nothing behind it.
+
+To let a scraper in without opening the daemon to the network, keep the listener on an interface only the scraper can reach — loopback with a node-local scraper or an SSH tunnel, a pod address reachable only through a network policy — or put a reverse proxy in front of it. The monitoring routes are two fixed paths that no cache request can ever take, so a proxy can serve `/status` and `/metrics` to your monitoring subnet and `/ac/…` and `/cas/…` to your builders, with different rules on each.
+
+Unlike the cache routes, these two report their failures honestly. A cache route answers a broken store with a miss or with a success, because Bazel reads anything else as a build error and a cache must never break a build; a monitoring route answers with a `5xx`, because a reader asking how the daemon is doing is exactly the reader who must not be told "fine". `status -from` exits non-zero on any of it, so a report that could not be obtained is never mistakable for a cache with nothing in it.
 
 ### Activity history
 
@@ -437,6 +494,7 @@ be a surprising amount of reach for this one to have.
 | `PLAID_GOCACHE_COMPACT_AFTER` | Pruned entries that must accumulate before the index is compacted. Deletes in an LSM are writes, so pruning grows the index until a compaction reclaims it. | `1000` |
 | `PLAID_GOCACHE_BAZEL_ADDR` | Address for the Bazel HTTP remote cache, e.g. `localhost:9095`. Empty serves it not at all. | empty |
 | `PLAID_GOCACHE_BAZEL_GRPC_ADDR` | Address for the Bazel gRPC remote cache, e.g. `localhost:9096`. Empty serves it not at all. | empty |
+| `PLAID_GOCACHE_BAZEL_MONITORING` | `1` also serves `/status` and `/metrics` on the Bazel HTTP address, for `plaid-cache status -from` and for a Prometheus scrape. Off by default: they describe the host rather than the cache's contents. | unset |
 | `PLAID_GOCACHE_DISABLE_BAZEL_VERIFY` | `1` stops both Bazel listeners from checking that an uploaded CAS body hashes to the digest naming it, and lets a gRPC client name a digest function this cache cannot compute. For clients whose digest function is not SHA-256. | unset |
 | `PLAID_GOCACHE_DISABLE_EVICTION` | `1` disables eviction entirely. | unset |
 | `PLAID_GOCACHE_DISABLE_DAEMON` | `1` forces direct in-process mode. | unset |

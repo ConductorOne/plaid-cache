@@ -148,6 +148,26 @@ type Config struct {
 	// bind applies, and for the same reason.
 	BazelGRPCAddr string
 
+	// BazelMonitoring serves the two monitoring routes — /status and /metrics —
+	// on the Bazel HTTP listener, so that `plaid-cache status -from` and a
+	// Prometheus scrape can read a daemon an operator has no shell on. False,
+	// the default, serves neither.
+	//
+	// It is one setting for both because they disclose the same thing: the
+	// daemon's pid and uptime, how many entries it holds, how many bytes, what
+	// limits it was configured with. Splitting them would offer a choice with no
+	// meaning behind it, and would let an operator believe they had withheld
+	// something they had not.
+	//
+	// It is opt-in rather than always-on because BazelAddr may well be an
+	// address every machine on the network can reach. The cache routes on that
+	// same listener hand out build outputs, so the listener is already
+	// sensitive; that is an argument for making a second disclosure a second
+	// decision, not for treating it as already made. What the routes report is
+	// bounded to counters for the same reason: no directory, no configuration
+	// file path, no bucket name.
+	BazelMonitoring bool
+
 	// DisableBazelVerify stops the Bazel listener from checking that an
 	// uploaded CAS body hashes to the digest naming it. It exists for a client
 	// whose digest function is not SHA-256, since only the bare hash appears in
@@ -238,6 +258,9 @@ func Load() (*Config, error) {
 	if c.UploadConcurrency < 1 {
 		return nil, fmt.Errorf("Load: PLAID_GOCACHE_UPLOAD_CONCURRENCY: got %d, want >= 1", c.UploadConcurrency)
 	}
+	if c.BazelMonitoring, err = envBool(src, "PLAID_GOCACHE_BAZEL_MONITORING"); err != nil {
+		return nil, fmt.Errorf("Load: %w", err)
+	}
 	if c.DisableBazelVerify, err = envBool(src, "PLAID_GOCACHE_DISABLE_BAZEL_VERIFY"); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
@@ -287,6 +310,7 @@ var settingNames = map[string]bool{
 	"PLAID_GOCACHE_COMPACT_AFTER":        true,
 	"PLAID_GOCACHE_BAZEL_ADDR":           true,
 	"PLAID_GOCACHE_BAZEL_GRPC_ADDR":      true,
+	"PLAID_GOCACHE_BAZEL_MONITORING":     true,
 	"PLAID_GOCACHE_DISABLE_BAZEL_VERIFY": true,
 	"PLAID_GOCACHE_DISABLE_EVICTION":     true,
 	"PLAID_GOCACHE_DISABLE_DAEMON":       true,

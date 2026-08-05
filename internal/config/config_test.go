@@ -299,6 +299,7 @@ func TestLoadBazelSettings(t *testing.T) {
 	t.Setenv("PLAID_GOCACHE_DIR", t.TempDir())
 	t.Setenv("PLAID_GOCACHE_BAZEL_ADDR", "localhost:9095")
 	t.Setenv("PLAID_GOCACHE_BAZEL_GRPC_ADDR", "localhost:9096")
+	t.Setenv("PLAID_GOCACHE_BAZEL_MONITORING", "1")
 	t.Setenv("PLAID_GOCACHE_DISABLE_BAZEL_VERIFY", "1")
 
 	c, err := Load()
@@ -311,12 +312,32 @@ func TestLoadBazelSettings(t *testing.T) {
 	if c.BazelGRPCAddr != "localhost:9096" {
 		t.Fatalf("BazelGRPCAddr = %q, want %q", c.BazelGRPCAddr, "localhost:9096")
 	}
+	if !c.BazelMonitoring {
+		t.Fatalf("BazelMonitoring = false, want true")
+	}
 	if !c.DisableBazelVerify {
 		t.Fatalf("DisableBazelVerify = false, want true")
 	}
 }
 
-// TestBazelSettingsAreValidFileKeys pins that both settings can be written to
+// TestMonitoringIsOffUnlessAsked pins the conservative default. The monitoring
+// routes describe the host rather than the cache's contents, so a daemon that
+// was only told to serve Bazel serves them not at all.
+func TestMonitoringIsOffUnlessAsked(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PLAID_GOCACHE_DIR", t.TempDir())
+	t.Setenv("PLAID_GOCACHE_BAZEL_ADDR", "localhost:9095")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.BazelMonitoring {
+		t.Fatalf("BazelMonitoring = true for a daemon that was only asked to serve Bazel")
+	}
+}
+
+// TestBazelSettingsAreValidFileKeys pins that every Bazel setting can be written to
 // the configuration file. An unknown key there is a hard error, so a setting
 // missing from the accepted set is one a user cannot persist.
 func TestBazelSettingsAreValidFileKeys(t *testing.T) {
@@ -324,7 +345,7 @@ func TestBazelSettingsAreValidFileKeys(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PLAID_GOCACHE_DIR", dir)
 	path := filepath.Join(dir, "config")
-	if err := os.WriteFile(path, []byte("bazel-addr = localhost:9096\nbazel-grpc-addr = localhost:9097\ndisable-bazel-verify = 1\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("bazel-addr = localhost:9096\nbazel-grpc-addr = localhost:9097\nbazel-monitoring = 1\ndisable-bazel-verify = 1\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	t.Setenv(configFileEnvVar, path)
@@ -338,6 +359,9 @@ func TestBazelSettingsAreValidFileKeys(t *testing.T) {
 	}
 	if c.BazelGRPCAddr != "localhost:9097" {
 		t.Fatalf("BazelGRPCAddr = %q, want %q", c.BazelGRPCAddr, "localhost:9097")
+	}
+	if !c.BazelMonitoring {
+		t.Fatalf("BazelMonitoring = false, want true")
 	}
 	if !c.DisableBazelVerify {
 		t.Fatalf("DisableBazelVerify = false, want true")

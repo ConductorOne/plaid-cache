@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,10 +31,18 @@ import (
 
 // newHandler builds a handler over a real index and body store with no remote
 // tier, so the tests exercise the code that actually runs rather than a fake of
-// it. Verification is on, matching the default.
+// it. Verification is on, matching the default, and the monitoring routes are
+// off, also matching the default.
 func newHandler(t *testing.T) (*Handler, *blob.Store) {
 	st, _, blobs := newStore(t)
-	return NewHandler(st, t.Logf), blobs
+	return NewHandler(HandlerParams{Store: st, Logf: t.Logf}), blobs
+}
+
+// newMonitoredHandler builds a handler whose monitoring routes are served, from
+// providers a test controls.
+func newMonitoredHandler(t *testing.T, status StatusFunc, metrics MetricsFunc) *Handler {
+	st, _, _ := newStore(t)
+	return NewHandler(HandlerParams{Store: st, Logf: t.Logf, Status: status, Metrics: metrics})
 }
 
 // newStore builds the storage adapter the handler sits on, and hands back the
@@ -259,6 +269,137 @@ func TestPutLeavesNoStagedFile(t *testing.T) {
 	}
 }
 
+// TestMonitoringRoutesServeWhatTheyAreGiven pins the success shape of both
+// monitoring routes: the provider's bytes, unaltered, under the media type that
+// declares what they are.
+func TestMonitoringRoutesServeWhatTheyAreGiven(t *testing.T) {
+	h := newMonitoredHandler(t,
+		func(context.Context) (any, error) { return map[string]any{"pid": 4210}, nil },
+		func(context.Context) ([]byte, error) { return []byte("# TYPE plaid_cache_actions gauge\n"), nil })
+
+	w := do(t, h, http.MethodGet, StatusPath, nil)
+	wantStatus(t, w, http.StatusOK)
+	if got, want := w.Header().Get("Content-Type"), "application/json"; got != want {
+		t.Fatalf("status Content-Type = %q, want %q", got, want)
+	}
+	var report struct {
+		PID int `json:"pid"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &report); err != nil {
+		t.Fatalf("status body %q: %v", w.Body, err)
+	}
+	if report.PID != 4210 {
+		t.Fatalf("status pid = %d, want 4210", report.PID)
+	}
+
+	w = do(t, h, http.MethodGet, MetricsPath, nil)
+	wantStatus(t, w, http.StatusOK)
+	if got, want := w.Header().Get("Content-Type"), metricsContentType; got != want {
+		t.Fatalf("metrics Content-Type = %q, want %q", got, want)
+	}
+	if got := w.Body.String(); got != "# TYPE plaid_cache_actions gauge\n" {
+		t.Fatalf("metrics body = %q, want the provider's bytes unaltered", got)
+	}
+}
+
+// TestMonitoringRoutesAreAbsentUnlessAsked pins the conservative default. A
+// handler given no providers answers these paths exactly as it answers any other
+// path it does not serve, so a scan learns nothing about whether this daemon
+// could have been made to talk.
+func TestMonitoringRoutesAreAbsentUnlessAsked(t *testing.T) {
+	h, _ := newHandler(t)
+	for _, p := range []string{StatusPath, MetricsPath} {
+		w := do(t, h, http.MethodGet, p, nil)
+		wantStatus(t, w, http.StatusNotFound)
+		if got := w.Body.String(); !strings.Contains(got, "not a cache path") {
+			t.Fatalf("GET %s said %q, want the same answer any unserved path gets", p, got)
+		}
+	}
+}
+
+// TestMonitoringLeavesTheCacheRoutesAlone pins that adding these routes changed
+// nothing about the two that carry builds: the keyspaces still round-trip, and
+// a path that is neither is still a miss.
+func TestMonitoringLeavesTheCacheRoutesAlone(t *testing.T) {
+	h := newMonitoredHandler(t,
+		func(context.Context) (any, error) { return struct{}{}, nil },
+		func(context.Context) ([]byte, error) { return nil, nil })
+
+	body := []byte("an output stored while monitoring is on")
+	for _, p := range []string{"/cas/" + sha256Hex(body), "/ac/" + hex64} {
+		wantStatus(t, do(t, h, http.MethodPut, p, body), http.StatusOK)
+		w := do(t, h, http.MethodGet, p, nil)
+		wantStatus(t, w, http.StatusOK)
+		if got := w.Body.Bytes(); !bytes.Equal(got, body) {
+			t.Fatalf("GET %s = %q, want %q", p, got, body)
+		}
+	}
+	// Neither a cache route nor a monitoring one, including the shapes that
+	// would exist if the new routes had been given a keyspace's shape.
+	for _, p := range []string{"/status/" + hex64, "/metrics/" + hex64, "/status/cas/" + hex64, "/cas/not-a-digest"} {
+		wantStatus(t, do(t, h, http.MethodGet, p, nil), http.StatusNotFound)
+	}
+}
+
+// TestMonitoringRoutesRefuseWrites pins that these two are read-only, and say
+// what they would accept. A cache route takes a PUT; nothing here does.
+func TestMonitoringRoutesRefuseWrites(t *testing.T) {
+	h := newMonitoredHandler(t,
+		func(context.Context) (any, error) { return struct{}{}, nil },
+		func(context.Context) ([]byte, error) { return nil, nil })
+
+	for _, p := range []string{StatusPath, MetricsPath} {
+		for _, m := range []string{http.MethodPut, http.MethodPost, http.MethodDelete} {
+			w := do(t, h, m, p, []byte("x"))
+			wantStatus(t, w, http.StatusMethodNotAllowed)
+			if got := w.Header().Get("Allow"); got != "GET, HEAD" {
+				t.Fatalf("%s %s: Allow = %q, want %q", m, p, got, "GET, HEAD")
+			}
+		}
+		// HEAD costs the headers and none of the body, as it does on a hit.
+		w := do(t, h, http.MethodHead, p, nil)
+		wantStatus(t, w, http.StatusOK)
+		if w.Body.Len() != 0 {
+			t.Fatalf("HEAD %s returned %d body bytes, want 0", p, w.Body.Len())
+		}
+	}
+}
+
+// TestMonitoringRoutesReportTheirFailuresHonestly pins the discipline these
+// routes keep and the cache routes deliberately do not.
+//
+// A cache route reports a broken store as a miss or as a success, because Bazel
+// reads anything else as a build error. Nothing reads these two, and answering
+// "fine" with an empty report would hide exactly the failure the reader is
+// asking about — so a provider that cannot answer produces a 5xx.
+func TestMonitoringRoutesReportTheirFailuresHonestly(t *testing.T) {
+	broken := errors.New("index is unreadable")
+	h := newMonitoredHandler(t,
+		func(context.Context) (any, error) { return nil, broken },
+		func(context.Context) ([]byte, error) { return nil, broken })
+
+	for _, p := range []string{StatusPath, MetricsPath} {
+		w := do(t, h, http.MethodGet, p, nil)
+		wantStatus(t, w, http.StatusInternalServerError)
+	}
+
+	// The same handler, in the same broken state, still answers a cache lookup
+	// as a miss rather than as an error. The two disciplines coexist because
+	// their readers differ.
+	wantStatus(t, do(t, h, http.MethodGet, "/cas/"+hex64, nil), http.StatusNotFound)
+}
+
+// TestStatusRouteRefusesAnUnencodableReport pins that a report which cannot be
+// marshalled is a failure with a status code rather than a truncated body under
+// a 200, which is what writing the encoder straight to the response would give.
+func TestStatusRouteRefusesAnUnencodableReport(t *testing.T) {
+	h := newMonitoredHandler(t,
+		func(context.Context) (any, error) { return func() {}, nil }, nil)
+	wantStatus(t, do(t, h, http.MethodGet, StatusPath, nil), http.StatusInternalServerError)
+	// Metrics was given no provider, so it is unrouted even though status is.
+	wantStatus(t, do(t, h, http.MethodGet, MetricsPath, nil), http.StatusNotFound)
+}
+
 // totalAlloc reports the bytes this process has allocated in total, which is
 // cumulative and therefore unaffected by whether a collection has run.
 func totalAlloc() uint64 {
@@ -291,7 +432,10 @@ func (failingStore) PutStaged(context.Context, ids.ActionID, ids.OutputID, strin
 // answers cost a rebuild where the honest status would cost the build.
 func TestBrokenCacheStillAnswersCleanly(t *testing.T) {
 	_, blobs := newHandler(t)
-	h := NewHandler(NewStore(StoreParams{Cache: failingStore{}, Blobs: blobs, Verify: true, Logf: t.Logf}), t.Logf)
+	h := NewHandler(HandlerParams{
+		Store: NewStore(StoreParams{Cache: failingStore{}, Blobs: blobs, Verify: true, Logf: t.Logf}),
+		Logf:  t.Logf,
+	})
 
 	wantStatus(t, do(t, h, http.MethodGet, "/cas/"+hex64, nil), http.StatusNotFound)
 	body := []byte("a body the store will refuse")
