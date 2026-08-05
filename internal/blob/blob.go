@@ -24,6 +24,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/conductorone/plaid-cache/internal/ids"
@@ -167,8 +168,7 @@ func (s *Store) Remove(id ids.OutputID) error {
 //
 // The caller owns the file and must remove it on every path, including after a
 // successful Adopt, where it is a second name for a now-published inode. A
-// process killed mid-write leaves one behind, which is what CleanStaging is
-// for.
+// process killed mid-write leaves one behind, which is what CleanTemp is for.
 func (s *Store) Stage() (*os.File, error) {
 	dir := filepath.Join(s.root, stagingDir)
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
@@ -181,35 +181,89 @@ func (s *Store) Stage() (*os.File, error) {
 	return f, nil
 }
 
-// CleanStaging removes staged bodies left behind by a process that died before
-// it could publish or remove them.
+// CleanTemp removes partial bodies left behind by a process that died before it
+// could publish or remove them.
 //
-// They are invisible to the byte budget — nothing in the index references a
-// body that was never published — so without this a repeatedly killed daemon
-// leaks disk that no eviction pass will ever reclaim. It is safe only because
-// exactly one process holds the index lock, and therefore the store, at a time.
-func (s *Store) CleanStaging() (removed int, err error) {
-	dir := filepath.Join(s.root, stagingDir)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("CleanStaging: %w", err)
+// Two kinds accumulate, and this sweeps both:
+//
+//   - Staged bodies, from a caller that had to read a body before it could
+//     address it (see Stage). They have a directory to themselves.
+//   - Put's own temporary, which shares a directory with the published body so
+//     that the link(2) that publishes it stays intra-filesystem. It therefore
+//     sits inside the output tree, among the bodies, which is where a sweep
+//     scoped to the staging directory never looked.
+//
+// Both are invisible to the byte budget — nothing in the index references a body
+// that was never published — so without this a repeatedly killed daemon leaks
+// disk that no eviction pass will ever reclaim, and leaks it in proportion to
+// the size of whatever it was writing when it died.
+//
+// It is safe only because exactly one process holds the index lock, and
+// therefore the store, at a time, and only before that process has begun
+// serving: a temporary belonging to a write that is still running is
+// indistinguishable from an abandoned one.
+func (s *Store) CleanTemp() (removed int, err error) {
+	n, serr := sweepDir(filepath.Join(s.root, stagingDir), nil)
+	removed += n
+	if serr != nil {
+		err = fmt.Errorf("CleanTemp: %w", serr)
 	}
-	for _, e := range entries {
-		if e.IsDir() {
+
+	// The output tree is sharded by the first byte of the id, so a temporary
+	// lives one level down rather than at the root.
+	outRoot := filepath.Join(s.root, outputDir)
+	shards, rerr := os.ReadDir(outRoot)
+	if rerr != nil {
+		if errors.Is(rerr, fs.ErrNotExist) {
+			return removed, err
+		}
+		return removed, fmt.Errorf("CleanTemp: %w", rerr)
+	}
+	for _, sh := range shards {
+		if !sh.IsDir() {
 			continue
 		}
-		if rerr := os.Remove(filepath.Join(dir, e.Name())); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+		n, serr := sweepDir(filepath.Join(outRoot, sh.Name()), isTempName)
+		removed += n
+		if serr != nil {
 			// One undeletable file is a leak, not a reason to leave the rest.
-			err = fmt.Errorf("CleanStaging: %w", rerr)
+			err = fmt.Errorf("CleanTemp: %w", serr)
+		}
+	}
+	return removed, err
+}
+
+// sweepDir removes the files in dir that match, or every file when match is
+// nil. An absent directory is nothing to clean rather than a failure, and one
+// file that will not delete does not abandon the others.
+func sweepDir(dir string, match func(string) bool) (removed int, err error) {
+	entries, rerr := os.ReadDir(dir)
+	if rerr != nil {
+		if errors.Is(rerr, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, rerr
+	}
+	for _, e := range entries {
+		if e.IsDir() || (match != nil && !match(e.Name())) {
+			continue
+		}
+		if derr := os.Remove(filepath.Join(dir, e.Name())); derr != nil && !errors.Is(derr, fs.ErrNotExist) {
+			err = derr
 			continue
 		}
 		removed++
 	}
 	return removed, err
 }
+
+// tempMarker is the infix createTemp puts between a final name and its random
+// suffix. A published body is a bare hex id, so the marker cannot occur in one
+// and a sweep can recognise a temporary by name alone.
+const tempMarker = ".tmp."
+
+// isTempName reports whether name is one of createTemp's.
+func isTempName(name string) bool { return strings.Contains(name, tempMarker) }
 
 // tempAttempts bounds the retry loop for an O_EXCL tmp name. A collision
 // needs both a random-suffix collision and a live concurrent writer, so more
@@ -226,7 +280,7 @@ func createTemp(path string) (*os.File, error) {
 		if _, err := rand.Read(buf[:]); err != nil {
 			return nil, err
 		}
-		name := path + ".tmp." + hex.EncodeToString(buf[:])
+		name := path + tempMarker + hex.EncodeToString(buf[:])
 		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, filePerm)
 		if err == nil {
 			return f, nil

@@ -420,6 +420,43 @@ volume      16.0 GiB used of 50.0 GiB (32.0%, 34.0 GiB free)
 On platforms without `st_blocks` the budget is the logical length, which is all
 that is available there.
 
+### What a transfer costs in memory
+
+A constant, whatever the payload weighs.
+
+This matters most for Bazel, whose blobs run to hundreds of megabytes for a
+linked binary, and whose concurrency is the client's to choose. A server that
+held one body in memory would have a footprint of blob size times concurrency,
+and it has no say in either factor. So no path holds one: an upload is hashed as
+it streams into a temporary in the body store and published by `link(2)`, a
+download is served off the open file, and a body faulted in from the shared tier
+goes from the network to the disk without stopping. The `GOCACHEPROG` protocol
+carries its body base64-encoded on a single line, which is the shape most likely
+to tempt a decoder into reading the line before decoding it; that one is decoded
+through a fixed window too.
+
+The property is measured rather than asserted. Every path has a test that runs
+the same transfer at 1 MiB and 32 MiB and fails if the larger allocates
+meaningfully more than the smaller, and the same is visible as a benchmark:
+
+```
+$ go test ./internal/bazel/ -run XXX -bench BenchmarkStorePut -benchmem
+BenchmarkStorePut/1MiB-12      559    2774966 ns/op   377.87 MB/s   35667 B/op   32 allocs/op
+BenchmarkStorePut/32MiB-12      25   47862606 ns/op   701.06 MB/s   35916 B/op   32 allocs/op
+```
+
+Thirty-two times the payload for the same thirty-two allocations. A change that
+buffers a body instead fails those tests by an order of magnitude, which is the
+point of having them: the streaming is easy to write and easier to lose.
+
+Temporaries are cleaned up on every path — success, error, and a client that
+disconnects mid-upload — and they live in the cache's own directory, so they
+share the volume the store was sized against and the publish stays a link rather
+than a copy. What a killed process leaves behind is swept by the next daemon on
+its way up, before either listener serves: at that point exactly one process
+holds the index, so anything still there belongs to a dead one. It cannot be
+done later, because a temporary belonging to a live write looks exactly the same.
+
 ## Configuration
 
 Every setting has one name and one fallback chain: the environment, then the

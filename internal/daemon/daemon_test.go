@@ -95,6 +95,16 @@ type testServer struct {
 func startServer(t *testing.T, cfg *config.Config) *testServer {
 	t.Helper()
 	s := newTestServer(t, cfg)
+
+	// Sweep here rather than leaving it to Serve, which runs in the goroutine
+	// below. Serve sweeps the store's abandoned temporaries before it accepts
+	// anything, so a client cannot have a write in flight when it happens — but
+	// a test that writes through the cache directly is not a client and is not
+	// ordered behind it. Doing it now leaves Serve's sync.Once with the work
+	// already done, rather than racing a Put the test has started meanwhile and
+	// deleting the temporary out from under it.
+	s.cleanTemp()
+
 	ln, err := Listen(cfg)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)

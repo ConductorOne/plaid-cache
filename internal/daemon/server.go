@@ -54,12 +54,14 @@ type Server struct {
 	stopOnce sync.Once
 
 	// bazelOnce guards the storage adapter the Bazel transports share. Both
-	// listeners may run at once, and the startup sweep of leftover staging
-	// files must happen before either serves and never again: a second sweep
-	// would delete the bodies the first listener's uploads are streaming into.
+	// listeners may run at once, and neither may build a second adapter over
+	// the same store.
 	bazelOnce  sync.Once
 	bazelStore *bazel.Store
 	bazelErr   error
+
+	// cleanOnce gates the sweep of abandoned temporaries. See cleanTemp.
+	cleanOnce sync.Once
 }
 
 // ServerParams carries the daemon's dependencies.
@@ -203,6 +205,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	bg.Add(1)
 	go func() { defer bg.Done(); s.metricsLoop(ctx) }()
 	defer func() { cancel(); bg.Wait() }()
+	s.cleanTemp()
 	s.armIdleTimer()
 
 	// Unblock Accept when we are asked to stop: a unix listener has no other
@@ -330,11 +333,10 @@ func (s *Server) ServeBazel(ctx context.Context, ln net.Listener) error {
 // bazelAdapter returns the storage adapter both Bazel transports serve over,
 // building it on first use.
 //
-// One adapter rather than one per listener, so that the sweep of staging files
-// left by a previous process happens exactly once. It has to happen before
-// anything serves — a body staged by a process that was killed is referenced by
-// nothing and accounted for by no eviction pass — and it must not happen again
-// afterwards, because by then the staging directory holds uploads in flight.
+// One adapter rather than one per listener, and the sweep of what a previous
+// process left behind happens here as well, before this one has served
+// anything. Both listeners may start at once and neither can assume it is
+// first, which is what cleanTemp's own Once is for.
 func (s *Server) bazelAdapter() (*bazel.Store, error) {
 	s.bazelOnce.Do(func() {
 		if s.blobs == nil {
@@ -344,13 +346,7 @@ func (s *Server) bazelAdapter() (*bazel.Store, error) {
 			s.bazelErr = errors.New("this daemon has no body store")
 			return
 		}
-		// Exactly one process holds the index, and therefore the store, so
-		// anything still staged is from a previous one.
-		if n, err := s.blobs.CleanStaging(); err != nil {
-			s.logf("bazel: clean staging: %v", err)
-		} else if n > 0 {
-			s.logf("bazel: removed %d staged bodies left by a previous process", n)
-		}
+		s.cleanTemp()
 		s.bazelStore = bazel.NewStore(bazel.StoreParams{
 			Cache:  s.cache,
 			Blobs:  s.blobs,
@@ -393,6 +389,29 @@ func (s *Server) bazelMetrics(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("bazelMetrics: status is a %T", r)
 	}
 	return renderMetrics(status), nil
+}
+
+// cleanTemp removes the partial bodies a process killed mid-write left in the
+// store, once per daemon and before any listener serves.
+//
+// Both halves of that matter. A temporary belonging to a write still in flight
+// is indistinguishable from an abandoned one, so a sweep that ran while this
+// daemon was serving would delete a body out from under the build writing it —
+// and the socket and the Bazel listeners start concurrently, so none of them can
+// assume it is first. sync.Once supplies the ordering for free: whichever of
+// Serve and bazelAdapter arrives second blocks in Do until the sweep has
+// finished, and all of them therefore begin serving on a swept store.
+func (s *Server) cleanTemp() {
+	s.cleanOnce.Do(func() {
+		if s.blobs == nil {
+			return
+		}
+		if n, err := s.blobs.CleanTemp(); err != nil {
+			s.logf("clean temporaries: %v", err)
+		} else if n > 0 {
+			s.logf("removed %d partial bodies left by a previous process", n)
+		}
+	})
 }
 
 // drain waits for in-flight connections to finish.
