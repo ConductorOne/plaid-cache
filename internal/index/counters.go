@@ -64,7 +64,9 @@ func (ix *Index) loadCounters() error {
 
 	if clean {
 		b := ix.db.NewBatch()
-		defer b.Close()
+		// Commit is what can fail and it is checked below; Close releases the
+		// batch's memory whether or not the commit happened.
+		defer func() { _ = b.Close() }()
 		if err := b.Delete(metaCleanShutdown, nil); err != nil {
 			return fmt.Errorf("loadCounters: %w", err)
 		}
@@ -88,7 +90,10 @@ func (ix *Index) rebuildCounters() error {
 	if err != nil {
 		return fmt.Errorf("rebuildCounters: %w", err)
 	}
-	defer iter.Close()
+	// Close reports the error accumulated while iterating, which iter.Error()
+	// below already reads and turns into this function's failure; by the time
+	// this runs there is nothing left in it to act on.
+	defer func() { _ = iter.Close() }()
 
 	var c countersSnapshot
 	for iter.First(); iter.Valid(); iter.Next() {

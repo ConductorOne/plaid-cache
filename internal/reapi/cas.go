@@ -209,7 +209,7 @@ func (c *casService) readOne(ctx context.Context, bd *repb.Digest, compressor re
 		out.Status = status.Newf(codes.NotFound, "plaid-cache: no blob %s", d).Proto()
 		return out
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	data := make([]byte, size)
 	if _, err := io.ReadFull(f, data); err != nil {

@@ -112,10 +112,12 @@ func (ix *Index) evictChunk(
 	if err != nil {
 		return nil, false, err
 	}
-	defer iter.Close()
+	// As in rebuildCounters: what Close reports is the iteration error that
+	// iter.Error() below has already read.
+	defer func() { _ = iter.Close() }()
 
 	b := ix.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	// Two actions in one chunk can share an output. Decrementing each from the
 	// committed value would apply both decrements to the same base and lose
@@ -252,10 +254,12 @@ func (ix *Index) reapChunk(res *EvictResult) (orphans []ids.OutputID, more bool,
 	if err != nil {
 		return nil, false, err
 	}
-	defer iter.Close()
+	// As in rebuildCounters: what Close reports is the iteration error that
+	// iter.Error() below has already read.
+	defer func() { _ = iter.Close() }()
 
 	b := ix.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	var nObjects, freed int64
 	hitLimit := false

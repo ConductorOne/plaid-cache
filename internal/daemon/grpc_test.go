@@ -142,7 +142,7 @@ func TestBothBazelListenersShareOneCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	defer got.Body.Close()
+	defer func() { _ = got.Body.Close() }()
 	if got.StatusCode != http.StatusOK {
 		t.Fatalf("GET status = %d, want 200", got.StatusCode)
 	}

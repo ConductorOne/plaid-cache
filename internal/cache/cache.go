@@ -217,7 +217,7 @@ func (c *Cache) getRemote(ctx context.Context, a ids.ActionID) (Result, error) {
 		c.metrics.GetMiss.Add(1)
 		return Result{Miss: true}, nil
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	path, diskBytes, err := c.blobs.Put(outputID, body, size)
 	if err != nil {
@@ -554,7 +554,9 @@ func (u *uploader) run(j uploadJob) {
 		u.logf("upload open %s: %v", j.output, err)
 		return
 	}
-	defer f.Close()
+	// Read-only, so there is no buffered write for Close to fail on; the upload
+	// itself is what can fail, and it is checked.
+	defer func() { _ = f.Close() }()
 
 	if err := j.backend.PutObject(ctx, j.output, f, j.size); err != nil {
 		u.metrics.UploadFail.Add(1)

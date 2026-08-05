@@ -186,7 +186,7 @@ func TestWaitSocketGoneStopsOnContextCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

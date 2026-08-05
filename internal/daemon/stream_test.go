@@ -196,7 +196,7 @@ func TestServeSweepsAbandonedTemporaries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	resp, err := handshake(conn, testVersion, OpStatus)
 	if err != nil {
 		t.Fatalf("handshake: %v", err)

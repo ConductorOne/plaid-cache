@@ -89,7 +89,7 @@ func (s *S3) GetAction(ctx context.Context, a ids.ActionID) (ids.OutputID, time.
 		}
 		return ids.OutputID{}, time.Time{}, fmt.Errorf("GetAction: %w", err)
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 
 	// An action record is two short fields; cap the read so a corrupt or
 	// hostile object cannot be streamed into memory without bound.

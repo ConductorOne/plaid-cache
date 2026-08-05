@@ -37,7 +37,7 @@ func TestListenSocketDirIsOwnerOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	fi, err := os.Stat(cfg.SocketDir())
 	if err != nil {
@@ -70,7 +70,7 @@ func TestListenTightensAPreexistingLooseSocketDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	fi, err := os.Stat(cfg.SocketDir())
 	if err != nil {
@@ -207,7 +207,7 @@ func TestSilentSessionDoesNotKeepTheDaemonAlive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := writeJSONLine(conn, Hello{Version: srv.version, Op: OpSession}); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}

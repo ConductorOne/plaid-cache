@@ -46,7 +46,7 @@ func (a *actionCacheService) GetActionResult(ctx context.Context, req *repb.GetA
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "plaid-cache: no action result for %s", d)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	if size > maxActionResultBytes {
 		// The same keyspace is writable over HTTP, where a body is opaque bytes

@@ -58,7 +58,7 @@ func (b *byteStreamService) Read(req *bytestream.ReadRequest, stream bytestream.
 	if !ok {
 		return status.Errorf(codes.NotFound, "plaid-cache: no blob %s", res.digest)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	if offset > size {
 		return status.Errorf(codes.OutOfRange, "plaid-cache: read offset %d is past the end of a %d-byte blob", offset, size)

@@ -251,7 +251,7 @@ func readRecord(path, name string) (record, error) {
 	if err != nil {
 		return record{}, fmt.Errorf("readRecord: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	buf := make([]byte, 256)
 	n, err := f.Read(buf)
 	if err != nil && n == 0 {

@@ -24,16 +24,16 @@ func (a *app) runStats(ctx context.Context) int {
 		f.StringVar(&since, "since", "24h", "how far back to report, as a Go duration")
 		f.BoolVar(&asJSON, "json", false, "emit JSON instead of a table")
 	}, a.args[1:]); err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return exitUsage
 	}
 	window, err := time.ParseDuration(since)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: -since: %q is not a duration (want e.g. 24h, 7d is 168h)\n", since)
+		a.errf("plaid-cache: -since: %q is not a duration (want e.g. 24h, 7d is 168h)\n", since)
 		return exitUsage
 	}
 	if window < 0 {
-		fmt.Fprintf(a.stderr, "plaid-cache: -since: %v is negative\n", window)
+		a.errf("plaid-cache: -since: %v is negative\n", window)
 		return exitUsage
 	}
 
@@ -49,7 +49,7 @@ func (a *app) runStats(ctx context.Context) int {
 		enc := json.NewEncoder(a.stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(resp); err != nil {
-			fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+			a.errf("plaid-cache: %v\n", err)
 			return exitError
 		}
 		return exitOK
@@ -67,14 +67,14 @@ func (a *app) runStats(ctx context.Context) int {
 func (a *app) collectStats(ctx context.Context, cfg *config.Config, window time.Duration) (daemon.StatsResponse, bool) {
 	params := &daemon.StatsParams{Since: window.String()}
 	if conn, err := dialExistingStats(cfg, buildVersion(), params); err == nil {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var resp daemon.StatsResponse
 		if err := conn.ReadJSONLine(&resp); err != nil {
-			fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+			a.errf("plaid-cache: %v\n", err)
 			return resp, false
 		}
 		if resp.Err != "" {
-			fmt.Fprintf(a.stderr, "plaid-cache: %s\n", resp.Err)
+			a.errf("plaid-cache: %s\n", resp.Err)
 			return resp, false
 		}
 		return resp, true
@@ -82,20 +82,20 @@ func (a *app) collectStats(ctx context.Context, cfg *config.Config, window time.
 
 	st, err := openStores(ctx, cfg)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return daemon.StatsResponse{}, false
 	}
 	defer st.close()
 
 	total, since, err := st.idx.TotalActivity()
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return daemon.StatsResponse{}, false
 	}
 	cutoff := time.Now().Add(-window)
 	buckets, err := st.idx.ActivitySince(cutoff)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		a.errf("plaid-cache: %v\n", err)
 		return daemon.StatsResponse{}, false
 	}
 	var windowed cache.MetricsSnapshot
@@ -113,16 +113,16 @@ func (a *app) collectStats(ctx context.Context, cfg *config.Config, window time.
 
 // printStats renders the report.
 func (a *app) printStats(cfg *config.Config, r daemon.StatsResponse, window time.Duration) {
-	fmt.Fprintf(a.stdout, "window      last %s, %s\n", window, hoursWithActivity(r.Buckets))
+	a.outf("window      last %s, %s\n", window, hoursWithActivity(r.Buckets))
 	a.printActivity(cfg, r.Window)
 
 	if r.Lifetime.Lookups() > 0 {
 		rate, _ := r.Lifetime.HitRate()
-		fmt.Fprintf(a.stdout, "lifetime    %.1f%% of %d lookups", 100*rate, r.Lifetime.Lookups())
+		a.outf("lifetime    %.1f%% of %d lookups", 100*rate, r.Lifetime.Lookups())
 		if r.LifetimeSince > 0 {
-			fmt.Fprintf(a.stdout, " since %s", time.Unix(0, r.LifetimeSince).UTC().Format("2006-01-02 15:04 UTC"))
+			a.outf(" since %s", time.Unix(0, r.LifetimeSince).UTC().Format("2006-01-02 15:04 UTC"))
 		}
-		fmt.Fprintln(a.stdout)
+		a.outf("\n")
 	}
 	if len(r.Buckets) == 0 {
 		return
@@ -132,7 +132,7 @@ func (a *app) printStats(cfg *config.Config, r daemon.StatsResponse, window time
 	// fortnight cannot tell you whether the cache is working now or worked well
 	// in the past, and a rate that is falling looks identical to a healthy one
 	// in a total.
-	fmt.Fprintf(a.stdout, "\n%-17s %9s %6s %8s %7s %8s %6s\n",
+	a.outf("\n%-17s %9s %6s %8s %7s %8s %6s\n",
 		"hour (UTC)", "lookups", "hit%", "local", "remote", "misses", "puts")
 	for _, b := range r.Buckets {
 		act := b.Activity
@@ -141,7 +141,7 @@ func (a *app) printStats(cfg *config.Config, r daemon.StatsResponse, window time
 		if ok {
 			pct = fmt.Sprintf("%5.1f%%", 100*rate)
 		}
-		fmt.Fprintf(a.stdout, "%-17s %9d %6s %8d %7d %8d %6d\n",
+		a.outf("%-17s %9d %6s %8d %7d %8d %6d\n",
 			time.Unix(b.Hour, 0).UTC().Format("2006-01-02 15:04"),
 			act.Lookups(), pct, act.GetLocalHit, act.GetRemoteHit, act.GetMiss, act.Put)
 	}
@@ -150,18 +150,18 @@ func (a *app) printStats(cfg *config.Config, r daemon.StatsResponse, window time
 // printActivity renders one counter set.
 func (a *app) printActivity(cfg *config.Config, act cache.MetricsSnapshot) {
 	if rate, ok := act.HitRate(); ok {
-		fmt.Fprintf(a.stdout, "hit rate    %.1f%% of %d lookups\n", 100*rate, act.Lookups())
+		a.outf("hit rate    %.1f%% of %d lookups\n", 100*rate, act.Lookups())
 	} else {
-		fmt.Fprintf(a.stdout, "hit rate    no lookups in this window\n")
+		a.outf("hit rate    no lookups in this window\n")
 	}
-	fmt.Fprintf(a.stdout, "hits        %d local, %d remote\n", act.GetLocalHit, act.GetRemoteHit)
-	fmt.Fprintf(a.stdout, "misses      %d\n", act.GetMiss)
-	fmt.Fprintf(a.stdout, "puts        %d\n", act.Put)
+	a.outf("hits        %d local, %d remote\n", act.GetLocalHit, act.GetRemoteHit)
+	a.outf("misses      %d\n", act.GetMiss)
+	a.outf("puts        %d\n", act.Put)
 	if act.GetRepair > 0 {
-		fmt.Fprintf(a.stdout, "repairs     %d (index entries dropped for missing bodies)\n", act.GetRepair)
+		a.outf("repairs     %d (index entries dropped for missing bodies)\n", act.GetRepair)
 	}
 	if cfg.RemoteEnabled() {
-		fmt.Fprintf(a.stdout, "uploads     %d ok, %d failed, %d dropped, %d skipped\n",
+		a.outf("uploads     %d ok, %d failed, %d dropped, %d skipped\n",
 			act.UploadOK, act.UploadFail, act.UploadDrop, act.UploadSkip)
 	}
 }

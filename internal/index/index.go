@@ -205,7 +205,7 @@ func (ix *Index) Put(a ids.ActionID, e Entry, diskBytes int64) error {
 	}
 
 	b := ix.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	var dActions, dObjects, dDisk, dZero int64
 
@@ -292,7 +292,7 @@ func (ix *Index) Touch(a ids.ActionID, now int64, granularity time.Duration) (bo
 	}
 
 	b := ix.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	if err := b.Delete(lruKey(e.LastUsedAt, a), nil); err != nil {
 		return false, fmt.Errorf("Touch: %w", err)
@@ -329,7 +329,7 @@ func (ix *Index) Delete(a ids.ActionID) (ids.OutputID, bool, error) {
 	}
 
 	b := ix.db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	if err := b.Delete(entryKey(a), nil); err != nil {
 		return ids.OutputID{}, false, fmt.Errorf("Delete: %w", err)

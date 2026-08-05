@@ -293,7 +293,7 @@ func TestS3GetObjectHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	if size != int64(len(want)) {
 		t.Fatalf("size = %d, want %d", size, len(want))
 	}

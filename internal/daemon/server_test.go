@@ -57,7 +57,7 @@ func runSessionOverPipes(t *testing.T, s *Server) (*wire.RequestEncoder, *wire.R
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		defer respW.Close()
+		defer func() { _ = respW.Close() }()
 		s.RunSession(context.Background(), reqR, respW)
 	}()
 	t.Cleanup(func() {
@@ -85,7 +85,7 @@ func TestListenCreatesOwnerOnlySocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	fi, err := os.Stat(cfg.SocketPath())
 	if err != nil {
@@ -129,7 +129,7 @@ func TestListenReplacesStaleSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen over stale socket: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// The replacement must actually be usable, not merely created.
 	c, err := net.Dial("unix", cfg.SocketPath())
@@ -150,11 +150,11 @@ func TestListenRefusesLiveSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer first.Close()
+	defer func() { _ = first.Close() }()
 
 	second, err := Listen(cfg)
 	if err == nil {
-		second.Close()
+		_ = second.Close()
 		t.Fatal("Listen = nil error on a live socket, want a refusal")
 	}
 	if !strings.Contains(err.Error(), "another daemon is already listening") {
@@ -557,7 +557,7 @@ func TestServeMissesDrainsPutBodyAndMissesEveryGet(t *testing.T) {
 	respR, respW := io.Pipe()
 	errc := make(chan error, 1)
 	go func() {
-		defer respW.Close()
+		defer func() { _ = respW.Close() }()
 		errc <- ServeMisses(reqR, respW)
 	}()
 	t.Cleanup(func() {

@@ -289,7 +289,7 @@ func TestPutStagedPublishesWithoutCopying(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("close staged body: %v", err)
 	}
-	defer os.Remove(f.Name())
+	defer func() { _ = os.Remove(f.Name()) }()
 
 	a := mkAction(10)
 	o := mkOutput(10)
@@ -333,7 +333,7 @@ func TestPutStagedUploadsToTheSharedTier(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("close staged body: %v", err)
 	}
-	defer os.Remove(f.Name())
+	defer func() { _ = os.Remove(f.Name()) }()
 
 	a := mkAction(11)
 	o := mkOutput(11)

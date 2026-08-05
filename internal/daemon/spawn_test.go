@@ -139,7 +139,7 @@ func stopSpawnedDaemon(t *testing.T, cfg *config.Config) {
 	if err != nil {
 		return // nothing listening
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := handshake(conn, daemonVersion(t, cfg), OpShutdown); err != nil {
 		t.Logf("cleanup shutdown: %v (daemon will exit on its idle timeout)", err)
 		return
@@ -155,7 +155,7 @@ func daemonVersion(t *testing.T, cfg *config.Config) string {
 	if err != nil {
 		return ""
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	// A deliberately wrong version elicits a refusal that names the daemon's.
 	resp, err := handshake(conn, "probe-mismatch", OpStatus)
 	if err != nil {
@@ -190,7 +190,7 @@ func TestConnectSpawnsADaemonWhenNoneIsRunning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connect: %v\ndaemon log:\n%s", err, spawnLog(cfg))
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// The session must be live, which means the spawned process really is a
 	// daemon and not just a socket that exists.
@@ -237,7 +237,7 @@ func TestConcurrentClientsConvergeOnOneDaemon(t *testing.T) {
 				errs[i] = err
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			var st StatusResponse
 			if err := conn.ReadJSONLine(&st); err != nil {
 				errs[i] = err
@@ -282,7 +282,7 @@ func TestConnectReplacesAMismatchedDaemon(t *testing.T) {
 	if err := first.ReadJSONLine(&oldStatus); err != nil {
 		t.Fatalf("status from the old daemon: %v", err)
 	}
-	first.Close()
+	_ = first.Close()
 	if oldStatus.PID == 0 {
 		t.Fatal("no PID from the old daemon")
 	}
@@ -294,7 +294,7 @@ func TestConnectReplacesAMismatchedDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connect after a version bump: %v\ndaemon log:\n%s", err, spawnLog(cfg))
 	}
-	defer second.Close()
+	defer func() { _ = second.Close() }()
 	var newStatus StatusResponse
 	if err := second.ReadJSONLine(&newStatus); err != nil {
 		t.Fatalf("status from the new daemon: %v", err)
@@ -325,12 +325,12 @@ func TestConnectGivesUpWhenReplacementNeverMatches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seeding Connect: %v\ndaemon log:\n%s", err, spawnLog(cfg))
 	}
-	seed.Close()
+	_ = seed.Close()
 
 	start := time.Now()
 	conn, err := Connect(ctx, cfg, "v-never", OpSession, nil)
 	if err == nil {
-		conn.Close()
+		_ = conn.Close()
 		t.Fatal("Connect succeeded against a permanently mismatched daemon")
 	}
 	if ctx.Err() != nil {
@@ -414,7 +414,7 @@ func TestConnectRetriesWhenTheFirstSpawnLosesTheIndexLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connect while the index lock was briefly held: %v\ndaemon log:\n%s", err, spawnLog(cfg))
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	var st StatusResponse
 	if err := conn.ReadJSONLine(&st); err != nil {

@@ -21,7 +21,7 @@ func read(t *testing.T, s *Store, k Kind, d Digest) ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	b, err := io.ReadAll(f)
 	if err != nil {
 		t.Fatalf("read stored body: %v", err)
