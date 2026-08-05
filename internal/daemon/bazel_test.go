@@ -8,11 +8,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/conductorone/plaid-cache/internal/bazel"
 )
 
 // startBazel runs ServeBazel on a loopback listener and returns its base URL.
@@ -113,6 +118,124 @@ func TestServeBazelSuppressesTheIdleExit(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("GET status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// getBazel performs one GET against the listener and returns the response and
+// its body.
+func getBazel(t *testing.T, url string) (*http.Response, []byte) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", url, err)
+	}
+	return resp, body
+}
+
+// TestServeBazelWithoutMonitoring pins the default. A daemon serving Bazel says
+// nothing about its host unless it was told to, and says nothing about the fact
+// that it could: the monitoring paths get the same answer as any other path this
+// listener does not serve.
+func TestServeBazelWithoutMonitoring(t *testing.T) {
+	cfg := newTestConfig(t)
+	s := newTestServer(t, cfg)
+	base := startBazel(t, s)
+
+	for _, p := range []string{bazel.StatusPath, bazel.MetricsPath} {
+		resp, _ := getBazel(t, base+p)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s = %d, want 404 from a daemon that was not asked to monitor", p, resp.StatusCode)
+		}
+	}
+}
+
+// TestServeBazelMonitoring pins the other side of the gate: with monitoring on,
+// both routes answer, the status route carries the same report the socket serves,
+// and the scrape agrees with it about the same daemon at the same moment.
+func TestServeBazelMonitoring(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.BazelMonitoring = true
+	s := newTestServer(t, cfg)
+	putCached(t, s, testActionID(41), testOutputID(41), []byte("an output this daemon holds"))
+	base := startBazel(t, s)
+
+	resp, body := getBazel(t, base+bazel.StatusPath)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, want 200", bazel.StatusPath, resp.StatusCode)
+	}
+	if got, want := resp.Header.Get("Content-Type"), "application/json"; got != want {
+		t.Fatalf("status Content-Type = %q, want %q", got, want)
+	}
+	var status StatusResponse
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatalf("status body %q: %v", body, err)
+	}
+	if status.PID != os.Getpid() {
+		t.Fatalf("status pid = %d, want this process (%d)", status.PID, os.Getpid())
+	}
+	if status.Version != testVersion {
+		t.Fatalf("status version = %q, want %q", status.Version, testVersion)
+	}
+	if status.Actions != 1 || status.Objects != 1 {
+		t.Fatalf("status = %d actions, %d objects, want the one entry just stored", status.Actions, status.Objects)
+	}
+	// Nothing about where the cache lives goes over the wire. The report is
+	// counters; a directory or a bucket name would be host detail this endpoint
+	// has no business handing out.
+	if strings.Contains(string(body), cfg.Dir) {
+		t.Fatalf("status body names the cache directory:\n%s", body)
+	}
+
+	resp, body = getBazel(t, base+bazel.MetricsPath)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, want 200", bazel.MetricsPath, resp.StatusCode)
+	}
+	if got, want := resp.Header.Get("Content-Type"), "text/plain; version=0.0.4; charset=utf-8"; got != want {
+		t.Fatalf("metrics Content-Type = %q, want %q", got, want)
+	}
+	e := parseExposition(t, string(body))
+	e.wantSample(t, "plaid_cache_actions", float64(status.Actions))
+	e.wantSample(t, "plaid_cache_objects", float64(status.Objects))
+	e.wantSample(t, "plaid_cache_disk_bytes", float64(status.DiskBytes))
+	e.wantSample(t, "plaid_cache_puts_total", float64(status.Lifetime.Put))
+}
+
+// TestServeBazelMonitoringLeavesTheCacheAlone pins that turning monitoring on
+// does not change what the cache routes do, since it is the same handler and
+// the same store answering both.
+func TestServeBazelMonitoringLeavesTheCacheAlone(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.BazelMonitoring = true
+	s := newTestServer(t, cfg)
+	base := startBazel(t, s)
+
+	body := []byte("an output uploaded while monitoring is on")
+	sum := sha256.Sum256(body)
+	url := base + "/cas/" + hex.EncodeToString(sum[:])
+
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200", resp.StatusCode)
+	}
+	resp, got := getBazel(t, url)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200", resp.StatusCode)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("body = %q, want %q", got, body)
 	}
 }
 

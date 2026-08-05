@@ -4,6 +4,8 @@
 package bazel
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -13,26 +15,111 @@ import (
 	"github.com/conductorone/plaid-cache/internal/cache"
 )
 
+// The monitoring routes: the two paths on this listener that are not part of
+// Bazel's protocol at all, but a report on the daemon serving it, for an
+// operator with no shell on the host.
+//
+// Each is a single segment, matched in full, which is what keeps them clear of
+// the discipline [parsePath] documents. Every cache route is a keyspace and a
+// digest — two segments — so a bare word can never be read as one: these cannot
+// become a third keyspace by accident, cannot be reached under a prefix, and
+// leave what /ac and /cas mean untouched. Being distinct fixed paths also means
+// a reverse proxy in front of this listener can route them to a different
+// audience than the cache itself.
+const (
+	StatusPath  = "/status"
+	MetricsPath = "/metrics"
+)
+
+// StatusFunc produces the report [StatusPath] serves, and MetricsFunc the
+// exposition [MetricsPath] serves. A nil one leaves that route unserved.
+//
+// Both hand back what the daemon has already decided to say rather than letting
+// this package assemble it, and for the same reason: the numbers belong to the
+// package that owns the counters, and a second assembly here would be a second
+// accounting path free to disagree with the first. StatusFunc returns the value
+// to encode rather than encoded bytes because the daemon's response type cannot
+// be named from here — the daemon package imports this one, so referring to it
+// would be an import cycle, and a second copy of it here is exactly the drift
+// that having one type avoids.
+//
+// An error from either means the daemon could not answer, and is reported to the
+// client as one. See [Handler.serveMonitoring] for why that differs from the
+// cache routes.
+type (
+	StatusFunc  func(ctx context.Context) (any, error)
+	MetricsFunc func(ctx context.Context) ([]byte, error)
+)
+
+// metricsContentType is the Prometheus text exposition format's own media type.
+// An OpenTelemetry Collector's prometheus receiver reads the same bytes.
+const metricsContentType = "text/plain; version=0.0.4; charset=utf-8"
+
 // Handler serves Bazel's HTTP/1.1 remote-cache protocol over a [Store].
 //
 // The protocol is four routes — GET and PUT on /ac/<hex-digest> and
 // /cas/<hex-digest> — with every body opaque bytes. This is the whole of the
 // transport: what the routes mean is [Store]'s business.
 type Handler struct {
-	store *Store
-	logf  cache.Logf
+	store   *Store
+	logf    cache.Logf
+	status  StatusFunc
+	metrics MetricsFunc
+}
+
+// HandlerParams carries what a Handler serves.
+type HandlerParams struct {
+	Store *Store
+	Logf  cache.Logf
+
+	// Status and Metrics serve the monitoring routes. Nil, the zero value,
+	// leaves that route unrouted: the caller decides whether this listener
+	// discloses anything about its host, and a listener that has not been told
+	// to is indistinguishable from one built before the routes existed.
+	Status  StatusFunc
+	Metrics MetricsFunc
 }
 
 // NewHandler constructs a Handler over an existing Store.
-func NewHandler(s *Store, logf cache.Logf) *Handler {
+func NewHandler(p HandlerParams) *Handler {
+	logf := p.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Handler{store: s, logf: logf}
+	return &Handler{store: p.Store, logf: logf, status: p.Status, metrics: p.Metrics}
 }
 
 // ServeHTTP routes one request.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// The monitoring routes come first because they are not cache routes, and
+	// each only when something is on offer: with nothing, the path falls through
+	// to the same 404 any other unserved path gets, which says nothing about
+	// whether this build of the daemon has the route at all.
+	switch r.URL.Path {
+	case StatusPath:
+		if h.status != nil {
+			h.serveMonitoring(w, r, "status", "application/json", func(ctx context.Context) ([]byte, error) {
+				v, err := h.status(ctx)
+				if err != nil {
+					return nil, err
+				}
+				b, err := json.Marshal(v)
+				if err != nil {
+					return nil, err
+				}
+				// A trailing newline so the document reads sanely from a
+				// terminal, which is where a good deal of it will be read.
+				return append(b, '\n'), nil
+			})
+			return
+		}
+	case MetricsPath:
+		if h.metrics != nil {
+			h.serveMonitoring(w, r, "metrics", metricsContentType, h.metrics)
+			return
+		}
+	}
+
 	k, d, ok := parsePath(r.URL.Path)
 	if !ok {
 		// Not a route this cache serves. A GET of one is also the answer Bazel
@@ -100,6 +187,46 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request, k Kind, d Digest) 
 	}
 	// Bazel accepts 200, 201, 202 and 204 for an upload.
 	w.WriteHeader(http.StatusOK)
+}
+
+// serveMonitoring answers one request on a monitoring route.
+//
+// These report their failures honestly, with real status codes, and that is a
+// deliberate break from the two routes above. A cache route lies about its
+// troubles because Bazel reads any non-200 other than a miss as a build error,
+// so an honest 500 there turns a broken cache into a broken build. Nothing reads
+// these two: a scraper or an operator asking how the daemon is doing wants the
+// truth, and answering "fine" with an empty report would hide exactly the
+// failure they are asking about. The two disciplines are opposite because their
+// readers are, and neither should be extended to the other's routes.
+func (h *Handler) serveMonitoring(w http.ResponseWriter, r *http.Request, what, contentType string, body func(context.Context) ([]byte, error)) {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+	default:
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "plaid-cache: method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	b, err := body(r.Context())
+	if err != nil {
+		h.logf("bazel %s: %v", what, err)
+		http.Error(w, "plaid-cache: "+what+" is unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+	// A report is true for the instant it was taken and no longer, so an
+	// intermediary must not be allowed to serve a stale one as current.
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	if _, err := w.Write(b); err != nil {
+		h.logf("bazel send %s: %v", what, err)
+	}
 }
 
 // parsePath splits a request path into the keyspace and digest it names.

@@ -120,6 +120,12 @@ type HelloResponse struct {
 }
 
 // StatusResponse reports the daemon's view of the cache.
+//
+// One type serves three readers: the local socket's status report, the same
+// report read from another host over the monitoring route, and the metrics
+// exposition rendered from it. That is deliberate. A second shape for any of
+// them would be a second place to assemble the same numbers, free to disagree
+// with the first about what the cache holds.
 type StatusResponse struct {
 	// Lifetime is the persisted activity across every process that has used this
 	// cache, and LifetimeSince when the first of it was recorded. Metrics below
@@ -127,6 +133,17 @@ type StatusResponse struct {
 	// this process happened to be up for.
 	Lifetime      cache.MetricsSnapshot `json:"lifetime"`
 	LifetimeSince int64                 `json:"lifetime_since"`
+
+	// Version is the build answering. The socket learns it in the handshake and
+	// refuses a mismatch; a reader that arrived over HTTP has no such exchange,
+	// and a report whose provenance is unstated is a report about nothing in
+	// particular.
+	Version string `json:"version"`
+
+	// RemoteEnabled says whether a shared tier is configured, without naming it.
+	// Whether uploads are meaningful is what a reader needs; which bucket they
+	// go to is the operator's business and not something this report discloses.
+	RemoteEnabled bool `json:"remote_enabled"`
 
 	PID       int                   `json:"pid"`
 	Actions   int64                 `json:"actions"`
@@ -139,6 +156,19 @@ type StatusResponse struct {
 	NewestAge string                `json:"newest_age,omitempty"`
 	Metrics   cache.MetricsSnapshot `json:"metrics"`
 	Err       string                `json:"err,omitempty"`
+
+	// The durations above again, in seconds.
+	//
+	// Each pair is two encodings of one measurement taken at one moment, not two
+	// measurements: the strings are Go durations for a person reading a report,
+	// and these are numbers for a scrape, which has no business parsing "168h0m0s"
+	// and no use for milliseconds. HaveAgeSpan distinguishes an empty cache, which
+	// has no age span at all, from one whose entries were all touched this second.
+	TTLSeconds       float64 `json:"ttl_seconds"`
+	UptimeSeconds    float64 `json:"uptime_seconds"`
+	HaveAgeSpan      bool    `json:"have_age_span"`
+	OldestAgeSeconds float64 `json:"oldest_age_seconds"`
+	NewestAgeSeconds float64 `json:"newest_age_seconds"`
 }
 
 // GCResponse reports the outcome of a forced eviction pass.

@@ -142,6 +142,18 @@ cache already holds, so an action that re-runs stops re-uploading outputs the
 cache has. Both may be served at once, and a build that uses either reads what
 the other stored.
 
+-bazel-monitoring adds two routes to the HTTP address — /status and /metrics —
+so a daemon serving a room full of builders can be read without a shell on its
+host. They are off unless asked for, because they describe the host rather than
+the cache's contents:
+  plaid-cache serve -bazel-addr localhost:9095 -bazel-monitoring
+  plaid-cache status -from localhost:9095
+  curl localhost:9095/metrics
+
+/metrics is Prometheus text exposition, which an OpenTelemetry Collector
+scrapes as it stands. status -from prints the same report as a local status,
+minus the lines that would describe this machine rather than that one.
+
 Configuration is read from the environment; see the README for the full list.
 `)
 }

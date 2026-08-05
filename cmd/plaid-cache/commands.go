@@ -11,11 +11,15 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/conductorone/plaid-cache/internal/adopt"
+	"github.com/conductorone/plaid-cache/internal/bazel"
 	"github.com/conductorone/plaid-cache/internal/blob"
 	"github.com/conductorone/plaid-cache/internal/cache"
 	"github.com/conductorone/plaid-cache/internal/config"
@@ -100,12 +104,15 @@ func openStores(ctx context.Context, cfg *config.Config) (*stores, error) {
 func (a *app) runServe(ctx context.Context) int {
 	var limits limitFlags
 	var bazelAddr, bazelGRPCAddr string
+	var bazelMonitoring bool
 	register := func(fs *flag.FlagSet) {
 		limits.register(fs)
 		fs.StringVar(&bazelAddr, "bazel-addr", "",
 			"also serve Bazel's HTTP remote-cache protocol on this address, e.g. localhost:9095 (default: PLAID_GOCACHE_BAZEL_ADDR)")
 		fs.StringVar(&bazelGRPCAddr, "bazel-grpc-addr", "",
 			"also serve Bazel's gRPC remote-cache protocol on this address, e.g. localhost:9096 (default: PLAID_GOCACHE_BAZEL_GRPC_ADDR)")
+		fs.BoolVar(&bazelMonitoring, "bazel-monitoring", false,
+			"also serve "+bazel.StatusPath+" and "+bazel.MetricsPath+" on the Bazel HTTP address (default: PLAID_GOCACHE_BAZEL_MONITORING)")
 	}
 	if _, err := a.parseFlags("serve", register, a.args[1:]); err != nil {
 		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
@@ -124,6 +131,12 @@ func (a *app) runServe(ctx context.Context) int {
 	}
 	if bazelGRPCAddr != "" {
 		cfg.BazelGRPCAddr = bazelGRPCAddr
+	}
+	// The flag can turn monitoring on and not off, matching the addresses above:
+	// a flag given is a decision, a flag omitted is silence, and silence must
+	// leave the environment's answer standing.
+	if bazelMonitoring {
+		cfg.BazelMonitoring = true
 	}
 	logf := a.logger(cfg, config.LogInfo)
 
@@ -176,6 +189,13 @@ func (a *app) runServe(ctx context.Context) int {
 			return exitError
 		}
 		logf("serving the Bazel HTTP cache on http://%s", bazelLn.Addr())
+		if cfg.BazelMonitoring {
+			// Worth a line of its own: this is the one setting that makes the
+			// listener say something about its host rather than only about the
+			// blobs it was asked for.
+			logf("serving monitoring on http://%s%s and http://%s%s",
+				bazelLn.Addr(), bazel.StatusPath, bazelLn.Addr(), bazel.MetricsPath)
+		}
 		bazelWG.Add(1)
 		go func() {
 			defer bazelWG.Done()
@@ -303,6 +323,26 @@ func (a *app) serveMisses() int {
 
 // runStatus reports the cache's contents.
 func (a *app) runStatus(ctx context.Context) int {
+	var from string
+	if _, err := a.parseFlags("status", func(fs *flag.FlagSet) {
+		// Not -remote. In this tool "remote" already means the shared S3 tier,
+		// which every status report has a line about; a flag by that name would
+		// read as asking about the bucket rather than about another daemon. What
+		// this names is where the report comes from.
+		fs.StringVar(&from, "from", "",
+			"read the report from another daemon's monitoring endpoint, e.g. cache-host:9095 (default: this machine's own cache)")
+	}, a.args[1:]); err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		return exitUsage
+	}
+	if from != "" {
+		// Deliberately before loadConfig: nothing in this machine's environment
+		// describes the daemon being asked, so reading it could only mislead —
+		// and a broken local configuration is no reason to be unable to ask a
+		// remote host how it is doing.
+		return a.runStatusFrom(ctx, from)
+	}
+
 	cfg, ok := a.loadConfig()
 	if !ok {
 		return exitError
@@ -342,7 +382,115 @@ func (a *app) runStatus(ctx context.Context) int {
 	return exitOK
 }
 
-// printStatus renders the status report.
+// statusFetchTimeout bounds a read from another daemon. Assembling the report
+// is a handful of index lookups, so a host that has not answered in this long is
+// not busy, it is unreachable — and a command a person is waiting on should say
+// so rather than hang.
+const statusFetchTimeout = 15 * time.Second
+
+// maxStatusBody bounds what is read from an endpoint before giving up on it.
+//
+// A real report is a couple of kilobytes. The bound is what stops a wrong
+// address — a log shipper, a video stream, something that answers every path
+// with a redirect loop's worth of HTML — from being decoded into memory in the
+// hope that JSON turns up later.
+const maxStatusBody = 1 << 20
+
+// runStatusFrom reports on a daemon reached over its monitoring endpoint,
+// rather than on the cache belonging to this machine.
+//
+// Every failure here exits non-zero and says which endpoint failed. This command
+// is the one an operator reaches for when they suspect a cache is unwell, so a
+// report that could not be obtained must never be mistakable for a cache with
+// nothing in it.
+func (a *app) runStatusFrom(ctx context.Context, addr string) int {
+	endpoint, err := statusEndpoint(addr)
+	if err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		return exitUsage
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %v\n", err)
+		return exitError
+	}
+	resp, err := (&http.Client{Timeout: statusFetchTimeout}).Do(req)
+	if err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %s: %v\n", endpoint, err)
+		return exitError
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(a.stderr, "plaid-cache: %s: %s\n", endpoint, resp.Status)
+		if resp.StatusCode == http.StatusNotFound {
+			// The likeliest cause by some distance, and the one whose fix is not
+			// guessable: a daemon serving Bazel with monitoring left off answers
+			// this path exactly as it answers any path it does not serve.
+			fmt.Fprintf(a.stderr, "plaid-cache: that daemon may be serving Bazel without -bazel-monitoring\n")
+		}
+		return exitError
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxStatusBody))
+	if err != nil {
+		fmt.Fprintf(a.stderr, "plaid-cache: %s: %v\n", endpoint, err)
+		return exitError
+	}
+	var r daemon.StatusResponse
+	if err := json.Unmarshal(body, &r); err != nil {
+		// Truncated JSON and a proxy's error page arrive here alike, and neither
+		// is worth quoting back in full at somebody's terminal.
+		fmt.Fprintf(a.stderr, "plaid-cache: %s: not a status report: %v\n", endpoint, err)
+		return exitError
+	}
+	if r.PID == 0 {
+		// Well-formed JSON from something that is not a daemon. Every real report
+		// names the process that produced it, and printing a report of zeros
+		// would describe an empty cache rather than a wrong address.
+		fmt.Fprintf(a.stderr, "plaid-cache: %s: not a status report: no daemon in it\n", endpoint)
+		return exitError
+	}
+	if r.Err != "" {
+		fmt.Fprintf(a.stderr, "plaid-cache: %s: %s\n", endpoint, r.Err)
+		return exitError
+	}
+	a.printStatusFrom(endpoint, &r)
+	return exitOK
+}
+
+// statusEndpoint turns what a person typed into the URL of a status route.
+//
+// A bare host and port is the common case and is what the -bazel-addr flag on
+// the other end took, so it is accepted as written and given the http scheme.
+// The path is fixed rather than taken from the argument: this route lives at one
+// place, and accepting a path would invite the same prefix confusion the cache
+// routes refuse — so the one path a caller may write is the one they would get
+// anyway.
+func statusEndpoint(addr string) (string, error) {
+	s := strings.TrimSpace(addr)
+	if !strings.Contains(s, "://") {
+		s = "http://" + s
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("-from: %q is not an address (want e.g. cache-host:9095)", addr)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("-from: %q: got scheme %q, want one of: http, https", addr, u.Scheme)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("-from: %q names no host (want e.g. cache-host:9095)", addr)
+	}
+	if p := strings.TrimSuffix(u.Path, "/"); p != "" && p != bazel.StatusPath {
+		return "", fmt.Errorf("-from: %q: the endpoint is %s, and nothing is served under a prefix", addr, bazel.StatusPath)
+	}
+	return (&url.URL{Scheme: u.Scheme, User: u.User, Host: u.Host, Path: bazel.StatusPath}).String(), nil
+}
+
+// printStatus renders the status report for the cache this machine is
+// configured for.
 //
 // The eviction limits come from the daemon when one is running, not from this
 // process's environment. The daemon read its configuration when it started,
@@ -357,35 +505,14 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 	if cfg.ConfigFile != "" {
 		fmt.Fprintf(a.stdout, "config      %s\n", cfg.ConfigFile)
 	}
-
-	// Report the derived figures, not just the raw counts. Actions per object is
-	// the dedup ratio the output refcounting exists to produce, and the share of
-	// the budget in use is what says whether eviction is about to start biting.
-	if objects > 0 {
-		fmt.Fprintf(a.stdout, "entries     %d actions, %d objects (%.2fx dedup, %s avg)\n",
-			actions, objects, float64(actions)/float64(objects),
-			config.FormatBytes(diskBytes/objects))
-	} else {
-		fmt.Fprintf(a.stdout, "entries     %d actions, %d objects\n", actions, objects)
-	}
-
-	if maxBytes > 0 {
-		pct := 100 * float64(diskBytes) / float64(maxBytes)
-		headroom := maxBytes - diskBytes
-		if headroom < 0 {
-			headroom = 0
-		}
-		fmt.Fprintf(a.stdout, "size        %s of %s (%.1f%%, %s free)\n",
-			config.FormatBytes(diskBytes), config.FormatBytes(maxBytes), pct,
-			config.FormatBytes(headroom))
-	} else {
-		fmt.Fprintf(a.stdout, "size        %s (no limit)\n", config.FormatBytes(diskBytes))
-	}
+	a.printEntries(actions, objects, diskBytes)
+	a.printSize(diskBytes, maxBytes)
 
 	// What the budget thinks is not what the disk has. Compression, other users
 	// of the volume, and snapshots all move the two apart, and the number an
 	// operator needs to judge whether a ceiling is set sensibly is the second
-	// one: a cache can report itself full with most of the volume idle.
+	// one: a cache can report itself full with most of the volume idle. It is
+	// this machine's volume, so it belongs to this report and to no other.
 	if total, avail, err := blob.VolumeUsage(cfg.Dir); err == nil && total > 0 {
 		used := total - avail
 		fmt.Fprintf(a.stdout, "volume      %s used of %s (%.1f%%, %s free)\n",
@@ -393,16 +520,9 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 			100*float64(used)/float64(total), config.FormatBytes(int64(avail)))
 	}
 
-	if ttl != "" && ttl != "0s" {
-		fmt.Fprintf(a.stdout, "ttl         %s\n", ttl)
-	} else {
-		fmt.Fprintf(a.stdout, "ttl         none\n")
-	}
-
-	// The age span says whether the TTL is doing anything: if the oldest entry
-	// is younger than the TTL, only the size ceiling is evicting.
+	a.printTTL(ttl)
 	if d != nil && d.OldestAge != "" {
-		fmt.Fprintf(a.stdout, "age         oldest %s, newest %s\n", d.OldestAge, d.NewestAge)
+		a.printAge(d.OldestAge, d.NewestAge)
 	}
 	if cfg.RemoteEnabled() {
 		fmt.Fprintf(a.stdout, "remote      s3://%s/%s\n", cfg.S3Bucket, cfg.S3Prefix)
@@ -415,16 +535,102 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 		// history worth reading — and this is the state anyone asking about a
 		// quiet machine finds it in.
 		fmt.Fprintf(a.stdout, "daemon      not running\n")
-		a.printLifetime(cfg, life, lifeSince)
+		a.printLifetime(life, lifeSince)
 		return
 	}
 	fmt.Fprintf(a.stdout, "daemon      pid %d, up %s\n", d.PID, d.Uptime)
-	m := d.Metrics
+	a.printCounters(d.Metrics, cfg.RemoteEnabled())
+	a.printLifetime(life, lifeSince)
+}
 
-	// A hit rate is the one number worth reading first, and it is the one the
-	// caller would otherwise have to work out from three separate counters.
-	// Repairs are called out because a nonzero count means bodies went missing
-	// under the index, which is worth noticing rather than burying.
+// printStatusFrom renders a report read from another daemon over its monitoring
+// endpoint.
+//
+// Everything here comes off the wire, and the lines the local report opens with
+// are absent rather than filled in from this machine: the directory, the
+// configuration file, and the volume describe wherever this command happens to
+// be run, which has nothing to do with the host being asked. Attributing them to
+// it would be a lie with a plausible shape, which is the worst kind to print. The
+// endpoint leads the report so that there is no reading of it that leaves which
+// cache it describes in doubt.
+func (a *app) printStatusFrom(endpoint string, r *daemon.StatusResponse) {
+	fmt.Fprintf(a.stdout, "endpoint    %s\n", endpoint)
+	if r.Version != "" {
+		fmt.Fprintf(a.stdout, "version     %s\n", r.Version)
+	}
+	a.printEntries(r.Actions, r.Objects, r.DiskBytes)
+	a.printSize(r.DiskBytes, r.MaxBytes)
+	a.printTTL(r.TTL)
+	if r.OldestAge != "" {
+		a.printAge(r.OldestAge, r.NewestAge)
+	}
+	// The bucket is the operator's business and the endpoint does not disclose
+	// it. Whether uploads mean anything is the part a reader needs, and that is
+	// what this says.
+	if r.RemoteEnabled {
+		fmt.Fprintf(a.stdout, "remote      enabled\n")
+	} else {
+		fmt.Fprintf(a.stdout, "remote      disabled\n")
+	}
+	fmt.Fprintf(a.stdout, "daemon      pid %d, up %s\n", r.PID, r.Uptime)
+	a.printCounters(r.Metrics, r.RemoteEnabled)
+	a.printLifetime(r.Lifetime, r.LifetimeSince)
+}
+
+// printEntries reports what the cache holds.
+//
+// The derived figures are the point, not just the raw counts: actions per object
+// is the dedup ratio that refcounting outputs exists to produce.
+func (a *app) printEntries(actions, objects, diskBytes int64) {
+	if objects > 0 {
+		fmt.Fprintf(a.stdout, "entries     %d actions, %d objects (%.2fx dedup, %s avg)\n",
+			actions, objects, float64(actions)/float64(objects),
+			config.FormatBytes(diskBytes/objects))
+		return
+	}
+	fmt.Fprintf(a.stdout, "entries     %d actions, %d objects\n", actions, objects)
+}
+
+// printSize reports the bytes held against the ceiling, since the share of the
+// budget in use is what says whether eviction is about to start biting.
+func (a *app) printSize(diskBytes, maxBytes int64) {
+	if maxBytes <= 0 {
+		fmt.Fprintf(a.stdout, "size        %s (no limit)\n", config.FormatBytes(diskBytes))
+		return
+	}
+	headroom := maxBytes - diskBytes
+	if headroom < 0 {
+		headroom = 0
+	}
+	fmt.Fprintf(a.stdout, "size        %s of %s (%.1f%%, %s free)\n",
+		config.FormatBytes(diskBytes), config.FormatBytes(maxBytes),
+		100*float64(diskBytes)/float64(maxBytes), config.FormatBytes(headroom))
+}
+
+// printTTL reports the age limit, spelling out a disabled one rather than
+// printing a zero duration nobody reads as "off".
+func (a *app) printTTL(ttl string) {
+	if ttl != "" && ttl != "0s" {
+		fmt.Fprintf(a.stdout, "ttl         %s\n", ttl)
+		return
+	}
+	fmt.Fprintf(a.stdout, "ttl         none\n")
+}
+
+// printAge reports the age span, which says whether the TTL is doing anything:
+// if the oldest entry is younger than the TTL, only the size ceiling is
+// evicting.
+func (a *app) printAge(oldest, newest string) {
+	fmt.Fprintf(a.stdout, "age         oldest %s, newest %s\n", oldest, newest)
+}
+
+// printCounters reports one daemon's own tally.
+//
+// A hit rate is the one number worth reading first, and it is the one the caller
+// would otherwise have to work out from three separate counters. Repairs are
+// called out because a nonzero count means bodies went missing under the index,
+// which is worth noticing rather than burying.
+func (a *app) printCounters(m cache.MetricsSnapshot, remoteEnabled bool) {
 	lookups := m.GetLocalHit + m.GetRemoteHit + m.GetMiss
 	if lookups > 0 {
 		fmt.Fprintf(a.stdout, "hit rate    %.1f%% of %d lookups\n",
@@ -439,11 +645,10 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 	if m.Compactions > 0 {
 		fmt.Fprintf(a.stdout, "compactions %d (index reclaimed after pruning)\n", m.Compactions)
 	}
-	if cfg.RemoteEnabled() {
+	if remoteEnabled {
 		fmt.Fprintf(a.stdout, "uploads     %d ok, %d failed, %d dropped, %d skipped\n",
 			m.UploadOK, m.UploadFail, m.UploadDrop, m.UploadSkip)
 	}
-	a.printLifetime(cfg, life, lifeSince)
 }
 
 // printLifetime reports the persisted counters.
@@ -453,7 +658,7 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 // has this process seen", which for a cache that has been quiet for half an hour
 // is nothing — and reading that as the cache's hit rate is exactly the mistake
 // this line exists to prevent.
-func (a *app) printLifetime(cfg *config.Config, life cache.MetricsSnapshot, since int64) {
+func (a *app) printLifetime(life cache.MetricsSnapshot, since int64) {
 	if life.Lookups() == 0 {
 		return
 	}
