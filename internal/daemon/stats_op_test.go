@@ -173,4 +173,13 @@ func TestStatusReportsLifetimeAlongsideTheSession(t *testing.T) {
 	if st.LifetimeSince == 0 {
 		t.Fatal("no start time for the lifetime figures")
 	}
+	// The upload backlog travels with the report rather than only with the
+	// counters, because it is the number that says saturation is coming rather
+	// than that it has already cost something.
+	if st.UploadQueueCapacity <= 0 {
+		t.Fatalf("upload queue capacity = %d, want the daemon's own bound", st.UploadQueueCapacity)
+	}
+	if st.UploadQueueDepth != 0 {
+		t.Fatalf("upload queue depth = %d on an idle daemon, want 0", st.UploadQueueDepth)
+	}
 }

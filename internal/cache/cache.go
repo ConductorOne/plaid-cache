@@ -123,7 +123,7 @@ func New(p Params) *Cache {
 		rem:   rem,
 		logf:  logf,
 	}
-	c.uploads = newUploader(p.Config.UploadConcurrency, logf, &c.metrics)
+	c.uploads = newUploader(p.Config.UploadConcurrency, p.Config.UploadQueueDepth, p.Config.UploadBlockTimeout, logf, &c.metrics)
 	return c
 }
 
@@ -346,6 +346,15 @@ func (c *Cache) record(a ids.ActionID, o ids.OutputID, path string, size, diskBy
 // Metrics returns a snapshot of the counters.
 func (c *Cache) Metrics() MetricsSnapshot { return c.metrics.Snapshot() }
 
+// UploadQueue reports how many uploads are waiting and how many may wait.
+//
+// It is not part of Metrics because it is not the same kind of number. Those
+// are counters that only rise and are persisted across processes; this is a
+// level that rises and falls and means nothing once the process holding the
+// queue is gone. Its use is to be watched while it is still climbing — the drop
+// counter can only be read after the entries are already lost.
+func (c *Cache) UploadQueue() (depth, capacity int) { return c.uploads.queue() }
+
 // Evict runs one eviction pass, removing orphaned bodies as the index
 // releases them.
 func (c *Cache) Evict(ctx context.Context) (index.EvictResult, error) {
@@ -473,12 +482,35 @@ type uploadJob struct {
 // of concurrent connections; an unbounded queue would let it accumulate
 // unbounded memory and delay process exit. When the queue is full the job is
 // dropped and counted, which is the correct trade for a best-effort tier.
+//
+// What that trade costs is paid somewhere else and much later: the entry is
+// simply not in the shared tier, so a reader on another machine takes a clean
+// miss and redoes the work, with nothing at the moment of the loss to connect
+// the two. Hence queue and depth below, which say how close to full the queue is
+// before any of it is lost, and the drop log, which says that it happened.
 type uploader struct {
 	jobs    chan uploadJob
 	wg      sync.WaitGroup
 	logf    Logf
 	metrics *Metrics
 	once    sync.Once
+
+	// blockFor is how long submit waits for room before dropping. Zero, the
+	// default, never waits.
+	blockFor time.Duration
+
+	// quit is closed at the start of close, before the lock a waiting submit
+	// holds is taken, so a bounded wait cannot hold up exit for its whole
+	// timeout. It is separate from jobs because closing jobs is what a waiting
+	// send must not observe.
+	quit chan struct{}
+
+	// droppedSinceLog counts drops not yet reported, and loggedAt is when the
+	// last report went out, as Unix nanoseconds. Together they rate-limit the
+	// warning: a saturation episode is thousands of drops a second, and a line
+	// each would bury the log it is trying to make legible.
+	droppedSinceLog atomic.Int64
+	loggedAt        atomic.Int64
 
 	// mu guards jobs against a send racing close. A send on a closed channel
 	// panics even inside a select with a default, because the send case is
@@ -489,18 +521,32 @@ type uploader struct {
 	closed bool
 }
 
-// queueDepthPerWorker sizes the backlog relative to the pool.
+// queueDepthPerWorker sizes the backlog relative to the pool when nothing else
+// says otherwise. Configured by PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH.
 const queueDepthPerWorker = 64
 
+// dropLogInterval is the shortest gap between two drop warnings. Each one
+// carries the count since the last, so a longer gap loses no information about
+// how much was lost, only about exactly when.
+const dropLogInterval = 30 * time.Second
+
 // newUploader starts the worker pool.
-func newUploader(workers int, logf Logf, m *Metrics) *uploader {
+//
+// depth is per worker and blockFor may be zero, which is the default and means
+// a full queue drops immediately rather than waiting.
+func newUploader(workers, depth int, blockFor time.Duration, logf Logf, m *Metrics) *uploader {
 	if workers < 1 {
 		workers = 1
 	}
+	if depth < 1 {
+		depth = queueDepthPerWorker
+	}
 	u := &uploader{
-		jobs:    make(chan uploadJob, workers*queueDepthPerWorker),
-		logf:    logf,
-		metrics: m,
+		jobs:     make(chan uploadJob, workers*depth),
+		logf:     logf,
+		metrics:  m,
+		blockFor: blockFor,
+		quit:     make(chan struct{}),
 	}
 	u.wg.Add(workers)
 	for range workers {
@@ -509,21 +555,81 @@ func newUploader(workers int, logf Logf, m *Metrics) *uploader {
 	return u
 }
 
+// queue reports how much of the backlog is in use, which is the number that
+// moves before anything is lost rather than after.
+//
+// Both halves are needed to read it: a depth of 400 is idle on one pool and
+// about to start dropping on another, and the capacity is derived from the
+// worker count, so a reader has no way to work it out for themselves.
+func (u *uploader) queue() (depth, capacity int) {
+	return len(u.jobs), cap(u.jobs)
+}
+
 // submit queues a job, dropping it if the queue is full rather than blocking
 // the build that produced it.
+//
+// A configured blockFor buys a bounded wait for room first. It is off by
+// default: a put that waits is a build that waits, and the whole promise of this
+// tier is that it cannot do that.
 func (u *uploader) submit(j uploadJob) {
 	u.mu.RLock()
 	defer u.mu.RUnlock()
 	if u.closed {
 		// Nothing will drain it, so count it as dropped rather than panicking.
+		// Counted but not logged: a submission arriving after shutdown is not
+		// the queue overflowing, and saying so would send a reader looking for
+		// load that was never there.
 		u.metrics.UploadDrop.Add(1)
 		return
 	}
 	select {
 	case u.jobs <- j:
+		return
 	default:
-		u.metrics.UploadDrop.Add(1)
 	}
+	if u.blockFor <= 0 {
+		u.dropped()
+		return
+	}
+	t := time.NewTimer(u.blockFor)
+	defer t.Stop()
+	select {
+	case u.jobs <- j:
+	case <-t.C:
+		u.dropped()
+	case <-u.quit:
+		// close is waiting on the read lock this send holds. What is already
+		// queued will still be drained; one more job is not worth delaying the
+		// process's exit by the rest of a timeout an operator chose for load,
+		// not for shutdown.
+		u.dropped()
+	}
+}
+
+// dropped counts a lost upload and says so in the log, at most once per
+// dropLogInterval.
+//
+// The count since the previous report is the point of the line. A rate is what
+// distinguishes a queue that overflowed on one burst from one that has been
+// shedding the shared tier's contents for an hour, and the counter alone cannot
+// tell those apart without someone already watching it.
+func (u *uploader) dropped() {
+	u.metrics.UploadDrop.Add(1)
+	n := u.droppedSinceLog.Add(1)
+
+	now := time.Now().UnixNano()
+	last := u.loggedAt.Load()
+	// The first drop reports immediately: last is zero, which is further in the
+	// past than any interval. Losing the CAS means another goroutine is
+	// reporting this instant, and its line will carry this drop too.
+	if now-last < int64(dropLogInterval) || !u.loggedAt.CompareAndSwap(last, now) {
+		return
+	}
+	u.droppedSinceLog.Add(-n)
+	_, capacity := u.queue()
+	u.logf("upload queue full: dropped %d uploads since the last report; those entries are missing from the "+
+		"shared tier (the queue holds %d — raise PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH or PLAID_GOCACHE_UPLOAD_CONCURRENCY)",
+		n, capacity)
 }
 
 // uploadTimeout bounds a single transfer so one stuck connection cannot hold
@@ -574,6 +680,10 @@ func (u *uploader) run(j uploadJob) {
 // close stops accepting work and waits for the pool to drain.
 func (u *uploader) close() {
 	u.once.Do(func() {
+		// Released before the lock is taken, since a submit part-way through a
+		// bounded wait holds that lock and would otherwise keep exit waiting for
+		// the remainder of its timeout.
+		close(u.quit)
 		u.mu.Lock()
 		u.closed = true
 		close(u.jobs)

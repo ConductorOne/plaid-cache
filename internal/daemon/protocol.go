@@ -157,6 +157,16 @@ type StatusResponse struct {
 	Metrics   cache.MetricsSnapshot `json:"metrics"`
 	Err       string                `json:"err,omitempty"`
 
+	// UploadQueueDepth is how many uploads to the shared tier are waiting on
+	// this daemon's pool right now, and UploadQueueCapacity how many may.
+	//
+	// They are here rather than in Metrics because they are levels rather than
+	// counters, and because they are what says saturation is coming: the drop
+	// counter beside them only moves once entries have already been lost, and
+	// says nothing about a queue that is one burst away from losing them.
+	UploadQueueDepth    int `json:"upload_queue_depth"`
+	UploadQueueCapacity int `json:"upload_queue_capacity"`
+
 	// The durations above again, in seconds.
 	//
 	// Each pair is two encodings of one measurement taken at one moment, not two

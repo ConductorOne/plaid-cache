@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -197,6 +198,41 @@ type testCache struct {
 	blobs *blob.Store
 	rem   *fakeRemote
 	cache *Cache
+	logs  *logRecorder
+}
+
+// logRecorder captures what the cache logged, for the diagnostics that exist to
+// be read rather than counted. Lines still reach t.Logf, which is the other
+// reason they are there.
+//
+// mu guards lines because the uploader logs from its worker pool and from
+// whichever goroutine submitted a job it had to drop.
+type logRecorder struct {
+	t     *testing.T
+	mu    sync.Mutex
+	lines []string
+}
+
+// logf records one line and forwards it to the test log.
+func (r *logRecorder) logf(format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	r.mu.Lock()
+	r.lines = append(r.lines, line)
+	r.mu.Unlock()
+	r.t.Log(line)
+}
+
+// matching returns the recorded lines containing sub.
+func (r *logRecorder) matching(sub string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, l := range r.lines {
+		if strings.Contains(l, sub) {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // option mutates the config before the tiers are opened.
@@ -210,6 +246,17 @@ func withRemote() option {
 // withMinUploadSize sets the upload-skip threshold.
 func withMinUploadSize(n int64) option {
 	return func(c *config.Config) { c.MinUploadSize = n }
+}
+
+// withUploadQueueDepth sets the per-worker upload backlog.
+func withUploadQueueDepth(n int) option {
+	return func(c *config.Config) { c.UploadQueueDepth = n }
+}
+
+// withUploadBlockTimeout makes a full upload queue wait for room rather than
+// drop immediately.
+func withUploadBlockTimeout(d time.Duration) option {
+	return func(c *config.Config) { c.UploadBlockTimeout = d }
 }
 
 // withCompactAfter sets the pruned-entry debt that triggers a compaction.
@@ -251,12 +298,13 @@ func newTestCache(t *testing.T, opts ...option) *testCache {
 	}
 
 	rem := newFakeRemote()
-	c := New(Params{Config: cfg, Index: idx, Blobs: blobs, Remote: rem, Logf: t.Logf})
+	logs := &logRecorder{t: t}
+	c := New(Params{Config: cfg, Index: idx, Blobs: blobs, Remote: rem, Logf: logs.logf})
 	// Registered after the index cleanup so it runs first: the uploader must
 	// drain while the index is still open.
 	t.Cleanup(func() { _ = c.Close() })
 
-	return &testCache{cfg: cfg, idx: idx, blobs: blobs, rem: rem, cache: c}
+	return &testCache{cfg: cfg, idx: idx, blobs: blobs, rem: rem, cache: c, logs: logs}
 }
 
 // put is a terse Cache.Put for tests, returning the on-disk path.

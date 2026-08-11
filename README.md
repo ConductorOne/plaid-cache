@@ -249,6 +249,7 @@ There is no `directory`, no `config`, and no `volume` line, and `remote` says wh
 | `plaid_cache_gets_total{result}` | counter | Lookups by outcome: `local_hit`, `remote_hit`, `miss`. |
 | `plaid_cache_puts_total`, `plaid_cache_repairs_total`, `plaid_cache_compactions_total` | counter | Stores, index entries dropped for a missing body, and compactions. |
 | `plaid_cache_uploads_total{result}` | counter | Uploads by outcome: `ok`, `failed`, `dropped`, `skipped`. |
+| `plaid_cache_upload_queue_depth`, `plaid_cache_upload_queue_capacity` | gauge | Uploads waiting on this daemon's pool, and how many may wait. Depth at capacity means uploads are being dropped. |
 | `plaid_cache_activity_start_time_seconds` | gauge | When the counters above started counting. |
 
 Two labels, both with a short fixed set of values. Nothing is ever labelled by digest, key, path, or client: a series is created for every distinct label value and never forgotten, so a per-request label is an unbounded leak in whatever scrapes it.
@@ -525,6 +526,8 @@ be a surprising amount of reach for this one to have.
 | `PLAID_GOCACHE_S3_PREFIX` | Key prefix within the bucket. | empty |
 | `PLAID_GOCACHE_MIN_UPLOAD_SIZE` | Skip uploading bodies smaller than this. Skipping also omits the action record, so the entry becomes a remote miss and the action is re-run rather than re-downloaded. | `0` (upload everything) |
 | `PLAID_GOCACHE_UPLOAD_CONCURRENCY` | Remote upload workers. | `NumCPU` |
+| `PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH` | Uploads that may wait per worker before further ones are dropped. Raising it buys tolerance of a burst with memory. | `64` |
+| `PLAID_GOCACHE_UPLOAD_BLOCK_TIMEOUT` | How long a put waits for room in the upload queue before dropping the upload, as a Go duration. Zero never waits. | `0` (drop rather than wait) |
 | `PLAID_GOCACHE_TOUCH_GRANULARITY` | Relatime-style window for last-used updates. | `1h` |
 | `PLAID_GOCACHE_IDLE_TIMEOUT` | Daemon exits after this long with no connections. | `30m` |
 | `PLAID_GOCACHE_EVICT_INTERVAL` | Eviction ticker period. | `1m` |
@@ -552,6 +555,19 @@ export PLAID_GOCACHE_S3_PREFIX=go-build
 Credentials come from the standard AWS configuration chain. The caller needs `s3express:CreateSession` on the bucket in addition to the usual object permissions; the SDK negotiates the session automatically.
 
 Uploads are best-effort. They run in a bounded worker pool off the critical path, and a failure is logged and counted rather than propagated — a cache must never fail a build. If the daemon cannot be reached at all, the plugin falls back to direct mode, warns on stderr, and lets the build proceed.
+
+#### When the upload queue fills
+
+The pool is fed by a bounded queue, and a build that produces entries faster than the link ships them fills it. A submission that finds it full is dropped: the body is already on local disk and the put has already returned, so nothing fails and nothing waits. That is the right trade for a tier a build must never stall on, and it is worth knowing what it costs, because the cost is paid on a different machine at a different time. The entry is simply not in the shared tier, so the next reader takes an ordinary miss and rebuilds — and there is nothing about that miss to connect it back to the queue that dropped it.
+
+So the loss is reported where it happens rather than only where it lands:
+
+- `plaid_cache_upload_queue_depth` against `plaid_cache_upload_queue_capacity` says how close the queue is to full. This is the number to watch and to alert on: it climbs before anything is lost, where `plaid_cache_uploads_total{result="dropped"}` only moves once entries are already gone. `plaid-cache status` prints the same pair as its `upload q` line.
+- The first drop logs a warning naming how many uploads went with it, and no more than one such line is written per 30 seconds — a saturated queue drops thousands of uploads a second, and a line each would bury the log rather than explain it. Each line carries the count since the previous one, so a burst and an hour of sustained shedding do not look alike. It travels with the daemon's other cache diagnostics, so `PLAID_GOCACHE_LOG=info` is what puts it in the log; the two gauges above need nothing turned on.
+
+Two settings adjust the trade. `PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH` is the backlog each worker may accumulate; raising it absorbs a longer burst in exchange for memory, since the queue holds a job per waiting entry. `PLAID_GOCACHE_UPLOAD_CONCURRENCY` drains it faster, which is the better answer when the bucket, and not the burst, is the constraint.
+
+`PLAID_GOCACHE_UPLOAD_BLOCK_TIMEOUT` reverses the trade rather than adjusting it: a put whose queue is full waits up to that long for room and only then drops. It is off by default and should stay off for ordinary builds — it makes a saturated queue something a build can wait on, which is exactly what the drop exists to prevent. It is there for the runs where the upload is the point and the local copy is not, such as a warmer filling a bucket for everyone else, and the wait is bounded so that opting in cannot turn into an unbounded stall. Shutdown does not wait it out either: a put still waiting when the daemon stops drops its upload and lets the process exit.
 
 Keys are laid out as `[<prefix>/]action/<xx>/<hex-action-id>` and `[<prefix>/]output/<xx>/<hex-output-id>`, mirroring the de-facto convention so a bucket stays interoperable with other `GOCACHEPROG` implementations.
 
