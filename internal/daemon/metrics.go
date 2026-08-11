@@ -6,6 +6,8 @@ package daemon
 import (
 	"strconv"
 	"strings"
+
+	"github.com/conductorone/plaid-cache/internal/remote"
 )
 
 // metricPrefix namespaces every family this daemon exposes.
@@ -129,6 +131,22 @@ func renderMetrics(r StatusResponse) []byte {
 		"Index compactions, which reclaim the space pruning leaves behind.",
 		sample{value: float64(life.Compactions)})
 
+	// The shared tier's transport, which is the only part of this report about how
+	// the cache reaches the network rather than about what it holds. Absent when
+	// there is no such tier, rather than rendered as zeros: a cache with no bucket
+	// configured has not failed to reuse a connection, it has not tried.
+	if rem := r.Remote; rem != nil {
+		writeFamily(&b, "remote_requests_total", "counter",
+			"HTTP requests to the shared tier, by whether the transport had an idle connection to give them. "+
+				"conn=\"new\" is a request that paid for a TCP and TLS handshake before it could be sent.",
+			sample{labels: labels("conn", "reused"), value: float64(rem.ConnsReused)},
+			sample{labels: labels("conn", "new"), value: float64(rem.ConnsNew)})
+		writeHistogram(&b, "remote_operation_duration_seconds",
+			"How long an operation against the shared tier took, by operation and outcome. "+
+				"A get is measured to the open body rather than through it, so reads are first-byte latency; a put is the whole transfer.",
+			rem.Ops)
+	}
+
 	// When the counters above started counting, so that a total read off a
 	// dashboard can be understood as covering a week or an afternoon. Nanos on
 	// the wire, seconds here, because seconds is the unit this format uses for
@@ -152,10 +170,63 @@ type sample struct {
 // writeFamily emits one family: the HELP and TYPE lines the format requires,
 // then a line per sample.
 func writeFamily(b *strings.Builder, name, typ, help string, samples ...sample) {
+	writeHeader(b, name, typ, help)
+	for _, s := range samples {
+		writeSample(b, name, s.labels, s.value)
+	}
+}
+
+// writeHeader emits a family's HELP and TYPE lines.
+//
+// They belong to the family and not to a series, so a family carrying several
+// label sets — the histogram below — declares them once. A second HELP line for
+// the same name is not a harmless repetition; a scraper rejects the document.
+func writeHeader(b *strings.Builder, name, typ, help string) {
 	b.WriteString("# HELP " + metricPrefix + name + " " + escapeHelp(help) + "\n")
 	b.WriteString("# TYPE " + metricPrefix + name + " " + typ + "\n")
-	for _, s := range samples {
-		b.WriteString(metricPrefix + name + s.labels + " " + formatValue(s.value) + "\n")
+}
+
+// writeSample emits one series line. name carries no prefix and labels are
+// already rendered.
+func writeSample(b *strings.Builder, name, labelSet string, v float64) {
+	b.WriteString(metricPrefix + name + labelSet + " " + formatValue(v) + "\n")
+}
+
+// writeHistogram emits a histogram family: the three series names the format
+// defines for one, for every distribution handed over.
+//
+// The buckets arrive cumulative and are labelled with the edges the recording
+// package owns, so the two cannot disagree about which bound a count belongs to.
+// The overflow bucket is written from the count rather than from a fourteenth
+// number, because the format requires le="+Inf" to equal _count — they are one
+// value, and storing it twice would let them differ.
+//
+// Nothing is written for a family with no distributions in it. An operation that
+// has not happened has no latency, and a bucket set of zeros would read as one
+// that answered instantly.
+func writeHistogram(b *strings.Builder, name, help string, dists []remote.OpDurations) {
+	if len(dists) == 0 {
+		return
+	}
+	edges := remote.DurationBuckets()
+	writeHeader(b, name, "histogram", help)
+	for _, d := range dists {
+		for i, count := range d.Buckets {
+			if i >= len(edges) {
+				// A snapshot longer than the edges it was measured against
+				// cannot come from this build. Report what can be labelled
+				// rather than guessing a bound or panicking on a scrape.
+				break
+			}
+			writeSample(b, name+"_bucket",
+				labels("operation", d.Operation, "outcome", d.Outcome, "le", formatValue(edges[i])),
+				float64(count))
+		}
+		labelSet := labels("operation", d.Operation, "outcome", d.Outcome)
+		writeSample(b, name+"_bucket",
+			labels("operation", d.Operation, "outcome", d.Outcome, "le", "+Inf"), float64(d.Count))
+		writeSample(b, name+"_sum", labelSet, d.SumSeconds)
+		writeSample(b, name+"_count", labelSet, float64(d.Count))
 	}
 }
 

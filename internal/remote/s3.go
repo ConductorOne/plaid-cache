@@ -33,6 +33,12 @@ type S3 struct {
 	client *s3.Client
 	bucket string
 	keys   keyspace
+
+	// stats is this backend's transport accounting: how often a request was
+	// given a connection that was already open, and how long each operation
+	// took. It is per backend rather than per package, because the pool it
+	// describes belongs to the client constructed below.
+	stats *stats
 }
 
 // S3Params configures an S3 backend. Bucket is required; every other field
@@ -70,15 +76,38 @@ func NewS3(ctx context.Context, p S3Params) (*S3, error) {
 		})
 	}
 
+	st := &stats{}
+	s3opts = append(s3opts, func(o *s3.Options) {
+		// Wrap the client the SDK already resolved rather than installing one of
+		// our own. By the time an option function runs, o.HTTPClient is the
+		// client this call would otherwise have used, pool settings and all, so
+		// wrapping it cannot change any of them — which is the point. Nothing
+		// here tunes the pool; this exists to find out whether it needs tuning.
+		o.HTTPClient = newTracingClient(o.HTTPClient, st)
+	})
+
 	return &S3{
 		client: s3.NewFromConfig(cfg, s3opts...),
 		bucket: p.Bucket,
 		keys:   keyspace{prefix: p.Prefix},
+		stats:  st,
 	}, nil
 }
 
+// Stats reports what this backend's transport has done. It satisfies Statser.
+func (s *S3) Stats() StatsSnapshot { return s.stats.Snapshot() }
+
 // GetAction resolves an action to the output it produced.
 func (s *S3) GetAction(ctx context.Context, a ids.ActionID) (ids.OutputID, time.Time, error) {
+	start := time.Now()
+	o, mtime, err := s.getAction(ctx, a)
+	s.stats.observe(opGetAction, err, time.Since(start))
+	return o, mtime, err
+}
+
+// getAction is GetAction without the timing, so that there is one place the
+// duration is recorded rather than one per return path.
+func (s *S3) getAction(ctx context.Context, a ids.ActionID) (ids.OutputID, time.Time, error) {
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.keys.actionKey(a)),
@@ -108,6 +137,14 @@ func (s *S3) GetAction(ctx context.Context, a ids.ActionID) (ids.OutputID, time.
 
 // PutAction records that an action produced an output.
 func (s *S3) PutAction(ctx context.Context, a ids.ActionID, o ids.OutputID, mtime time.Time) error {
+	start := time.Now()
+	err := s.putAction(ctx, a, o, mtime)
+	s.stats.observe(opPutAction, err, time.Since(start))
+	return err
+}
+
+// putAction is PutAction without the timing.
+func (s *S3) putAction(ctx context.Context, a ids.ActionID, o ids.OutputID, mtime time.Time) error {
 	body := formatActionRecord(o, mtime)
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
@@ -123,6 +160,20 @@ func (s *S3) PutAction(ctx context.Context, a ids.ActionID, o ids.OutputID, mtim
 
 // GetObject opens a body from the bucket.
 func (s *S3) GetObject(ctx context.Context, o ids.OutputID) (io.ReadCloser, int64, error) {
+	start := time.Now()
+	body, size, err := s.getObject(ctx, o)
+	// The measured span ends when the body is open, not when it has been read:
+	// the reader is handed to the caller, and the time it spends draining it is
+	// the caller's transfer rather than this tier's round trip. So a get here is
+	// first-byte latency, which is the number the connection counters beside it
+	// are about; a put below is the whole transfer, because this package does
+	// stream that one itself.
+	s.stats.observe(opGetObject, err, time.Since(start))
+	return body, size, err
+}
+
+// getObject is GetObject without the timing.
+func (s *S3) getObject(ctx context.Context, o ids.OutputID) (io.ReadCloser, int64, error) {
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.keys.objectKey(o)),
@@ -147,6 +198,18 @@ func (s *S3) GetObject(ctx context.Context, o ids.OutputID) (io.ReadCloser, int6
 // head-then-put into a single round trip, and a precondition failure is the
 // success case rather than an error.
 func (s *S3) PutObject(ctx context.Context, o ids.OutputID, r io.ReadSeeker, size int64) error {
+	start := time.Now()
+	err := s.putObject(ctx, o, r, size)
+	// A conditional write that lost is recorded as a success, because that is
+	// what it is: the bytes are in the bucket. It is a fast success, though — no
+	// body was transferred — so it lands low in the distribution and drags the
+	// put percentiles down on a fleet that keeps offering the same objects.
+	s.stats.observe(opPutObject, err, time.Since(start))
+	return err
+}
+
+// putObject is PutObject without the timing.
+func (s *S3) putObject(ctx context.Context, o ids.OutputID, r io.ReadSeeker, size int64) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
 		Key:           aws.String(s.keys.objectKey(o)),

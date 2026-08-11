@@ -12,6 +12,7 @@ import (
 
 	"github.com/conductorone/plaid-cache/internal/cache"
 	"github.com/conductorone/plaid-cache/internal/index"
+	"github.com/conductorone/plaid-cache/internal/remote"
 )
 
 // exposition is a parsed scrape: the declared type of every family, and the
@@ -83,16 +84,17 @@ func parseExposition(t *testing.T, text string) exposition {
 		if err != nil {
 			t.Fatalf("line %d: value %q: %v", lineNo, value, err)
 		}
-		family := series
+		name := series
 		if i := strings.IndexByte(series, '{'); i >= 0 {
-			family = series[:i]
+			name = series[:i]
 			if !strings.HasSuffix(series, "}") {
 				t.Fatalf("line %d: %q has an unclosed label set", lineNo, line)
 			}
 		}
-		if !metricNamePattern.MatchString(family) {
-			t.Fatalf("line %d: %q is not a metric name", lineNo, family)
+		if !metricNamePattern.MatchString(name) {
+			t.Fatalf("line %d: %q is not a metric name", lineNo, name)
 		}
+		family := e.familyOf(name)
 		if _, ok := e.types[family]; !ok {
 			t.Fatalf("line %d: %s has no preceding TYPE line", lineNo, family)
 		}
@@ -105,6 +107,47 @@ func parseExposition(t *testing.T, text string) exposition {
 		e.samples[series] = v
 	}
 	return e
+}
+
+// familyOf maps a series name onto the family that declared its type.
+//
+// It is the format's one exception to "a sample's name is its family's": a
+// histogram declares one TYPE line and then emits three series names derived
+// from it, so the bucket, sum, and count lines have no declaration of their own
+// and a parser that insisted on one would reject a document every scraper
+// accepts.
+func (e exposition) familyOf(name string) string {
+	for _, suffix := range []string{"_bucket", "_sum", "_count"} {
+		base, ok := strings.CutSuffix(name, suffix)
+		if !ok {
+			continue
+		}
+		switch e.types[base] {
+		case "histogram", "summary":
+			return base
+		}
+	}
+	return name
+}
+
+// cumulative builds a bucket list in the shape a snapshot has — one cumulative
+// count per remote.DurationBuckets edge — from the counts at a few named edges,
+// carrying each forward to the edges above it.
+func cumulative(t *testing.T, at map[float64]int64) []int64 {
+	t.Helper()
+	edges := remote.DurationBuckets()
+	out := make([]int64, len(edges))
+	var running int64
+	for i, edge := range edges {
+		if v, ok := at[edge]; ok {
+			if v < running {
+				t.Fatalf("count %d at le=%v is below the %d beneath it, which no cumulative series can be", v, edge, running)
+			}
+			running = v
+		}
+		out[i] = running
+	}
+	return out
 }
 
 // wantSample fails unless the series is present with the expected value.
@@ -138,7 +181,7 @@ func (e exposition) wantType(t *testing.T, family, want string) {
 // mistake here is not caught downstream — it is inherited by every dashboard
 // built on top.
 func TestMetricsExposition(t *testing.T) {
-	e := parseExposition(t, string(renderMetrics(StatusResponse{
+	text := string(renderMetrics(StatusResponse{
 		Version:          "plaid-cache v9.9.9",
 		PID:              4210,
 		RemoteEnabled:    true,
@@ -160,12 +203,28 @@ func TestMetricsExposition(t *testing.T) {
 		UploadQueueDepth:    12,
 		UploadQueueCapacity: 512,
 
+		Remote: &remote.StatsSnapshot{
+			ConnsReused: 190,
+			ConnsNew:    22,
+			Ops: []remote.OpDurations{
+				{
+					Operation: "get_object", Outcome: "ok", Count: 5, SumSeconds: 0.031,
+					Buckets: cumulative(t, map[float64]int64{0.005: 2, 0.01: 4}),
+				},
+				{
+					Operation: "put_object", Outcome: "error", Count: 1, SumSeconds: 60,
+					Buckets: cumulative(t, nil),
+				},
+			},
+		},
+
 		Lifetime: cache.MetricsSnapshot{
 			GetLocalHit: 205, GetRemoteHit: 3, GetMiss: 139, GetRepair: 2,
 			Put: 275, UploadOK: 205, UploadFail: 1, UploadDrop: 2, UploadSkip: 3,
 			Compactions: 7,
 		},
-	})))
+	}))
+	e := parseExposition(t, text)
 
 	// What the cache holds and what it was told to hold: levels, so gauges.
 	for _, f := range []string{
@@ -185,9 +244,16 @@ func TestMetricsExposition(t *testing.T) {
 	for _, f := range []string{
 		"plaid_cache_gets_total", "plaid_cache_puts_total", "plaid_cache_repairs_total",
 		"plaid_cache_uploads_total", "plaid_cache_compactions_total",
+		// Requests that opened a connection and requests that did not: both only
+		// ever rise, so a rate() over either is the question worth asking.
+		"plaid_cache_remote_requests_total",
 	} {
 		e.wantType(t, f, "counter")
 	}
+	// How long the shared tier took, which is the one measurement here that a
+	// single number cannot carry: the read path blocks the build, so the tail is
+	// the part that costs anything.
+	e.wantType(t, "plaid_cache_remote_operation_duration_seconds", "histogram")
 
 	e.wantSample(t, "plaid_cache_actions", 274)
 	e.wantSample(t, "plaid_cache_objects", 206)
@@ -215,6 +281,36 @@ func TestMetricsExposition(t *testing.T) {
 	e.wantSample(t, "plaid_cache_upload_queue_depth", 12)
 	e.wantSample(t, "plaid_cache_upload_queue_capacity", 512)
 
+	e.wantSample(t, `plaid_cache_remote_requests_total{conn="reused"}`, 190)
+	e.wantSample(t, `plaid_cache_remote_requests_total{conn="new"}`, 22)
+
+	// A histogram is three series names per label set, and the two that are not
+	// buckets are what a quantile is computed against.
+	const dur = "plaid_cache_remote_operation_duration_seconds"
+	e.wantSample(t, dur+`_bucket{operation="get_object",outcome="ok",le="0.005"}`, 2)
+	e.wantSample(t, dur+`_bucket{operation="get_object",outcome="ok",le="0.01"}`, 4)
+	e.wantSample(t, dur+`_sum{operation="get_object",outcome="ok"}`, 0.031)
+	e.wantSample(t, dur+`_count{operation="get_object",outcome="ok"}`, 5)
+	// The overflow bucket is the count, always: the format requires the two to
+	// agree, and the fifth observation above is past the last edge.
+	e.wantSample(t, dur+`_bucket{operation="get_object",outcome="ok",le="+Inf"}`, 5)
+
+	// A failure that took a minute is entirely past the last edge, which is the
+	// case that proves the overflow bucket is not derived from the buckets.
+	e.wantSample(t, dur+`_bucket{operation="put_object",outcome="error",le="10"}`, 0)
+	e.wantSample(t, dur+`_bucket{operation="put_object",outcome="error",le="+Inf"}`, 1)
+	e.wantSample(t, dur+`_sum{operation="put_object",outcome="error"}`, 60)
+
+	// One HELP and one TYPE line for the whole histogram, however many label sets
+	// it carries. A repeated declaration is not a harmless duplicate; a scraper
+	// rejects the document.
+	if got := strings.Count(text, "# TYPE "+dur+" "); got != 1 {
+		t.Fatalf("the histogram declared its type %d times, want once", got)
+	}
+	if got := strings.Count(text, "# HELP "+dur+" "); got != 1 {
+		t.Fatalf("the histogram declared its help %d times, want once", got)
+	}
+
 	// Every family this daemon exposes carries the one prefix, and nothing
 	// carries a label whose values are not a fixed, short list — a label per
 	// digest or per client is how a metrics endpoint becomes a memory leak in
@@ -228,7 +324,8 @@ func TestMetricsExposition(t *testing.T) {
 		if i := strings.IndexByte(series, '{'); i >= 0 {
 			labels := series[i:]
 			switch {
-			case strings.HasPrefix(labels, `{result="`), strings.HasPrefix(labels, `{version="`):
+			case strings.HasPrefix(labels, `{result="`), strings.HasPrefix(labels, `{version="`),
+				strings.HasPrefix(labels, `{conn="`), strings.HasPrefix(labels, `{operation="`):
 			default:
 				t.Fatalf("series %s carries an unexpected label; only bounded ones belong here", series)
 			}
@@ -254,6 +351,36 @@ func TestMetricsOmitWhatIsNotKnown(t *testing.T) {
 	// The counters are still there, at zero: a cache that has done nothing has
 	// done nothing, which is a fact, unlike an age span it does not have.
 	e.wantSample(t, `plaid_cache_gets_total{result="miss"}`, 0)
+}
+
+// TestMetricsOmitTheRemoteTierWhenThereIsNone pins that a local-only cache
+// publishes no transport families at all.
+//
+// Zeros would be the wrong answer twice over: a cache with no bucket configured
+// has not failed to reuse a connection, and a histogram of zeros is
+// indistinguishable from a tier that answered every request instantly. A backend
+// that keeps accounting but has not been used yet is the other case below —
+// there the request counters are real zeros and the histogram is still absent,
+// because an operation that has not happened has no duration.
+func TestMetricsOmitTheRemoteTierWhenThereIsNone(t *testing.T) {
+	e := parseExposition(t, string(renderMetrics(StatusResponse{Version: testVersion})))
+	for _, f := range []string{
+		"plaid_cache_remote_requests_total",
+		"plaid_cache_remote_operation_duration_seconds",
+	} {
+		if _, ok := e.types[f]; ok {
+			t.Fatalf("%s was emitted for a cache with no shared tier", f)
+		}
+	}
+
+	idle := parseExposition(t, string(renderMetrics(StatusResponse{
+		Version: testVersion,
+		Remote:  &remote.StatsSnapshot{},
+	})))
+	idle.wantSample(t, `plaid_cache_remote_requests_total{conn="new"}`, 0)
+	if _, ok := idle.types["plaid_cache_remote_operation_duration_seconds"]; ok {
+		t.Fatal("a duration histogram was emitted for a tier no operation has reached")
+	}
 }
 
 // TestMetricsEscapeLabelValues pins that a version string carrying a quote or a
