@@ -110,6 +110,15 @@ func TestLoadDefaults(t *testing.T) {
 	if c.DisableBazelVerify {
 		t.Fatalf("DisableBazelVerify = true by default, want uploads verified")
 	}
+	if c.UploadQueueDepth != defaultUploadQueueDepth {
+		t.Fatalf("UploadQueueDepth = %d, want %d", c.UploadQueueDepth, defaultUploadQueueDepth)
+	}
+	// Waiting for room in the upload queue is opt-in. A default that blocked
+	// would turn a full queue from a lost cache entry into a stalled build,
+	// which is the one thing this tool promises not to do.
+	if c.UploadBlockTimeout != 0 {
+		t.Fatalf("UploadBlockTimeout = %v by default, want 0 (drop rather than wait)", c.UploadBlockTimeout)
+	}
 }
 
 // TestLoadDirChain pins the PLAID_GOCACHE_DIR > XDG_CACHE_HOME precedence.
@@ -148,6 +157,10 @@ func TestLoadRejectsBadValues(t *testing.T) {
 		{"PLAID_GOCACHE_MIN_UPLOAD_SIZE", "small"},
 		{"PLAID_GOCACHE_UPLOAD_CONCURRENCY", "many"},
 		{"PLAID_GOCACHE_UPLOAD_CONCURRENCY", "0"},
+		{"PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH", "deep"},
+		{"PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH", "0"},
+		{"PLAID_GOCACHE_UPLOAD_BLOCK_TIMEOUT", "a while"},
+		{"PLAID_GOCACHE_UPLOAD_BLOCK_TIMEOUT", "-1s"},
 		{"PLAID_GOCACHE_IDLE_TIMEOUT", "forever"},
 		{"PLAID_GOCACHE_EVICT_INTERVAL", "often"},
 		{"PLAID_GOCACHE_DISABLE_EVICTION", "true"},
@@ -267,6 +280,8 @@ func clearEnv(t *testing.T) {
 		"PLAID_GOCACHE_S3_ENDPOINT_URL",
 		"PLAID_GOCACHE_MIN_UPLOAD_SIZE",
 		"PLAID_GOCACHE_UPLOAD_CONCURRENCY",
+		"PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH",
+		"PLAID_GOCACHE_UPLOAD_BLOCK_TIMEOUT",
 		"PLAID_GOCACHE_IDLE_TIMEOUT",
 		"PLAID_GOCACHE_EVICT_INTERVAL",
 		"PLAID_GOCACHE_DISABLE_EVICTION",

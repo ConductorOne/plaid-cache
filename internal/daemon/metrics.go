@@ -80,6 +80,20 @@ func renderMetrics(r StatusResponse) []byte {
 			sample{value: r.NewestAgeSeconds})
 	}
 
+	// The upload backlog, which is the one number here that leads its failure
+	// rather than recording it. A queue at its capacity is dropping uploads, and
+	// the shared tier quietly stops receiving what this machine builds; the
+	// counter that says so is uploads_total{result="dropped"}, and by the time it
+	// moves the entries are gone. These two are a process level rather than a
+	// persisted total for the same reason they are worth having: what is queued
+	// belongs to the daemon holding it and means nothing after it exits.
+	writeFamily(&b, "upload_queue_depth", "gauge",
+		"Uploads to the shared tier waiting on this daemon's worker pool.",
+		sample{value: float64(r.UploadQueueDepth)})
+	writeFamily(&b, "upload_queue_capacity", "gauge",
+		"Uploads that may wait before further ones are dropped. Depth at capacity means entries are being lost.",
+		sample{value: float64(r.UploadQueueCapacity)})
+
 	writeFamily(&b, "uptime_seconds", "gauge",
 		"Time since this daemon started.", sample{value: r.UptimeSeconds})
 	writeFamily(&b, "remote_tier_enabled", "gauge",

@@ -114,6 +114,29 @@ type Config struct {
 	// UploadConcurrency bounds in-flight remote uploads.
 	UploadConcurrency int
 
+	// UploadQueueDepth is how many uploads may wait per worker before further
+	// ones are dropped. It is per worker rather than absolute so that the
+	// backlog scales with the pool draining it, the way it always has.
+	//
+	// It is a setting rather than a constant because the right value is a
+	// property of the machine and not of the tool: the queue holds a job per
+	// entry, so raising it buys tolerance of a burst with memory, and a builder
+	// that produces entries faster than one link can ship them wants a different
+	// number from a laptop. Dropping is still what happens when it fills; this
+	// only decides how much of a burst passes without one.
+	UploadQueueDepth int
+
+	// UploadBlockTimeout is how long a put waits for room in the upload queue
+	// before its upload is dropped. Zero, the default, never waits.
+	//
+	// Waiting is opt-in because the default is the trade a best-effort tier
+	// should make: a full queue costs the shared tier an entry, and no build
+	// stalls on a cache. Setting this reverses that for the callers who would
+	// rather pay latency than lose the entry — a nightly warmer filling a bucket
+	// for everyone else, where a dropped upload is the whole point of the run —
+	// and it is bounded so the reversal cannot become an unbounded stall.
+	UploadBlockTimeout time.Duration
+
 	// IdleTimeout is how long the daemon runs with no connected clients
 	// before exiting.
 	IdleTimeout time.Duration
@@ -193,6 +216,7 @@ const (
 	defaultTTL              = 168 * time.Hour
 	defaultTouchGranularity = time.Hour
 	defaultMinUploadSize    = 0
+	defaultUploadQueueDepth = 64
 	defaultIdleTimeout      = 30 * time.Minute
 	defaultEvictInterval    = time.Minute
 	defaultCompactAfter     = 1000
@@ -258,6 +282,15 @@ func Load() (*Config, error) {
 	if c.UploadConcurrency < 1 {
 		return nil, fmt.Errorf("Load: PLAID_GOCACHE_UPLOAD_CONCURRENCY: got %d, want >= 1", c.UploadConcurrency)
 	}
+	if c.UploadQueueDepth, err = envInt(src, "PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH", defaultUploadQueueDepth); err != nil {
+		return nil, fmt.Errorf("Load: %w", err)
+	}
+	if c.UploadQueueDepth < 1 {
+		return nil, fmt.Errorf("Load: PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH: got %d, want >= 1", c.UploadQueueDepth)
+	}
+	if c.UploadBlockTimeout, err = envDuration(src, "PLAID_GOCACHE_UPLOAD_BLOCK_TIMEOUT", 0); err != nil {
+		return nil, fmt.Errorf("Load: %w", err)
+	}
 	if c.BazelMonitoring, err = envBool(src, "PLAID_GOCACHE_BAZEL_MONITORING"); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
@@ -304,6 +337,8 @@ var settingNames = map[string]bool{
 	"PLAID_GOCACHE_S3_ENDPOINT_URL":      true,
 	"PLAID_GOCACHE_MIN_UPLOAD_SIZE":      true,
 	"PLAID_GOCACHE_UPLOAD_CONCURRENCY":   true,
+	"PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH":   true,
+	"PLAID_GOCACHE_UPLOAD_BLOCK_TIMEOUT": true,
 	"PLAID_GOCACHE_TOUCH_GRANULARITY":    true,
 	"PLAID_GOCACHE_IDLE_TIMEOUT":         true,
 	"PLAID_GOCACHE_EVICT_INTERVAL":       true,

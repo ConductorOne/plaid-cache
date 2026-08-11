@@ -539,7 +539,7 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 		return
 	}
 	a.outf("daemon      pid %d, up %s\n", d.PID, d.Uptime)
-	a.printCounters(d.Metrics, cfg.RemoteEnabled())
+	a.printCounters(d, cfg.RemoteEnabled())
 	a.printLifetime(life, lifeSince)
 }
 
@@ -573,7 +573,7 @@ func (a *app) printStatusFrom(endpoint string, r *daemon.StatusResponse) {
 		a.outf("remote      disabled\n")
 	}
 	a.outf("daemon      pid %d, up %s\n", r.PID, r.Uptime)
-	a.printCounters(r.Metrics, r.RemoteEnabled)
+	a.printCounters(r, r.RemoteEnabled)
 	a.printLifetime(r.Lifetime, r.LifetimeSince)
 }
 
@@ -630,7 +630,13 @@ func (a *app) printAge(oldest, newest string) {
 // would otherwise have to work out from three separate counters. Repairs are
 // called out because a nonzero count means bodies went missing under the index,
 // which is worth noticing rather than burying.
-func (a *app) printCounters(m cache.MetricsSnapshot, remoteEnabled bool) {
+//
+// It takes the whole report rather than the counters alone because the upload
+// backlog is not one of them: it is a level, and it belongs beside the upload
+// counters because it is what those counters cannot say — how close the next
+// burst is to being dropped.
+func (a *app) printCounters(d *daemon.StatusResponse, remoteEnabled bool) {
+	m := d.Metrics
 	lookups := m.GetLocalHit + m.GetRemoteHit + m.GetMiss
 	if lookups > 0 {
 		a.outf("hit rate    %.1f%% of %d lookups\n",
@@ -648,6 +654,9 @@ func (a *app) printCounters(m cache.MetricsSnapshot, remoteEnabled bool) {
 	if remoteEnabled {
 		a.outf("uploads     %d ok, %d failed, %d dropped, %d skipped\n",
 			m.UploadOK, m.UploadFail, m.UploadDrop, m.UploadSkip)
+		if d.UploadQueueCapacity > 0 {
+			a.outf("upload q    %d of %d queued\n", d.UploadQueueDepth, d.UploadQueueCapacity)
+		}
 	}
 }
 

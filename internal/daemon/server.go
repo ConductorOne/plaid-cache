@@ -604,6 +604,7 @@ func (s *Server) status() StatusResponse {
 		UptimeSeconds: uptime.Seconds(),
 		Metrics:       s.cache.Metrics(),
 	}
+	r.UploadQueueDepth, r.UploadQueueCapacity = s.cache.UploadQueue()
 	// The lifetime figures include what this process has counted but not yet
 	// flushed, so the two sets cannot disagree about activity that just
 	// happened — a lifetime total smaller than the session's would be a

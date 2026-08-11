@@ -156,6 +156,10 @@ func TestMetricsExposition(t *testing.T) {
 		NewestAge:        "1s",
 		NewestAgeSeconds: 1,
 		LifetimeSince:    1_700_000_000_000_000_000,
+
+		UploadQueueDepth:    12,
+		UploadQueueCapacity: 512,
+
 		Lifetime: cache.MetricsSnapshot{
 			GetLocalHit: 205, GetRemoteHit: 3, GetMiss: 139, GetRepair: 2,
 			Put: 275, UploadOK: 205, UploadFail: 1, UploadDrop: 2, UploadSkip: 3,
@@ -170,6 +174,10 @@ func TestMetricsExposition(t *testing.T) {
 		"plaid_cache_oldest_entry_age_seconds", "plaid_cache_newest_entry_age_seconds",
 		"plaid_cache_remote_tier_enabled", "plaid_cache_activity_start_time_seconds",
 		"plaid_cache_build_info",
+		// A backlog rises and falls, so a counter here would make every
+		// dashboard built on it nonsense — and this is the one family meant to
+		// be watched climbing, before the drops it predicts have happened.
+		"plaid_cache_upload_queue_depth", "plaid_cache_upload_queue_capacity",
 	} {
 		e.wantType(t, f, "gauge")
 	}
@@ -204,6 +212,8 @@ func TestMetricsExposition(t *testing.T) {
 	e.wantSample(t, `plaid_cache_uploads_total{result="dropped"}`, 2)
 	e.wantSample(t, `plaid_cache_uploads_total{result="skipped"}`, 3)
 	e.wantSample(t, "plaid_cache_compactions_total", 7)
+	e.wantSample(t, "plaid_cache_upload_queue_depth", 12)
+	e.wantSample(t, "plaid_cache_upload_queue_capacity", 512)
 
 	// Every family this daemon exposes carries the one prefix, and nothing
 	// carries a label whose values are not a fixed, short list — a label per
