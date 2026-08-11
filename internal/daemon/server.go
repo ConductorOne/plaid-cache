@@ -605,6 +605,9 @@ func (s *Server) status() StatusResponse {
 		Metrics:       s.cache.Metrics(),
 	}
 	r.UploadQueueDepth, r.UploadQueueCapacity = s.cache.UploadQueue()
+	if rs, ok := s.cache.RemoteStats(); ok {
+		r.Remote = &rs
+	}
 	// The lifetime figures include what this process has counted but not yet
 	// flushed, so the two sets cannot disagree about activity that just
 	// happened — a lifetime total smaller than the session's would be a

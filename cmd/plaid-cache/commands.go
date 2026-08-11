@@ -657,7 +657,27 @@ func (a *app) printCounters(d *daemon.StatusResponse, remoteEnabled bool) {
 		if d.UploadQueueCapacity > 0 {
 			a.outf("upload q    %d of %d queued\n", d.UploadQueueDepth, d.UploadQueueCapacity)
 		}
+		a.printConns(d.Remote)
 	}
+}
+
+// printConns reports how much of the shared tier's traffic reused a connection.
+//
+// The percentage is the whole line: a transport keeps a bounded number of idle
+// connections per host, so a process working harder than that bound spends its
+// time on handshakes it need not repeat, and this is the number that says whether
+// it is. What each of those handshakes costs is the duration histogram on the
+// metrics endpoint; this is the one figure worth having without a scraper.
+func (a *app) printConns(rem *remote.StatsSnapshot) {
+	if rem == nil {
+		return
+	}
+	total := rem.ConnsReused + rem.ConnsNew
+	if total == 0 {
+		return
+	}
+	a.outf("conns       %d requests, %.1f%% on a reused connection\n",
+		total, 100*float64(rem.ConnsReused)/float64(total))
 }
 
 // printLifetime reports the persisted counters.

@@ -62,6 +62,7 @@ hits        205 local, 0 remote
 misses      139
 puts        275
 uploads     205 ok, 0 failed, 0 dropped, 0 skipped
+conns       212 requests, 94.8% on a reused connection
 lifetime    71.2% of 128443 lookups since 2026-07-14 09:00 UTC (every process; see `plaid-cache stats`)
 ```
 
@@ -250,9 +251,13 @@ There is no `directory`, no `config`, and no `volume` line, and `remote` says wh
 | `plaid_cache_puts_total`, `plaid_cache_repairs_total`, `plaid_cache_compactions_total` | counter | Stores, index entries dropped for a missing body, and compactions. |
 | `plaid_cache_uploads_total{result}` | counter | Uploads by outcome: `ok`, `failed`, `dropped`, `skipped`. |
 | `plaid_cache_upload_queue_depth`, `plaid_cache_upload_queue_capacity` | gauge | Uploads waiting on this daemon's pool, and how many may wait. Depth at capacity means uploads are being dropped. |
+| `plaid_cache_remote_requests_total{conn}` | counter | Requests to the shared tier by connection: `reused` or `new`. `new` paid for a handshake. |
+| `plaid_cache_remote_operation_duration_seconds{operation,outcome}` | histogram | How long a shared-tier operation took, by `get_action`/`put_action`/`get_object`/`put_object` and `ok`/`miss`/`error`. |
 | `plaid_cache_activity_start_time_seconds` | gauge | When the counters above started counting. |
 
-Two labels, both with a short fixed set of values. Nothing is ever labelled by digest, key, path, or client: a series is created for every distinct label value and never forgotten, so a per-request label is an unbounded leak in whatever scrapes it.
+The last three families describe this process rather than the cache, because that is what they are about: a connection pool and a network path exist only while the daemon holding them does. The two remote families are absent altogether when no shared tier is configured — a local-only cache has not failed to reuse a connection, it has not tried.
+
+Five labels, all with a short fixed set of values, and one `le` per histogram bucket. Nothing is ever labelled by digest, key, path, or client: a series is created for every distinct label value and never forgotten, so a per-request label is an unbounded leak in whatever scrapes it.
 
 **These routes are off unless asked for, and that is the conservative default on purpose.** They describe the host — pid, uptime, entry counts, byte budgets — where the cache routes beside them describe only blobs somebody already knew the digest of. `PLAID_GOCACHE_BAZEL_ADDR` takes a full address precisely because the choice between loopback and every interface is the difference between a private cache and a public one, and this is a second disclosure on top of that choice, so it is a second decision. One setting governs both routes, because they disclose the same thing and a split would offer a choice with nothing behind it.
 
@@ -568,6 +573,15 @@ So the loss is reported where it happens rather than only where it lands:
 Two settings adjust the trade. `PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH` is the backlog each worker may accumulate; raising it absorbs a longer burst in exchange for memory, since the queue holds a job per waiting entry. `PLAID_GOCACHE_UPLOAD_CONCURRENCY` drains it faster, which is the better answer when the bucket, and not the burst, is the constraint.
 
 `PLAID_GOCACHE_UPLOAD_BLOCK_TIMEOUT` reverses the trade rather than adjusting it: a put whose queue is full waits up to that long for room and only then drops. It is off by default and should stay off for ordinary builds — it makes a saturated queue something a build can wait on, which is exactly what the drop exists to prevent. It is there for the runs where the upload is the point and the local copy is not, such as a warmer filling a bucket for everyone else, and the wait is bounded so that opting in cannot turn into an unbounded stall. Shutdown does not wait it out either: a put still waiting when the daemon stops drops its upload and lets the process exit.
+
+#### Connection reuse and how long the tier takes
+
+Two numbers about the transport rather than the cache, because a shared tier that works can still be slower than it needs to be:
+
+- `plaid_cache_remote_requests_total{conn}` splits every request by whether the transport had an idle connection to give it. An HTTP transport keeps a bounded number of idle connections per host, so a process making more concurrent requests than that bound closes connections it is about to want again, and each replacement pays a TCP handshake and a TLS handshake before its request is sent at all. A `conn="new"` share that tracks the upload concurrency rather than the number of distinct hosts is what that looks like. `plaid-cache status` prints the ratio as its `conns` line.
+- `plaid_cache_remote_operation_duration_seconds{operation,outcome}` says what those round trips cost. It is a histogram because the read path blocks the caller and the tail is the part that does: a mean hides the request that waited on a handshake behind a hundred that did not. Buckets run from 1ms to 10s, with most of the resolution below 100ms, which is the band where establishing a connection and reusing one are distinguishable. A get is measured to the open body rather than through it, so reads are first-byte latency; a put is the whole transfer, so its distribution reflects object size as well.
+
+Nothing in this repository tunes the connection pool: the settings are the AWS SDK's, and the client the SDK builds is wrapped to be counted rather than replaced. Tuning it before these two numbers exist would be changing behaviour and measuring it in the same breath, which is how a change nobody can evaluate gets made.
 
 Keys are laid out as `[<prefix>/]action/<xx>/<hex-action-id>` and `[<prefix>/]output/<xx>/<hex-output-id>`, mirroring the de-facto convention so a bucket stays interoperable with other `GOCACHEPROG` implementations.
 

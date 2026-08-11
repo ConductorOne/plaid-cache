@@ -9,6 +9,8 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/conductorone/plaid-cache/internal/remote"
 )
 
 // remoteMtime is a fixed instant carried across the shared tier, so a faulted-in
@@ -203,5 +205,54 @@ func TestUploadErrorsNeverFailPut(t *testing.T) {
 	}
 	if res := tc.get(t, a); res.Miss {
 		t.Fatal("Get after a failed upload = a miss, want a local hit")
+	}
+}
+
+// countingRemote is a fake that also keeps transport accounting, as the S3
+// backend does. It exists to pin the assertion below without an S3 client: what
+// is being tested is that a Cache passes on whatever its backend keeps, not what
+// the backend counts.
+type countingRemote struct {
+	*fakeRemote
+	snap remote.StatsSnapshot
+}
+
+// Stats satisfies remote.Statser.
+func (c countingRemote) Stats() remote.StatsSnapshot { return c.snap }
+
+// TestRemoteStatsFollowTheBackend pins that a Cache reports transport accounting
+// only from a backend that keeps it, and reports it unchanged.
+//
+// The distinction is what lets the daemon leave the families out of a scrape
+// entirely rather than publishing zeros: a local-only cache has no connection
+// pool to describe, and zeros would describe one that never reuses anything.
+func TestRemoteStatsFollowTheBackend(t *testing.T) {
+	tc := newTestCache(t, withRemote())
+	if snap, ok := tc.cache.RemoteStats(); ok {
+		t.Fatalf("RemoteStats over a backend that keeps none = %+v, true; want false", snap)
+	}
+
+	want := remote.StatsSnapshot{
+		ConnsReused: 40,
+		ConnsNew:    3,
+		Ops: []remote.OpDurations{{
+			Operation: "put_object", Outcome: "ok", Count: 3, SumSeconds: 0.5,
+			Buckets: make([]int64, len(remote.DurationBuckets())),
+		}},
+	}
+	counting := countingRemote{fakeRemote: newFakeRemote(), snap: want}
+	c := New(Params{Config: tc.cfg, Index: tc.idx, Blobs: tc.blobs, Remote: counting})
+	t.Cleanup(func() { _ = c.Close() })
+
+	got, ok := c.RemoteStats()
+	if !ok {
+		t.Fatal("RemoteStats over a counting backend reported none")
+	}
+	if got.ConnsReused != want.ConnsReused || got.ConnsNew != want.ConnsNew {
+		t.Fatalf("conns = %d reused, %d new; want %d and %d",
+			got.ConnsReused, got.ConnsNew, want.ConnsReused, want.ConnsNew)
+	}
+	if len(got.Ops) != 1 || got.Ops[0].Operation != "put_object" || got.Ops[0].Count != 3 {
+		t.Fatalf("ops = %+v, want the backend's own", got.Ops)
 	}
 }

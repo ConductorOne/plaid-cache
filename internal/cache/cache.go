@@ -355,6 +355,22 @@ func (c *Cache) Metrics() MetricsSnapshot { return c.metrics.Snapshot() }
 // counter can only be read after the entries are already lost.
 func (c *Cache) UploadQueue() (depth, capacity int) { return c.uploads.queue() }
 
+// RemoteStats reports what the shared tier's transport has done — connection
+// reuse and per-operation latency — and false when the backend keeps no such
+// accounting.
+//
+// Like the upload queue, this is the process's own and not persisted: it
+// describes a connection pool that exists only while this daemon does, and a
+// lifetime total of handshakes would say nothing about the pool serving builds
+// now.
+func (c *Cache) RemoteStats() (remote.StatsSnapshot, bool) {
+	s, ok := c.rem.(remote.Statser)
+	if !ok {
+		return remote.StatsSnapshot{}, false
+	}
+	return s.Stats(), true
+}
+
 // Evict runs one eviction pass, removing orphaned bodies as the index
 // releases them.
 func (c *Cache) Evict(ctx context.Context) (index.EvictResult, error) {

@@ -18,6 +18,7 @@ import (
 
 	"github.com/conductorone/plaid-cache/internal/cache"
 	"github.com/conductorone/plaid-cache/internal/index"
+	"github.com/conductorone/plaid-cache/internal/remote"
 )
 
 // Op selects what a connection is for. It is exchanged once, before any
@@ -166,6 +167,15 @@ type StatusResponse struct {
 	// says nothing about a queue that is one burst away from losing them.
 	UploadQueueDepth    int `json:"upload_queue_depth"`
 	UploadQueueCapacity int `json:"upload_queue_capacity"`
+
+	// Remote is the shared tier's transport accounting: how often a request was
+	// given a connection that was already open, and how long each operation
+	// took. It is nil when the backend keeps none, which is every local-only
+	// cache, so a reader can tell "nothing to report" from "nothing happened".
+	//
+	// It is this process's own, for the same reason the queue above is: it
+	// describes a connection pool that lives and dies with this daemon.
+	Remote *remote.StatsSnapshot `json:"remote,omitempty"`
 
 	// The durations above again, in seconds.
 	//
