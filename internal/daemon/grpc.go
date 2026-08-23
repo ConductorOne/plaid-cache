@@ -49,6 +49,8 @@ func (s *Server) ServeBazelGRPC(ctx context.Context, ln net.Listener) error {
 		Logf:   s.logf,
 		Verify: !s.cfg.DisableBazelVerify,
 	})
+	s.setREAPI(svc)
+	defer s.setREAPI(nil)
 	g := grpc.NewServer(reapi.ServerOptions()...)
 	svc.Register(g)
 

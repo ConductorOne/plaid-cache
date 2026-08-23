@@ -161,6 +161,17 @@ func (s *Store) Open(ctx context.Context, k Kind, d Digest) (*os.File, int64, bo
 	return f, fi.Size(), true
 }
 
+// OpenLocal returns a locally resident body without faulting one in from the remote tier.
+//
+// The Has probe refreshes the entry before Open reads it, so eviction cannot
+// reclaim a body this caller is about to inspect.
+func (s *Store) OpenLocal(ctx context.Context, k Kind, d Digest) (*os.File, int64, bool) {
+	if !s.Has(ctx, k, d) {
+		return nil, 0, false
+	}
+	return s.Open(ctx, k, d)
+}
+
 // Has reports whether a digest already resolves to a readable body in a
 // keyspace, and refreshes its last use if it does.
 //

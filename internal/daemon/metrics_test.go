@@ -12,6 +12,7 @@ import (
 
 	"github.com/conductorone/plaid-cache/internal/cache"
 	"github.com/conductorone/plaid-cache/internal/index"
+	"github.com/conductorone/plaid-cache/internal/reapi"
 	"github.com/conductorone/plaid-cache/internal/remote"
 )
 
@@ -203,6 +204,10 @@ func TestMetricsExposition(t *testing.T) {
 		UploadQueueDepth:    12,
 		UploadQueueCapacity: 512,
 
+		RRCC: reapi.RRCCMetricsSnapshot{
+			Complete: 11, MarkerMissing: 2, TreeMissing: 3, FileMissing: 5, Malformed: 7,
+		},
+
 		Remote: &remote.StatsSnapshot{
 			ConnsReused: 190,
 			ConnsNew:    22,
@@ -244,6 +249,7 @@ func TestMetricsExposition(t *testing.T) {
 	for _, f := range []string{
 		"plaid_cache_gets_total", "plaid_cache_puts_total", "plaid_cache_repairs_total",
 		"plaid_cache_uploads_total", "plaid_cache_compactions_total",
+		"plaid_cache_rrcc_local_closure_checks_total",
 		// Requests that opened a connection and requests that did not: both only
 		// ever rise, so a rate() over either is the question worth asking.
 		"plaid_cache_remote_requests_total",
@@ -278,6 +284,11 @@ func TestMetricsExposition(t *testing.T) {
 	e.wantSample(t, `plaid_cache_uploads_total{result="dropped"}`, 2)
 	e.wantSample(t, `plaid_cache_uploads_total{result="skipped"}`, 3)
 	e.wantSample(t, "plaid_cache_compactions_total", 7)
+	e.wantSample(t, `plaid_cache_rrcc_local_closure_checks_total{result="complete"}`, 11)
+	e.wantSample(t, `plaid_cache_rrcc_local_closure_checks_total{result="marker_missing"}`, 2)
+	e.wantSample(t, `plaid_cache_rrcc_local_closure_checks_total{result="tree_missing"}`, 3)
+	e.wantSample(t, `plaid_cache_rrcc_local_closure_checks_total{result="file_missing"}`, 5)
+	e.wantSample(t, `plaid_cache_rrcc_local_closure_checks_total{result="malformed"}`, 7)
 	e.wantSample(t, "plaid_cache_upload_queue_depth", 12)
 	e.wantSample(t, "plaid_cache_upload_queue_capacity", 512)
 

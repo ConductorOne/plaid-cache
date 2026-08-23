@@ -18,6 +18,7 @@ import (
 
 	"github.com/conductorone/plaid-cache/internal/cache"
 	"github.com/conductorone/plaid-cache/internal/index"
+	"github.com/conductorone/plaid-cache/internal/reapi"
 	"github.com/conductorone/plaid-cache/internal/remote"
 )
 
@@ -156,7 +157,10 @@ type StatusResponse struct {
 	OldestAge string                `json:"oldest_age,omitempty"`
 	NewestAge string                `json:"newest_age,omitempty"`
 	Metrics   cache.MetricsSnapshot `json:"metrics"`
-	Err       string                `json:"err,omitempty"`
+
+	// RRCC records local closure observations for synthetic repository-cache entries.
+	RRCC reapi.RRCCMetricsSnapshot `json:"rrcc"`
+	Err  string                    `json:"err,omitempty"`
 
 	// UploadQueueDepth is how many uploads to the shared tier are waiting on
 	// this daemon's pool right now, and UploadQueueCapacity how many may.

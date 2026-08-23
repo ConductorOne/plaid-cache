@@ -130,6 +130,13 @@ func renderMetrics(r StatusResponse) []byte {
 	writeFamily(&b, "compactions_total", "counter",
 		"Index compactions, which reclaim the space pruning leaves behind.",
 		sample{value: float64(life.Compactions)})
+	writeFamily(&b, "rrcc_local_closure_checks_total", "counter",
+		"Experimental remote repository-contents cache closures observed locally, by completeness.",
+		sample{labels: labels("result", "complete"), value: float64(r.RRCC.Complete)},
+		sample{labels: labels("result", "marker_missing"), value: float64(r.RRCC.MarkerMissing)},
+		sample{labels: labels("result", "tree_missing"), value: float64(r.RRCC.TreeMissing)},
+		sample{labels: labels("result", "file_missing"), value: float64(r.RRCC.FileMissing)},
+		sample{labels: labels("result", "malformed"), value: float64(r.RRCC.Malformed)})
 
 	// The shared tier's transport, which is the only part of this report about how
 	// the cache reaches the network rather than about what it holds. Absent when
