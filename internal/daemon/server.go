@@ -23,6 +23,7 @@ import (
 	"github.com/conductorone/plaid-cache/internal/config"
 	"github.com/conductorone/plaid-cache/internal/ids"
 	"github.com/conductorone/plaid-cache/internal/index"
+	"github.com/conductorone/plaid-cache/internal/reapi"
 	"github.com/conductorone/plaid-cache/internal/wire"
 )
 
@@ -59,6 +60,10 @@ type Server struct {
 	bazelOnce  sync.Once
 	bazelStore *bazel.Store
 	bazelErr   error
+
+	// reapiMu protects the current gRPC service's process-local observability.
+	reapiMu sync.RWMutex
+	reapi   *reapi.Server
 
 	// cleanOnce gates the sweep of abandoned temporaries. See cleanTemp.
 	cleanOnce sync.Once
@@ -136,6 +141,23 @@ func (s *Server) sessionIdleTimeout() time.Duration {
 		return s.sessionIdle
 	}
 	return sessionIdleTimeout
+}
+
+// setREAPI publishes the gRPC service whose process-local metrics status reads.
+func (s *Server) setREAPI(svc *reapi.Server) {
+	s.reapiMu.Lock()
+	defer s.reapiMu.Unlock()
+	s.reapi = svc
+}
+
+// rrccMetrics returns the current gRPC service's RRCC observations.
+func (s *Server) rrccMetrics() reapi.RRCCMetricsSnapshot {
+	s.reapiMu.RLock()
+	defer s.reapiMu.RUnlock()
+	if s.reapi == nil {
+		return reapi.RRCCMetricsSnapshot{}
+	}
+	return s.reapi.RRCCMetrics()
 }
 
 // Listen binds the unix socket.
@@ -603,6 +625,7 @@ func (s *Server) status() StatusResponse {
 		Uptime:        uptime.String(),
 		UptimeSeconds: uptime.Seconds(),
 		Metrics:       s.cache.Metrics(),
+		RRCC:          s.rrccMetrics(),
 	}
 	r.UploadQueueDepth, r.UploadQueueCapacity = s.cache.UploadQueue()
 	if rs, ok := s.cache.RemoteStats(); ok {

@@ -97,6 +97,8 @@ type Server struct {
 	uploads *uploads
 	logf    cache.Logf
 
+	rrccMetrics rrccMetrics
+
 	// verify mirrors the store's digest checking. It is read here to decide
 	// whether a client may name a digest function this server cannot check,
 	// which is the one protocol-level consequence of turning verification off.
