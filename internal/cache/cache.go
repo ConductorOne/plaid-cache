@@ -246,6 +246,25 @@ func (c *Cache) getRemote(ctx context.Context, a ids.ActionID) (Result, error) {
 	return Result{OutputID: outputID, Size: size, DiskPath: path, Time: time.Unix(0, created)}, nil
 }
 
+// HasRemote reports whether an action and its body are both available from the shared tier.
+//
+// It opens the remote body and closes it without reading, which obtains the
+// storage service's presence verdict without faulting bytes into the local tier.
+func (c *Cache) HasRemote(ctx context.Context, a ids.ActionID) bool {
+	if !c.cfg.RemoteEnabled() {
+		return false
+	}
+	outputID, _, err := c.rem.GetAction(ctx, a)
+	if err != nil {
+		return false
+	}
+	body, _, err := c.rem.GetObject(ctx, outputID)
+	if err != nil {
+		return false
+	}
+	return body.Close() == nil
+}
+
 // Has reports whether an action already resolves to a readable body,
 // refreshing its last-used time if it does.
 //

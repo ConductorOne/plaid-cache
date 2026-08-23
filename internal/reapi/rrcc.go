@@ -51,15 +51,15 @@ func (m *rrccMetrics) Snapshot() RRCCMetricsSnapshot {
 func (s *Server) RRCCMetrics() RRCCMetricsSnapshot { return s.rrccMetrics.Snapshot() }
 
 // validateRRCCLocalClosure accepts ordinary action results and synthetic
-// repository-cache results whose complete closure is local. A missing local body
-// is a cache miss: returning the ActionResult would make Bazel fail later while
-// lazily reading the injected repository.
+// repository-cache results whose complete closure is available locally or from
+// the shared tier. A missing body is a cache miss: returning the ActionResult
+// would make Bazel fail later while lazily reading the injected repository.
 func (s *Server) validateRRCCLocalClosure(ctx context.Context, result *repb.ActionResult) bool {
 	marker, tree, ok := rrccOutputs(result)
 	if !ok {
 		return true
 	}
-	if !s.hasLocalCAS(ctx, marker) {
+	if !s.hasCAS(ctx, marker) {
 		s.rrccMetrics.markerMissing.Add(1)
 		s.logf("bazel grpc: rrcc local closure missing marker %s", marker.GetHash())
 		return false
@@ -71,6 +71,9 @@ func (s *Server) validateRRCCLocalClosure(ctx context.Context, result *repb.Acti
 		return false
 	}
 	file, size, ok := s.store.OpenLocal(ctx, bazel.KindCAS, treeDigest)
+	if !ok && s.store.HasRemote(ctx, bazel.KindCAS, treeDigest) {
+		file, size, ok = s.store.Open(ctx, bazel.KindCAS, treeDigest)
+	}
 	if !ok {
 		s.rrccMetrics.treeMissing.Add(1)
 		s.logf("bazel grpc: rrcc local closure missing tree %s", tree.GetHash())
@@ -96,7 +99,7 @@ func (s *Server) validateRRCCLocalClosure(ctx context.Context, result *repb.Acti
 	}
 	for _, directory := range append([]*repb.Directory{contents.GetRoot()}, contents.GetChildren()...) {
 		for _, node := range directory.GetFiles() {
-			if !s.hasLocalCAS(ctx, node.GetDigest()) {
+			if !s.hasCAS(ctx, node.GetDigest()) {
 				s.rrccMetrics.fileMissing.Add(1)
 				s.logf("bazel grpc: rrcc local closure missing file %s", node.GetDigest().GetHash())
 				return false
@@ -107,10 +110,10 @@ func (s *Server) validateRRCCLocalClosure(ctx context.Context, result *repb.Acti
 	return true
 }
 
-// hasLocalCAS reports whether a valid digest is currently present in the local cache.
-func (s *Server) hasLocalCAS(ctx context.Context, d *repb.Digest) bool {
+// hasCAS reports whether a valid digest is available locally or from the shared tier.
+func (s *Server) hasCAS(ctx context.Context, d *repb.Digest) bool {
 	parsed, err := digest(d)
-	return err == nil && s.store.Has(ctx, bazel.KindCAS, parsed)
+	return err == nil && (s.store.Has(ctx, bazel.KindCAS, parsed) || s.store.HasRemote(ctx, bazel.KindCAS, parsed))
 }
 
 // rrccOutputs recognizes Bazel's synthetic remote repository-contents result shape.
