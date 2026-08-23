@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -30,7 +32,40 @@ func TestRRCCLocalClosureMetrics(t *testing.T) {
 	}
 }
 
-// TestRRCCLocalClosureMetricsRecordsMissingFile records a missing nested repository file.
+// TestRRCCLocalClosureMetricsRecordsMissingMarker turns a missing repository marker into a miss.
+func TestRRCCLocalClosureMetricsRecordsMissingMarker(t *testing.T) {
+	h := newHarness(t)
+	action := digestOf([]byte("rrcc missing marker"))
+	missingMarker := digestOf([]byte("missing marker"))
+	tree := putTree(t, h, &repb.Tree{})
+
+	putRRCCActionResult(t, h, action, missingMarker, tree)
+	if _, err := h.ac.GetActionResult(ctx(t), &repb.GetActionResultRequest{ActionDigest: action}); status.Code(err) != codes.NotFound {
+		t.Fatalf("GetActionResult = %v, want NotFound", err)
+	}
+	if got := h.srv.RRCCMetrics(); got.MarkerMissing != 1 {
+		t.Fatalf("RRCCMetrics = %+v, want one missing marker", got)
+	}
+}
+
+// TestRRCCLocalClosureMetricsRecordsMissingTree turns a missing repository Tree into a miss.
+func TestRRCCLocalClosureMetricsRecordsMissingTree(t *testing.T) {
+	h := newHarness(t)
+	marker := []byte("recorded inputs")
+	putBlob(t, h, marker)
+	action := digestOf([]byte("rrcc missing tree"))
+	missingTree := digestOf([]byte("missing Tree"))
+
+	putRRCCActionResult(t, h, action, digestOf(marker), missingTree)
+	if _, err := h.ac.GetActionResult(ctx(t), &repb.GetActionResultRequest{ActionDigest: action}); status.Code(err) != codes.NotFound {
+		t.Fatalf("GetActionResult = %v, want NotFound", err)
+	}
+	if got := h.srv.RRCCMetrics(); got.TreeMissing != 1 {
+		t.Fatalf("RRCCMetrics = %+v, want one missing tree", got)
+	}
+}
+
+// TestRRCCLocalClosureMetricsRecordsMissingFile turns a missing nested repository file into a miss.
 func TestRRCCLocalClosureMetricsRecordsMissingFile(t *testing.T) {
 	h := newHarness(t)
 	marker := []byte("recorded inputs")
@@ -41,8 +76,8 @@ func TestRRCCLocalClosureMetricsRecordsMissingFile(t *testing.T) {
 	action := digestOf([]byte("rrcc missing file"))
 
 	putRRCCActionResult(t, h, action, digestOf(marker), treeDigest)
-	if _, err := h.ac.GetActionResult(ctx(t), &repb.GetActionResultRequest{ActionDigest: action}); err != nil {
-		t.Fatalf("GetActionResult: %v", err)
+	if _, err := h.ac.GetActionResult(ctx(t), &repb.GetActionResultRequest{ActionDigest: action}); status.Code(err) != codes.NotFound {
+		t.Fatalf("GetActionResult = %v, want NotFound", err)
 	}
 	if got := h.srv.RRCCMetrics(); got.FileMissing != 1 {
 		t.Fatalf("RRCCMetrics = %+v, want one missing file", got)

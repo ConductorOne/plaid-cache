@@ -50,59 +50,61 @@ func (m *rrccMetrics) Snapshot() RRCCMetricsSnapshot {
 // RRCCMetrics returns local-only closure observations accumulated by this REAPI server.
 func (s *Server) RRCCMetrics() RRCCMetricsSnapshot { return s.rrccMetrics.Snapshot() }
 
-// observeRRCCLocalClosure records whether a synthetic repository-cache result is
-// wholly available in the local cache. It deliberately does not alter the response:
-// remote-only entries remain valid until remote presence checks are introduced.
-func (s *Server) observeRRCCLocalClosure(ctx context.Context, result *repb.ActionResult) {
+// validateRRCCLocalClosure accepts ordinary action results and synthetic
+// repository-cache results whose complete closure is local. A missing local body
+// is a cache miss: returning the ActionResult would make Bazel fail later while
+// lazily reading the injected repository.
+func (s *Server) validateRRCCLocalClosure(ctx context.Context, result *repb.ActionResult) bool {
 	marker, tree, ok := rrccOutputs(result)
 	if !ok {
-		return
+		return true
 	}
 	if !s.hasLocalCAS(ctx, marker) {
 		s.rrccMetrics.markerMissing.Add(1)
 		s.logf("bazel grpc: rrcc local closure missing marker %s", marker.GetHash())
-		return
+		return false
 	}
 	treeDigest, err := digest(tree)
 	if err != nil {
 		s.rrccMetrics.malformed.Add(1)
 		s.logf("bazel grpc: rrcc local closure has malformed tree digest: %v", err)
-		return
+		return false
 	}
 	file, size, ok := s.store.OpenLocal(ctx, bazel.KindCAS, treeDigest)
 	if !ok {
 		s.rrccMetrics.treeMissing.Add(1)
 		s.logf("bazel grpc: rrcc local closure missing tree %s", tree.GetHash())
-		return
+		return false
 	}
 	defer func() { _ = file.Close() }()
 	if size > rrccTreeLimit {
 		s.rrccMetrics.malformed.Add(1)
 		s.logf("bazel grpc: rrcc local closure tree %s is %d bytes, refusing to inspect", tree.GetHash(), size)
-		return
+		return false
 	}
 	body, err := io.ReadAll(io.LimitReader(file, rrccTreeLimit))
 	if err != nil {
 		s.rrccMetrics.malformed.Add(1)
 		s.logf("bazel grpc: read rrcc tree %s: %v", tree.GetHash(), err)
-		return
+		return false
 	}
 	var contents repb.Tree
 	if err := proto.Unmarshal(body, &contents); err != nil {
 		s.rrccMetrics.malformed.Add(1)
 		s.logf("bazel grpc: rrcc tree %s does not parse: %v", tree.GetHash(), err)
-		return
+		return false
 	}
 	for _, directory := range append([]*repb.Directory{contents.GetRoot()}, contents.GetChildren()...) {
 		for _, node := range directory.GetFiles() {
 			if !s.hasLocalCAS(ctx, node.GetDigest()) {
 				s.rrccMetrics.fileMissing.Add(1)
 				s.logf("bazel grpc: rrcc local closure missing file %s", node.GetDigest().GetHash())
-				return
+				return false
 			}
 		}
 	}
 	s.rrccMetrics.complete.Add(1)
+	return true
 }
 
 // hasLocalCAS reports whether a valid digest is currently present in the local cache.
