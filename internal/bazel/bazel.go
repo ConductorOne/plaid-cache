@@ -82,6 +82,7 @@ var ErrDigestMismatch = errors.New("body does not match its digest")
 type store interface {
 	Get(ctx context.Context, a ids.ActionID) (cache.Result, error)
 	Has(ctx context.Context, a ids.ActionID) bool
+	HasRemote(ctx context.Context, a ids.ActionID) bool
 	PutStaged(ctx context.Context, a ids.ActionID, o ids.OutputID, stagedPath string, size int64) (string, error)
 }
 
@@ -185,6 +186,11 @@ func (s *Store) OpenLocal(ctx context.Context, k Kind, d Digest) (*os.File, int6
 // free to break. Counting the probe as active use is what keeps the promise.
 func (s *Store) Has(ctx context.Context, k Kind, d Digest) bool {
 	return s.cache.Has(ctx, k.actionID(d))
+}
+
+// HasRemote reports whether a digest is available from the shared cache tier.
+func (s *Store) HasRemote(ctx context.Context, k Kind, d Digest) bool {
+	return s.cache.HasRemote(ctx, k.actionID(d))
 }
 
 // Put stores a body under a digest, streaming it and hashing it on the way

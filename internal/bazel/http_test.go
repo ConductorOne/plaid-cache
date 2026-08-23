@@ -420,6 +420,9 @@ func (failingStore) Get(context.Context, ids.ActionID) (cache.Result, error) {
 // Has always reports absent, so an upload is always attempted.
 func (failingStore) Has(context.Context, ids.ActionID) bool { return false }
 
+// HasRemote always reports absent because the test store has no shared tier.
+func (failingStore) HasRemote(context.Context, ids.ActionID) bool { return false }
+
 // PutStaged always fails.
 func (failingStore) PutStaged(context.Context, ids.ActionID, ids.OutputID, string, int64) (string, error) {
 	return "", errors.New("no space left on device")
