@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -140,6 +141,35 @@ func TestGCFlagsAreUsageErrorsNotFailures(t *testing.T) {
 		if errb.Len() == 0 {
 			t.Fatalf("run(%v) produced no diagnostic", args)
 		}
+	}
+}
+
+// TestServePprofAddressFlagOverridesEnvironment pins that an explicit profile
+// address wins over the environment, matching the other optional listeners.
+func TestServePprofAddressFlagOverridesEnvironment(t *testing.T) {
+	a, _, errb := newApp(t, "serve", "-pprof-addr", "not-an-address")
+	t.Setenv("PLAID_GOCACHE_PPROF_ADDR", "127.0.0.1:0")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() { done <- a.runServe(ctx) }()
+
+	select {
+	case code := <-done:
+		if code != exitError {
+			t.Fatalf("runServe(-pprof-addr) = %d, want %d (stderr: %s)", code, exitError, errb)
+		}
+		if !strings.Contains(errb.String(), "pprof listener") {
+			t.Fatalf("stderr = %q, want the pprof listener error", errb)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("runServe did not return after cancelling its context")
+		}
+		t.Fatal("runServe did not use the explicit pprof address")
 	}
 }
 

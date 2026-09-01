@@ -123,6 +123,7 @@ Bazel's two keyspaces map onto what the index already stores. A CAS blob is addr
 
 Bazel traffic shows up in `plaid-cache status` and `plaid-cache stats` beside the toolchain's, since both go through the same tiers.
 
+
 #### Choosing a protocol
 
 The two protocols reach the same store, so the choice is about what a client can say over each.
@@ -206,6 +207,30 @@ An action-cache entry names CAS blobs that are stored, and evicted, separately f
 Bazel treats the resulting dangling reference as a failed download rather than as corruption, and `--experimental_remote_cache_eviction_retries` (5 by default) bounds how many times it will reset its state and retry rather than failing the build. Serving a plain miss for the absent blob is the whole of the server's obligation, and it is enough: evicting the entire cache in between a `--remote_download_outputs=minimal` build and the request for its 400 MB output re-ran the action and completed the build successfully. Verifying the reference at lookup time would mean parsing `ActionResult` and probing every blob it names on the hot path, which costs more than the occasional re-run it would save, so it is documented here rather than implemented.
 
 If you set a lifecycle rule on the bucket, expiring action records earlier than output bodies keeps the dangling reference on the harmless side: an action record with no body is a miss, where a body with no action record is merely unreferenced.
+
+### Runtime profiling
+
+Go runtime profiles are available only from a separate, opt-in loopback
+listener:
+
+```sh
+plaid-cache serve -pprof-addr 127.0.0.1:6060
+```
+
+The listener serves the standard `/debug/pprof/` endpoints. For example:
+
+```sh
+go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+go tool pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'
+curl http://127.0.0.1:6060/debug/pprof/goroutine
+curl http://127.0.0.1:6060/debug/pprof/mutex
+curl http://127.0.0.1:6060/debug/pprof/block
+curl -o trace.out 'http://127.0.0.1:6060/debug/pprof/trace?seconds=5'
+```
+
+`PLAID_GOCACHE_PPROF_ADDR` is the equivalent environment or configuration-file
+setting. It defaults to empty, accepts only loopback IP addresses, has no
+authentication, and never adds profiling routes to the Bazel HTTP listener.
 
 ### Monitoring a shared daemon
 
@@ -539,6 +564,7 @@ be a surprising amount of reach for this one to have.
 | `PLAID_GOCACHE_COMPACT_AFTER` | Pruned entries that must accumulate before the index is compacted. Deletes in an LSM are writes, so pruning grows the index until a compaction reclaims it. | `1000` |
 | `PLAID_GOCACHE_BAZEL_ADDR` | Address for the Bazel HTTP remote cache, e.g. `localhost:9095`. Empty serves it not at all. | empty |
 | `PLAID_GOCACHE_BAZEL_GRPC_ADDR` | Address for the Bazel gRPC remote cache, e.g. `localhost:9096`. Empty serves it not at all. | empty |
+| `PLAID_GOCACHE_PPROF_ADDR` | Loopback address for the separate Go runtime-profiling listener, e.g. `127.0.0.1:6060`. Empty serves it not at all. | empty |
 | `PLAID_GOCACHE_BAZEL_MONITORING` | `1` also serves `/status` and `/metrics` on the Bazel HTTP address, for `plaid-cache status -from` and for a Prometheus scrape. Off by default: they describe the host rather than the cache's contents. | unset |
 | `PLAID_GOCACHE_DISABLE_BAZEL_VERIFY` | `1` stops both Bazel listeners from checking that an uploaded CAS body hashes to the digest naming it, and lets a gRPC client name a digest function this cache cannot compute. For clients whose digest function is not SHA-256. | unset |
 | `PLAID_GOCACHE_DISABLE_EVICTION` | `1` disables eviction entirely. | unset |

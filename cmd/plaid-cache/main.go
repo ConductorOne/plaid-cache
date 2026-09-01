@@ -162,6 +162,12 @@ cache already holds, so an action that re-runs stops re-uploading outputs the
 cache has. Both may be served at once, and a build that uses either reads what
 the other stored.
 
+-pprof-addr serves Go runtime profiles on its own loopback address rather than
+adding them to the Bazel listener. It is off unless asked for and has no
+authentication:
+  plaid-cache serve -pprof-addr 127.0.0.1:6060
+  go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+
 -bazel-monitoring adds two routes to the HTTP address — /status and /metrics —
 so a daemon serving a room full of builders can be read without a shell on its
 host. They are off unless asked for, because they describe the host rather than
