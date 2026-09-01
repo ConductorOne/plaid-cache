@@ -107,6 +107,9 @@ func TestLoadDefaults(t *testing.T) {
 	if c.BazelAddr != "" {
 		t.Fatalf("BazelAddr = %q by default, want it empty", c.BazelAddr)
 	}
+	if c.PprofAddr != "" {
+		t.Fatalf("PprofAddr = %q by default, want it empty", c.PprofAddr)
+	}
 	if c.DisableBazelVerify {
 		t.Fatalf("DisableBazelVerify = true by default, want uploads verified")
 	}
@@ -290,6 +293,8 @@ func clearEnv(t *testing.T) {
 		"PLAID_GOCACHE_COMPACT_AFTER",
 		"PLAID_GOCACHE_BAZEL_ADDR",
 		"PLAID_GOCACHE_BAZEL_GRPC_ADDR",
+		"PLAID_GOCACHE_BAZEL_MONITORING",
+		"PLAID_GOCACHE_PPROF_ADDR",
 		"PLAID_GOCACHE_DISABLE_BAZEL_VERIFY",
 		"XDG_CACHE_HOME",
 	} {
@@ -306,16 +311,16 @@ func clearEnv(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 }
 
-// TestLoadBazelSettings pins that the Bazel listener is configurable from the
-// environment as well as from the serve flag, since a supervised daemon is
-// started from a unit file rather than by hand.
-func TestLoadBazelSettings(t *testing.T) {
+// TestLoadListenerSettings pins that optional TCP listeners are configurable
+// from the environment as well as from the serve flag.
+func TestLoadListenerSettings(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("PLAID_GOCACHE_DIR", t.TempDir())
 	t.Setenv("PLAID_GOCACHE_BAZEL_ADDR", "localhost:9095")
 	t.Setenv("PLAID_GOCACHE_BAZEL_GRPC_ADDR", "localhost:9096")
 	t.Setenv("PLAID_GOCACHE_BAZEL_MONITORING", "1")
 	t.Setenv("PLAID_GOCACHE_DISABLE_BAZEL_VERIFY", "1")
+	t.Setenv("PLAID_GOCACHE_PPROF_ADDR", "127.0.0.1:6060")
 
 	c, err := Load()
 	if err != nil {
@@ -326,6 +331,9 @@ func TestLoadBazelSettings(t *testing.T) {
 	}
 	if c.BazelGRPCAddr != "localhost:9096" {
 		t.Fatalf("BazelGRPCAddr = %q, want %q", c.BazelGRPCAddr, "localhost:9096")
+	}
+	if c.PprofAddr != "127.0.0.1:6060" {
+		t.Fatalf("PprofAddr = %q, want %q", c.PprofAddr, "127.0.0.1:6060")
 	}
 	if !c.BazelMonitoring {
 		t.Fatalf("BazelMonitoring = false, want true")
@@ -352,15 +360,16 @@ func TestMonitoringIsOffUnlessAsked(t *testing.T) {
 	}
 }
 
-// TestBazelSettingsAreValidFileKeys pins that every Bazel setting can be written to
-// the configuration file. An unknown key there is a hard error, so a setting
-// missing from the accepted set is one a user cannot persist.
-func TestBazelSettingsAreValidFileKeys(t *testing.T) {
+// TestListenerSettingsAreValidFileKeys pins that every optional TCP listener
+// setting can be written to the configuration file. An unknown key there is a
+// hard error, so a setting missing from the accepted set is one a user cannot
+// persist.
+func TestListenerSettingsAreValidFileKeys(t *testing.T) {
 	clearEnv(t)
 	dir := t.TempDir()
 	t.Setenv("PLAID_GOCACHE_DIR", dir)
 	path := filepath.Join(dir, "config")
-	if err := os.WriteFile(path, []byte("bazel-addr = localhost:9096\nbazel-grpc-addr = localhost:9097\nbazel-monitoring = 1\ndisable-bazel-verify = 1\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("bazel-addr = localhost:9096\nbazel-grpc-addr = localhost:9097\nbazel-monitoring = 1\npprof-addr = 127.0.0.1:6060\ndisable-bazel-verify = 1\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	t.Setenv(configFileEnvVar, path)
@@ -374,6 +383,9 @@ func TestBazelSettingsAreValidFileKeys(t *testing.T) {
 	}
 	if c.BazelGRPCAddr != "localhost:9097" {
 		t.Fatalf("BazelGRPCAddr = %q, want %q", c.BazelGRPCAddr, "localhost:9097")
+	}
+	if c.PprofAddr != "127.0.0.1:6060" {
+		t.Fatalf("PprofAddr = %q, want %q", c.PprofAddr, "127.0.0.1:6060")
 	}
 	if !c.BazelMonitoring {
 		t.Fatalf("BazelMonitoring = false, want true")

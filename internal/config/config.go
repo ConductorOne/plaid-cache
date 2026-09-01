@@ -171,6 +171,14 @@ type Config struct {
 	// bind applies, and for the same reason.
 	BazelGRPCAddr string
 
+	// PprofAddr is the loopback TCP address that serves Go runtime profiles,
+	// e.g. "127.0.0.1:6060". Empty, the default, serves no profiles.
+	//
+	// Profiles expose process runtime data and have no authentication, so the
+	// listener accepts only loopback IP addresses. It is separate from
+	// BazelAddr so enabling diagnostics cannot add routes to the cache listener.
+	PprofAddr string
+
 	// BazelMonitoring serves the two monitoring routes — /status and /metrics —
 	// on the Bazel HTTP listener, so that `plaid-cache status -from` and a
 	// Prometheus scrape can read a daemon an operator has no shell on. False,
@@ -252,6 +260,7 @@ func Load() (*Config, error) {
 		S3EndpointURL:     src("PLAID_GOCACHE_S3_ENDPOINT_URL"),
 		BazelAddr:         src("PLAID_GOCACHE_BAZEL_ADDR"),
 		BazelGRPCAddr:     src("PLAID_GOCACHE_BAZEL_GRPC_ADDR"),
+		PprofAddr:         src("PLAID_GOCACHE_PPROF_ADDR"),
 		UploadConcurrency: runtime.NumCPU(),
 	}
 
@@ -346,6 +355,7 @@ var settingNames = map[string]bool{
 	"PLAID_GOCACHE_BAZEL_ADDR":           true,
 	"PLAID_GOCACHE_BAZEL_GRPC_ADDR":      true,
 	"PLAID_GOCACHE_BAZEL_MONITORING":     true,
+	"PLAID_GOCACHE_PPROF_ADDR":           true,
 	"PLAID_GOCACHE_DISABLE_BAZEL_VERIFY": true,
 	"PLAID_GOCACHE_DISABLE_EVICTION":     true,
 	"PLAID_GOCACHE_DISABLE_DAEMON":       true,

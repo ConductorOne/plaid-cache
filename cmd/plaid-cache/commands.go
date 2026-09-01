@@ -103,7 +103,7 @@ func openStores(ctx context.Context, cfg *config.Config) (*stores, error) {
 // runServe runs the daemon in the foreground.
 func (a *app) runServe(ctx context.Context) int {
 	var limits limitFlags
-	var bazelAddr, bazelGRPCAddr string
+	var bazelAddr, bazelGRPCAddr, pprofAddr string
 	var bazelMonitoring bool
 	register := func(fs *flag.FlagSet) {
 		limits.register(fs)
@@ -113,6 +113,8 @@ func (a *app) runServe(ctx context.Context) int {
 			"also serve Bazel's gRPC remote-cache protocol on this address, e.g. localhost:9096 (default: PLAID_GOCACHE_BAZEL_GRPC_ADDR)")
 		fs.BoolVar(&bazelMonitoring, "bazel-monitoring", false,
 			"also serve "+bazel.StatusPath+" and "+bazel.MetricsPath+" on the Bazel HTTP address (default: PLAID_GOCACHE_BAZEL_MONITORING)")
+		fs.StringVar(&pprofAddr, "pprof-addr", "",
+			"serve Go runtime profiles on this address, e.g. 127.0.0.1:6060 (default: PLAID_GOCACHE_PPROF_ADDR)")
 	}
 	if _, err := a.parseFlags("serve", register, a.args[1:]); err != nil {
 		a.errf("plaid-cache: %v\n", err)
@@ -131,6 +133,9 @@ func (a *app) runServe(ctx context.Context) int {
 	}
 	if bazelGRPCAddr != "" {
 		cfg.BazelGRPCAddr = bazelGRPCAddr
+	}
+	if pprofAddr != "" {
+		cfg.PprofAddr = pprofAddr
 	}
 	// The flag can turn monitoring on and not off, matching the addresses above:
 	// a flag given is a decision, a flag omitted is silence, and silence must
@@ -170,12 +175,12 @@ func (a *app) runServe(ctx context.Context) int {
 	})
 	logf("serving on %s (pid %d)", cfg.SocketPath(), os.Getpid())
 
-	// The Bazel listener runs beside the socket rather than instead of it, and
-	// it holds the index the deferred closes above release. Stopping the daemon
-	// and waiting for it therefore has to happen before those run, which is
-	// what the ordering of these two defers buys.
-	var bazelWG sync.WaitGroup
-	defer bazelWG.Wait()
+	// Optional TCP listeners run beside the socket rather than instead of it,
+	// and they hold the index the deferred closes above release. Stopping the
+	// daemon and waiting for them therefore has to happen before those run,
+	// which is what the ordering of these two defers buys.
+	var listenerWG sync.WaitGroup
+	defer listenerWG.Wait()
 	defer srv.Stop()
 
 	if cfg.BazelAddr != "" {
@@ -196,9 +201,9 @@ func (a *app) runServe(ctx context.Context) int {
 			logf("serving monitoring on http://%s%s and http://%s%s",
 				bazelLn.Addr(), bazel.StatusPath, bazelLn.Addr(), bazel.MetricsPath)
 		}
-		bazelWG.Add(1)
+		listenerWG.Add(1)
 		go func() {
-			defer bazelWG.Done()
+			defer listenerWG.Done()
 			if err := srv.ServeBazel(ctx, bazelLn); err != nil && !errors.Is(err, context.Canceled) {
 				logf("bazel listener: %v", err)
 			}
@@ -212,11 +217,27 @@ func (a *app) runServe(ctx context.Context) int {
 			return exitError
 		}
 		logf("serving the Bazel gRPC cache on grpc://%s", grpcLn.Addr())
-		bazelWG.Add(1)
+		listenerWG.Add(1)
 		go func() {
-			defer bazelWG.Done()
+			defer listenerWG.Done()
 			if err := srv.ServeBazelGRPC(ctx, grpcLn); err != nil && !errors.Is(err, context.Canceled) {
 				logf("bazel grpc listener: %v", err)
+			}
+		}()
+	}
+
+	if cfg.PprofAddr != "" {
+		pprofLn, lerr := daemon.ListenPprof(cfg.PprofAddr)
+		if lerr != nil {
+			a.errf("plaid-cache: pprof listener: %v\n", lerr)
+			return exitError
+		}
+		logf("serving Go runtime profiles on http://%s/debug/pprof/", pprofLn.Addr())
+		listenerWG.Add(1)
+		go func() {
+			defer listenerWG.Done()
+			if err := srv.ServePprof(ctx, pprofLn); err != nil && !errors.Is(err, context.Canceled) {
+				logf("pprof listener: %v", err)
 			}
 		}()
 	}
