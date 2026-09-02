@@ -41,6 +41,7 @@ type Cache struct {
 	rem     remote.Backend
 	logf    Logf
 	uploads *uploader
+	touches *toucher
 	metrics Metrics
 
 	// prunedSinceCompact is the tombstone debt built up since the last
@@ -124,6 +125,7 @@ func New(p Params) *Cache {
 		logf:  logf,
 	}
 	c.uploads = newUploader(p.Config.UploadConcurrency, p.Config.UploadQueueDepth, p.Config.UploadBlockTimeout, logf, &c.metrics)
+	c.touches = newToucher(p.Index.TouchMany, p.Config.TouchGranularity, logf)
 	return c
 }
 
@@ -155,9 +157,7 @@ func (c *Cache) Get(ctx context.Context, a ids.ActionID) (Result, error) {
 	if ok {
 		path, _, err := c.blobs.Get(e.OutputID)
 		if err == nil {
-			if _, err := c.idx.Touch(a, time.Now().UnixNano(), c.cfg.TouchGranularity); err != nil {
-				c.logf("index touch %s: %v", a, err)
-			}
+			c.touches.enqueue(a, e.LastUsedAt)
 			c.metrics.GetLocalHit.Add(1)
 			return Result{
 				OutputID: e.OutputID,
@@ -285,9 +285,7 @@ func (c *Cache) Has(ctx context.Context, a ids.ActionID) bool {
 	if _, _, err := c.blobs.Get(e.OutputID); err != nil {
 		return false
 	}
-	if _, err := c.idx.Touch(a, time.Now().UnixNano(), c.cfg.TouchGranularity); err != nil {
-		c.logf("index touch %s: %v", a, err)
-	}
+	c.touches.enqueue(a, e.LastUsedAt)
 	return true
 }
 
@@ -462,9 +460,10 @@ func (c *Cache) maybeCompact(pruned int64) {
 	c.logf("compacted the index after %d pruned entries in %v", n, time.Since(start).Round(time.Millisecond))
 }
 
-// Close waits for queued uploads to finish or time out. It does not close the
-// index, body store, or remote backend.
+// Close waits for queued touches and uploads to finish or time out. It does not
+// close the index, body store, or remote backend.
 func (c *Cache) Close() error {
+	c.touches.close()
 	c.uploads.close()
 	// Persist before going away. The daemon exits on an idle timeout and a
 	// plugin invocation lasts one build, so without this the last stretch of

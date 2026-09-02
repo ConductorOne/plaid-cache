@@ -263,51 +263,73 @@ func (ix *Index) Put(a ids.ActionID, e Entry, diskBytes int64) error {
 // Touch advances LastUsedAt, but only if it is older than granularity — a
 // relatime-style optimization that keeps the hot read path from writing on
 // every cache hit. Returns whether it wrote.
-//
-// When it does write, the old 'l' key is deleted and the new one inserted in
-// the same batch: an LRU index that accumulated stale keys would make eviction
-// delete entries in the wrong order and, worse, revisit already-freed actions.
 func (ix *Index) Touch(a ids.ActionID, now int64, granularity time.Duration) (bool, error) {
+	n, err := ix.TouchMany([]ids.ActionID{a}, now, granularity)
+	return n != 0, err
+}
+
+// TouchMany advances LastUsedAt for distinct actions in one Pebble batch.
+//
+// LastUsedAt is an eviction hint, not part of a cache hit's correctness. A
+// crash can lose recent touches and evict a hot body early, but that degrades
+// only to a miss. The batch therefore does not sync: making every read wait
+// for a storage flush turns LRU bookkeeping into a throughput limiter.
+//
+// Repeating an action is harmless; only its first occurrence is considered.
+func (ix *Index) TouchMany(actions []ids.ActionID, now int64, granularity time.Duration) (int, error) {
 	if ix.closed.Load() {
-		return false, fmt.Errorf("Touch: %w", ErrClosed)
+		return 0, fmt.Errorf("TouchMany: %w", ErrClosed)
+	}
+	if len(actions) == 0 {
+		return 0, nil
 	}
 
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 
-	e, ok, err := ix.loadEntry(a)
-	if err != nil {
-		return false, fmt.Errorf("Touch: %w", err)
-	}
-	if !ok {
-		return false, nil
-	}
-	// Never move a timestamp backwards: the LRU key derived from the stored
-	// value is the only handle we have on the old secondary-index row.
-	if now <= e.LastUsedAt {
-		return false, nil
-	}
-	if g := granularity.Nanoseconds(); g > 0 && now-e.LastUsedAt < g {
-		return false, nil
-	}
-
 	b := ix.db.NewBatch()
 	defer func() { _ = b.Close() }()
 
-	if err := b.Delete(lruKey(e.LastUsedAt, a), nil); err != nil {
-		return false, fmt.Errorf("Touch: %w", err)
+	seen := make(map[ids.ActionID]struct{}, len(actions))
+	var touched int
+	for _, a := range actions {
+		if _, duplicate := seen[a]; duplicate {
+			continue
+		}
+		seen[a] = struct{}{}
+
+		e, ok, err := ix.loadEntry(a)
+		if err != nil {
+			return 0, fmt.Errorf("TouchMany: %w", err)
+		}
+		if !ok || now <= e.LastUsedAt {
+			continue
+		}
+		if g := granularity.Nanoseconds(); g > 0 && now-e.LastUsedAt < g {
+			continue
+		}
+
+		// The old key must leave with the new key: stale LRU rows can make
+		// eviction revisit an action after its body was already released.
+		if err := b.Delete(lruKey(e.LastUsedAt, a), nil); err != nil {
+			return 0, fmt.Errorf("TouchMany: %w", err)
+		}
+		e.LastUsedAt = now
+		if err := b.Set(entryKey(a), encodeEntry(e), nil); err != nil {
+			return 0, fmt.Errorf("TouchMany: %w", err)
+		}
+		if err := b.Set(lruKey(now, a), nil, nil); err != nil {
+			return 0, fmt.Errorf("TouchMany: %w", err)
+		}
+		touched++
 	}
-	e.LastUsedAt = now
-	if err := b.Set(entryKey(a), encodeEntry(e), nil); err != nil {
-		return false, fmt.Errorf("Touch: %w", err)
+	if touched == 0 {
+		return 0, nil
 	}
-	if err := b.Set(lruKey(now, a), nil, nil); err != nil {
-		return false, fmt.Errorf("Touch: %w", err)
+	if err := b.Commit(pebble.NoSync); err != nil {
+		return 0, fmt.Errorf("TouchMany: %w", err)
 	}
-	if err := b.Commit(pebble.Sync); err != nil {
-		return false, fmt.Errorf("Touch: %w", err)
-	}
-	return true, nil
+	return touched, nil
 }
 
 // Delete removes an action, decrements its output refcount, and reports whether
