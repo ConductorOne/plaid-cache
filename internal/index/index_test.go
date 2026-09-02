@@ -343,6 +343,43 @@ func TestTouchRekeysLRUOutsideGranularity(t *testing.T) {
 	wantStats(t, ix, 1, 1, 1024)
 }
 
+// TestTouchManyDeduplicatesAndRekeysLRU pins that batching preserves one
+// coherent LRU row per action even when a caller repeats an action in a batch.
+func TestTouchManyDeduplicatesAndRekeysLRU(t *testing.T) {
+	ix := openTemp(t)
+	a1, o1 := mkAction(1), mkOutput(1)
+	a2, o2 := mkAction(2), mkOutput(2)
+	put(t, ix, a1, o1, baseTime, 1024)
+	put(t, ix, a2, o2, baseTime+1, 2048)
+
+	now := baseTime + int64(2*time.Hour)
+	touched, err := ix.TouchMany([]ids.ActionID{a1, a2, a1}, now, time.Hour)
+	if err != nil {
+		t.Fatalf("TouchMany: %v", err)
+	}
+	if touched != 2 {
+		t.Fatalf("TouchMany touched %d actions, want 2", touched)
+	}
+	for _, a := range []ids.ActionID{a1, a2} {
+		e, ok, err := ix.Get(a)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if !ok {
+			t.Fatal("TouchMany removed an existing action")
+		}
+		if e.LastUsedAt != now {
+			t.Fatalf("LastUsedAt = %d, want %d", e.LastUsedAt, now)
+		}
+		if !hasKey(t, ix, lruKey(now, a)) {
+			t.Fatal("TouchMany did not insert the refreshed lru key")
+		}
+	}
+	if hasKey(t, ix, lruKey(baseTime, a1)) || hasKey(t, ix, lruKey(baseTime+1, a2)) {
+		t.Fatal("TouchMany left a stale lru key behind")
+	}
+}
+
 // TestTouchZeroGranularityAlwaysWrites pins that a disabled window makes every
 // hit a write, which is the behaviour a caller asks for with granularity <= 0.
 func TestTouchZeroGranularityAlwaysWrites(t *testing.T) {
