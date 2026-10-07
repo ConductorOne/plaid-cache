@@ -174,7 +174,7 @@ The matching client-side setting is worth knowing about, because it differs shar
 
 **Memory.** Nothing buffers a whole blob. A read streams from the open file to the wire and a write streams from the wire to a staging file. Measured: the daemon's peak resident memory while a 256 MiB output was uploaded, downloaded and re-offered was 39.5 MB, and 41.3 MB with compression on.
 
-**Resumable writes.** A `ByteStream.Write` that breaks leaves what it delivered on disk, registered under its resource name. `QueryWriteStatus` reports how far it got, and the next `Write` at that offset continues into the same body. A partial upload nobody resumes is released after ten minutes; at most 256 are held at once, and the longest-idle is dropped to make room rather than refusing a new one. Anything left staged by a process that died is swept at the next start.
+**Resumable writes.** A `ByteStream.Write` that breaks leaves what it delivered on disk, registered under its resource name. `QueryWriteStatus` reports how far it got, and the next `Write` at that offset continues into the same body. A partial upload nobody resumes is released after ten minutes; at most 256 are held at once, and the longest-idle is dropped to make room rather than refusing a new one. Only a break on the client's side is held: when the server itself fails to write what it was sent — a full disk, or a compressed stream that does not decode — the partial body is released at once, since the space it holds is what the store just failed to get. Anything left staged by a process that died is swept at the next start.
 
 
 #### Build without the bytes

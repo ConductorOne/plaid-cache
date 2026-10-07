@@ -186,11 +186,21 @@ func (b *byteStreamService) Write(stream bytestream.ByteStream_WriteServer) erro
 		return err
 	}
 
-	committed, err := b.receive(stream, p, first)
+	committed, resumable, err := b.receive(stream, p, first)
 	if err != nil {
+		p.abortStream()
+		if !resumable {
+			// The server could not store what arrived. Holding the partial body
+			// for a resume would keep disk the store has just failed to use,
+			// on the one path where disk is most likely to be what ran out, and
+			// a full disk then fails every upload that follows while each one
+			// is held for ten minutes.
+			b.srv.uploads.release(p, false)
+			p.discard()
+			return err
+		}
 		// Keep what arrived. The client is entitled to ask where it got to and
 		// carry on, which is the whole reason this survives a broken stream.
-		p.abortStream()
 		b.srv.uploads.release(p, true)
 		return err
 	}
@@ -251,14 +261,20 @@ func (b *byteStreamService) startStream(res resource, offset int64) (*pending, e
 
 // receive consumes the rest of a write stream and reports the committed size to
 // answer with.
-func (b *byteStreamService) receive(stream bytestream.ByteStream_WriteServer, p *pending, req *bytestream.WriteRequest) (int64, error) {
+//
+// On failure, resumable says whether the partial body is worth holding for the
+// client to continue into. It is false only when the server failed to write
+// what it was sent: a broken stream or a client mistake leaves a body that is
+// good as far as it goes, but a failed write leaves one the store has already
+// refused.
+func (b *byteStreamService) receive(stream bytestream.ByteStream_WriteServer, p *pending, req *bytestream.WriteRequest) (committed int64, resumable bool, err error) {
 	for {
 		if name := req.GetResourceName(); name != "" && name != p.res.name {
-			return 0, status.Errorf(codes.InvalidArgument,
+			return 0, true, status.Errorf(codes.InvalidArgument,
 				"plaid-cache: request names %q on a stream writing %q", name, p.res.name)
 		}
 		if want := p.streamStart + p.streamBytes; req.GetWriteOffset() != want {
-			return 0, status.Errorf(codes.InvalidArgument,
+			return 0, true, status.Errorf(codes.InvalidArgument,
 				"plaid-cache: write offset %d is not the expected %d", req.GetWriteOffset(), want)
 		}
 
@@ -269,13 +285,14 @@ func (b *byteStreamService) receive(stream bytestream.ByteStream_WriteServer, p 
 			}
 			if _, err := dst.Write(data); err != nil {
 				b.srv.logf("bazel grpc: receive %s: %v", p.res.digest, err)
-				return 0, status.Errorf(codes.Internal, "plaid-cache: cannot store blob %s", p.res.digest)
+				return 0, false, status.Errorf(codes.Internal, "plaid-cache: cannot store blob %s", p.res.digest)
 			}
 			p.streamBytes += int64(len(data))
 		}
 
 		if req.GetFinishWrite() {
-			return b.finish(stream.Context(), p)
+			n, ferr := b.finish(stream.Context(), p)
+			return n, true, ferr
 		}
 
 		next, err := stream.Recv()
@@ -283,9 +300,9 @@ func (b *byteStreamService) receive(stream bytestream.ByteStream_WriteServer, p 
 			if errors.Is(err, io.EOF) {
 				// The client closed without saying it was finished, which is
 				// what a broken upload looks like from here.
-				return 0, status.Error(codes.InvalidArgument, "plaid-cache: write stream ended before finish_write")
+				return 0, true, status.Error(codes.InvalidArgument, "plaid-cache: write stream ended before finish_write")
 			}
-			return 0, err
+			return 0, true, err
 		}
 		req = next
 	}

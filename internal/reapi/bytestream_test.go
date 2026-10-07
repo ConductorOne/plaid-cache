@@ -598,3 +598,45 @@ func waitClaimed(t *testing.T, h *harness, name string) {
 	}
 	t.Fatalf("the server never took a claim on %q", name)
 }
+
+// TestAFailedStoreWriteIsNotKeptForResume pins that a write the server could not
+// apply releases its partial body at once instead of holding it for a resume.
+//
+// The case that matters is a full disk: every upload fails on its first write,
+// and holding each one's staged body for the idle timeout keeps the space the
+// store needs to recover, so the next upload fails too. A compressed stream that
+// does not decode is the same path, a failed write into the store, and unlike a
+// full disk a test can produce one on demand.
+func TestAFailedStoreWriteIsNotKeptForResume(t *testing.T) {
+	h := newHarness(t)
+	body := bigBody(t, 256<<10)
+	d := digestOf(body)
+	name := compressedWriteName("undecodable", d)
+
+	stream, err := h.bs.Write(ctx(t))
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	// Not zstd at all. The decoder fails on the first frame, and the writes
+	// after that fail into the store. Send stops once the server has hung up.
+	const chunk = 4 << 10
+	for off := 0; off < len(body); off += chunk {
+		if serr := stream.Send(&bytestream.WriteRequest{
+			ResourceName: name,
+			WriteOffset:  int64(off),
+			Data:         body[off : off+chunk],
+		}); serr != nil {
+			break
+		}
+	}
+	if _, err := stream.CloseAndRecv(); status.Code(err) != codes.Internal {
+		t.Fatalf("undecodable stream = %v, want Internal from the failed store write", err)
+	}
+
+	if _, err := h.bs.QueryWriteStatus(ctx(t), &bytestream.QueryWriteStatusRequest{ResourceName: name}); status.Code(err) != codes.NotFound {
+		t.Fatalf("QueryWriteStatus after a failed store write = %v, want NotFound: the partial body was kept", err)
+	}
+	if n := h.srv.uploads.discardAll(); n != 0 {
+		t.Fatalf("%d uploads still held after a failed store write, want 0", n)
+	}
+}
