@@ -20,6 +20,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/conductorone/plaid-cache/internal/blob"
@@ -48,6 +49,11 @@ type Cache struct {
 	// floor. It is blob.VolumeUsage everywhere but in tests, which cannot fill a
 	// real disk to the point the floor exists for.
 	volumeUsage func(dir string) (total, avail uint64, err error)
+
+	// evictSoon is signalled when a write into the store finds the disk full,
+	// so the daemon can run a pass now rather than at its next tick. It is
+	// buffered to one: a burst of failed writes is one request, not a queue.
+	evictSoon chan struct{}
 
 	// prunedSinceCompact is the tombstone debt built up since the last
 	// compaction, counted across passes rather than within one: a thousand
@@ -130,6 +136,7 @@ func New(p Params) *Cache {
 		logf:  logf,
 
 		volumeUsage: blob.VolumeUsage,
+		evictSoon:   make(chan struct{}, 1),
 	}
 	c.uploads = newUploader(p.Config.UploadConcurrency, p.Config.UploadQueueDepth, p.Config.UploadBlockTimeout, logf, &c.metrics)
 	c.touches = newToucher(p.Index.TouchMany, p.Config.TouchGranularity, logf)
@@ -228,6 +235,7 @@ func (c *Cache) getRemote(ctx context.Context, a ids.ActionID) (Result, error) {
 
 	path, diskBytes, err := c.blobs.Put(outputID, body, size)
 	if err != nil {
+		c.NoteWriteError(err)
 		c.logf("stage remote object %s: %v", outputID, err)
 		c.metrics.GetMiss.Add(1)
 		return Result{Miss: true}, nil
@@ -304,11 +312,34 @@ func (c *Cache) Has(ctx context.Context, a ids.ActionID) bool {
 func (c *Cache) Put(ctx context.Context, a ids.ActionID, o ids.OutputID, body io.Reader, size int64) (diskPath string, err error) {
 	path, diskBytes, err := c.blobs.Put(o, body, size)
 	if err != nil {
+		c.NoteWriteError(err)
 		return "", fmt.Errorf("Put: %w", err)
 	}
 	c.record(a, o, path, size, diskBytes)
 	return path, nil
 }
+
+// NoteWriteError records a failed write into the body store. A full disk asks
+// for an eviction pass now: until one runs, every write fails the same way, and
+// the next tick can be most of a minute away.
+//
+// It is exported for the Bazel adapter, whose uploads stream into staging files
+// this package hands out but does not write.
+func (c *Cache) NoteWriteError(err error) {
+	if !errors.Is(err, syscall.ENOSPC) {
+		return
+	}
+	select {
+	case c.evictSoon <- struct{}{}:
+	default:
+		// A request is already pending; one pass answers every failure
+		// behind it.
+	}
+}
+
+// EvictRequests delivers a value when a write has found the disk full since the
+// channel was last read. The daemon's eviction loop is its only reader.
+func (c *Cache) EvictRequests() <-chan struct{} { return c.evictSoon }
 
 // PutStaged records an action whose body is already written to a staging file
 // in the body store.
@@ -325,6 +356,7 @@ func (c *Cache) Put(ctx context.Context, a ids.ActionID, o ids.OutputID, body io
 func (c *Cache) PutStaged(ctx context.Context, a ids.ActionID, o ids.OutputID, stagedPath string, size int64) (diskPath string, err error) {
 	path, diskBytes, _, err := c.blobs.Adopt(o, stagedPath, size)
 	if err != nil {
+		c.NoteWriteError(err)
 		return "", fmt.Errorf("PutStaged: %w", err)
 	}
 	c.record(a, o, path, size, diskBytes)

@@ -84,6 +84,7 @@ type store interface {
 	Has(ctx context.Context, a ids.ActionID) bool
 	HasRemote(ctx context.Context, a ids.ActionID) bool
 	PutStaged(ctx context.Context, a ids.ActionID, o ids.OutputID, stagedPath string, size int64) (string, error)
+	NoteWriteError(err error)
 }
 
 // stager opens the staging files uploads are streamed into. It is the part of

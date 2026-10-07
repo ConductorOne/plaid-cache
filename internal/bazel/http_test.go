@@ -428,6 +428,9 @@ func (failingStore) PutStaged(context.Context, ids.ActionID, ids.OutputID, strin
 	return "", errors.New("no space left on device")
 }
 
+// NoteWriteError ignores the failure; nothing here evicts.
+func (failingStore) NoteWriteError(error) {}
+
 // TestBrokenCacheStillAnswersCleanly pins the promise this package makes about
 // its own failures: a lookup against a broken cache is a miss, and a store that
 // could not happen is still reported as success. Bazel treats a non-200 read as

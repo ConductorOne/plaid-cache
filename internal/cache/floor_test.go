@@ -6,6 +6,9 @@ package cache
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io/fs"
+	"syscall"
 	"testing"
 )
 
@@ -129,5 +132,35 @@ func TestFreeFloorUnreadableVolumeFallsBackToTheCeiling(t *testing.T) {
 	}
 	if len(tc.logs.matching("free-space floor: no statfs")) == 0 {
 		t.Fatal("the skipped floor was not logged")
+	}
+}
+
+// TestNoteWriteErrorRequestsEvictionOnlyForAFullDisk pins what asks the daemon
+// for an early pass: a write that failed for lack of space, however wrapped,
+// and nothing else. A burst of failures is coalesced into one request.
+func TestNoteWriteErrorRequestsEvictionOnlyForAFullDisk(t *testing.T) {
+	tc := newTestCache(t)
+	pending := func() bool {
+		select {
+		case <-tc.cache.EvictRequests():
+			return true
+		default:
+			return false
+		}
+	}
+
+	tc.cache.NoteWriteError(errors.New("permission denied"))
+	if pending() {
+		t.Fatal("a write error that was not ENOSPC requested an eviction pass")
+	}
+
+	full := &fs.PathError{Op: "write", Path: "staging/body", Err: syscall.ENOSPC}
+	tc.cache.NoteWriteError(fmt.Errorf("Write: %w", full))
+	tc.cache.NoteWriteError(full)
+	if !pending() {
+		t.Fatal("a full disk did not request an eviction pass")
+	}
+	if pending() {
+		t.Fatal("two failures queued two passes, want them coalesced into one")
 	}
 }

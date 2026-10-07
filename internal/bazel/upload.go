@@ -68,6 +68,7 @@ func (u *Upload) Write(p []byte) (int, error) {
 		u.off += int64(n)
 	}
 	if err != nil {
+		u.store.cache.NoteWriteError(err)
 		return n, fmt.Errorf("Write: %w", err)
 	}
 	return n, nil

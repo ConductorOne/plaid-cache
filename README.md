@@ -432,6 +432,12 @@ pass prune more, never less. It is off by default. A dedicated cache volume
 should set it, for example to 5% of the volume, and keep `max-bytes` as the
 budget it is sized for.
 
+A write that fails because the disk is full also starts an eviction pass at once,
+instead of waiting for the next tick, at most once every 10 seconds while the disk
+stays full. That pass applies the same limits as any other, so with no floor set
+it frees space only if the cache is over `max-bytes`. The early pass is what makes
+the floor act within seconds of the disk filling.
+
 ### What `max-bytes` counts
 
 Allocated bytes on disk, not the lengths of the files.

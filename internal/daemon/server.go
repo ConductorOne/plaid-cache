@@ -503,9 +503,17 @@ func (s *Server) leave() {
 // Running it on a timer rather than at process exit is the whole point of the
 // daemon: a cache that only prunes when a build ends can exceed its ceiling
 // for the entire duration of a long build.
+//
+// A write that finds the disk full asks for a pass sooner, since every write
+// fails the same way until one runs. Those requests are spaced by
+// noSpaceEvictSpacing: a disk that stays full keeps failing writes, and a pass
+// per failure would spend the daemon re-measuring a cache it has just measured.
+// A request inside the spacing is dropped rather than deferred, because the
+// ticker is already coming.
 func (s *Server) evictLoop(ctx context.Context) {
 	t := time.NewTicker(s.cfg.EvictInterval)
 	defer t.Stop()
+	var last time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -513,16 +521,34 @@ func (s *Server) evictLoop(ctx context.Context) {
 		case <-s.stopped:
 			return
 		case <-t.C:
-			res, err := s.cache.Evict(ctx)
-			if err != nil {
-				s.logf("evict: %v", err)
+			s.evictOnce(ctx, "evict")
+			last = time.Now()
+		case <-s.cache.EvictRequests():
+			if time.Since(last) < noSpaceEvictSpacing {
 				continue
 			}
-			if res.ActionsPruned > 0 || res.ObjectsPruned > 0 {
-				s.logf("evict: pruned %d actions, %d objects, freed %d bytes in %v",
-					res.ActionsPruned, res.ObjectsPruned, res.BytesFreed, res.Elapsed)
-			}
+			s.evictOnce(ctx, "evict (disk full)")
+			last = time.Now()
 		}
+	}
+}
+
+// noSpaceEvictSpacing is the least time between two passes when the disk is
+// full. It is short against the default one-minute tick, which is the point of
+// running early, and long against a pass over a large cache, so a full disk
+// cannot keep the daemon evicting back to back.
+const noSpaceEvictSpacing = 10 * time.Second
+
+// evictOnce runs one pass and logs what it did under the given label.
+func (s *Server) evictOnce(ctx context.Context, label string) {
+	res, err := s.cache.Evict(ctx)
+	if err != nil {
+		s.logf("%s: %v", label, err)
+		return
+	}
+	if res.ActionsPruned > 0 || res.ObjectsPruned > 0 {
+		s.logf("%s: pruned %d actions, %d objects, freed %d bytes in %v",
+			label, res.ActionsPruned, res.ObjectsPruned, res.BytesFreed, res.Elapsed)
 	}
 }
 
