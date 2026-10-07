@@ -52,7 +52,7 @@ directory   /home/you/.cache/plaid-cache
 config      /home/you/.config/plaid-cache/config
 entries     274 actions, 206 objects (1.33x dedup, 173.1 KiB avg)
 size        34.8 MiB of 64.0 MiB (54.4%, 29.2 MiB free)
-volume      12.1 GiB used of 50.0 GiB (24.2%, 37.9 GiB free)
+volume      12.1 GiB used of 50.0 GiB (24.2%, 37.9 GiB free, zfs)
 ttl         168h0m0s
 age         oldest 4s, newest 1s
 remote      s3://example-bucket--usw2-az1--x-s3/arm64
@@ -271,6 +271,7 @@ There is no `directory`, no `config`, and no `volume` line, and `remote` says wh
 | `plaid_cache_max_bytes`, `plaid_cache_ttl_seconds` | gauge | The limits eviction is enforcing. Zero disables that constraint. |
 | `plaid_cache_min_free_bytes` | gauge | The free-space floor eviction keeps on the volume. Zero disables it. |
 | `plaid_cache_volume_total_bytes`, `plaid_cache_volume_avail_bytes` | gauge | The filesystem holding the cache. Absent where it cannot be measured. Alert on these, not on `disk_bytes`: the disk can fill with things the index does not count. |
+| `plaid_cache_volume_info{fstype}` | gauge | The filesystem detected under the cache at startup, as a constant 1: `zfs`, `xfs`, `ext4`, `unknown`, and so on. |
 | `plaid_cache_oldest_entry_age_seconds`, `plaid_cache_newest_entry_age_seconds` | gauge | The age span, absent for a cache with no entries. |
 | `plaid_cache_uptime_seconds`, `plaid_cache_build_info` | gauge | This daemon and the build serving it. |
 | `plaid_cache_remote_tier_enabled` | gauge | 1 when a shared tier is configured. |
@@ -438,6 +439,42 @@ stays full. That pass applies the same limits as any other, so with no floor set
 it frees space only if the cache is over `max-bytes`. The early pass is what makes
 the floor act within seconds of the disk filling.
 
+Passes that close together need one more correction. Deleting a body does not
+raise the volume's free space at once everywhere: ZFS returns the blocks a
+transaction group later and frees large files asynchronously after that, so a
+pass a few seconds after the last one reads the old free figure, sees the same
+shortfall, and evicts it a second time. So the floor credits what recent passes
+freed, for as long as the filesystem may take to report it:
+
+| Filesystem | Freed space credited for |
+| --- | --- |
+| ZFS | 30 seconds |
+| XFS | 5 seconds — recent kernels release unlinked inodes in a background worker |
+| ext4 | 10 seconds — blocks come back at the journal commit, every 5 seconds by default |
+| tmpfs | not at all — pages are freed on unlink |
+| anything else | 30 seconds |
+
+The credit can only hold a pass back for that long. After it, the free figure
+the volume reports is believed again, and if the space still has not appeared the
+next pass evicts for it.
+
+On a plain XFS or ext4 volume there is no dataset quota or pool reservation
+standing between the cache and everything else on the disk, so
+`PLAID_GOCACHE_MIN_FREE_BYTES` is the guard for the whole volume, not just for the
+cache's share of it. Set it there.
+
+The filesystem is detected once, when the daemon starts, from the cache
+directory, and logged:
+
+```
+plaid-cache: cache volume: xfs (allocation settle 0s, free lag 5s)
+```
+
+It also appears on `status`'s volume line and as `plaid_cache_volume_info` in
+`/metrics`. A filesystem that is not recognised, or one that cannot be
+identified, gets the cautious timings — the ZFS settle window and the longest
+free lag — and never stops the daemon from starting.
+
 ### What `max-bytes` counts
 
 Allocated bytes on disk, not the lengths of the files.
@@ -449,6 +486,14 @@ a second ago reports a single block however large it is — so the figure taken 
 is deliberately an overestimate. It is corrected once the allocation is real:
 before a size-driven eviction, bodies past the settle window are re-measured and
 their recorded costs replaced.
+
+The settle window is 10 seconds on ZFS and on any filesystem the cache does not
+recognise, and zero on XFS, ext4 and tmpfs. XFS and ext4 count delayed allocation in the
+allocated size the moment the data is written, so a body is measured truthfully
+at once and there is nothing to wait for. btrfs, overlayfs, NFS, APFS and HFS+
+keep the 10 seconds: each either compresses at writeback, inherits another
+filesystem's behaviour, or reports what something else says, and believing them
+early is not worth the risk of an undercount.
 
 Without that correction the budget stays at the logical lengths forever, and on a
 dataset compressing 3x a 40 GiB ceiling starts evicting at about 13 GiB of actual
@@ -465,12 +510,13 @@ hand should be decided on current numbers, and it reports what changed:
 $ plaid-cache gc
 pruned 0 actions, 0 objects, freed 0 B in 29ms
 measured     780 of 786 objects re-measured, recorded size 320.4 MiB -> 123.3 MiB
-``` `status` reports
-the volume alongside the budget, so the two can be compared:
+```
+
+`status` reports the volume alongside the budget, so the two can be compared:
 
 ```
 size        10.5 GiB of 40.0 GiB (26.3%, 29.5 GiB free)
-volume      16.0 GiB used of 50.0 GiB (32.0%, 34.0 GiB free)
+volume      16.0 GiB used of 50.0 GiB (32.0%, 34.0 GiB free, xfs)
 ```
 
 On platforms without `st_blocks` the budget is the logical length, which is all

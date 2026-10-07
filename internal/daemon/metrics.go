@@ -84,6 +84,15 @@ func renderMetrics(r StatusResponse) []byte {
 		writeFamily(&b, "volume_avail_bytes", "gauge",
 			"Bytes free to this process on the filesystem holding the cache.", sample{value: float64(r.VolumeAvailBytes)})
 	}
+	// Which filesystem that is, as an info gauge like build_info. It is what
+	// decides the accounting's timings, so a dashboard puzzling over a slow
+	// size correction or a floor that waits before evicting again can see why.
+	// One fixed label, so one series.
+	if r.VolumeFSType != "" {
+		writeFamily(&b, "volume_info", "gauge",
+			"The filesystem holding the cache, detected at startup, as a constant 1.",
+			sample{labels: labels("fstype", r.VolumeFSType), value: 1})
+	}
 
 	// The age span says whether the TTL is doing anything: an oldest entry
 	// younger than the TTL means only the size ceiling is evicting. An empty

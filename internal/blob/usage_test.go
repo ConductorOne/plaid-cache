@@ -41,7 +41,7 @@ func (f fakeInfo) Sys() any           { return &syscall.Stat_t{Blocks: f.blocks}
 // was introduced.
 func TestFreshWritesAreNotTrusted(t *testing.T) {
 	fi := fakeInfo{size: 8 << 20, modTime: time.Now(), blocks: 1}
-	got, settled := settledBytes(fi, time.Now())
+	got, settled := settledBytes(fi, time.Now(), allocationSettleWindow)
 	if settled {
 		t.Fatal("a file written just now was reported as measurable")
 	}
@@ -60,7 +60,7 @@ func TestFreshWritesAreNotTrusted(t *testing.T) {
 func TestSettledCompressionIsBelieved(t *testing.T) {
 	const size = 8 << 20
 	fi := fakeInfo{size: size, modTime: time.Now().Add(-time.Hour), blocks: 1} // 512 bytes allocated
-	got, settled := settledBytes(fi, time.Now())
+	got, settled := settledBytes(fi, time.Now(), allocationSettleWindow)
 	if !settled {
 		t.Fatal("an hour-old file was still reported as unmeasurable")
 	}
@@ -74,7 +74,7 @@ func TestSettledCompressionIsBelieved(t *testing.T) {
 // the one to use. This is the case the maximum was originally protecting.
 func TestSettledSmallFilesCountTheirBlock(t *testing.T) {
 	fi := fakeInfo{size: 10, modTime: time.Now().Add(-time.Hour), blocks: 8} // 4 KiB
-	got, settled := settledBytes(fi, time.Now())
+	got, settled := settledBytes(fi, time.Now(), allocationSettleWindow)
 	if !settled || got != 4096 {
 		t.Fatalf("settled cost = %d (settled=%v), want 4096", got, settled)
 	}
@@ -86,7 +86,7 @@ func TestSettledSmallFilesCountTheirBlock(t *testing.T) {
 // ignore it completely.
 func TestNoBlocksAtAllIsNotTrusted(t *testing.T) {
 	fi := fakeInfo{size: 1 << 20, modTime: time.Now().Add(-time.Hour), blocks: 0}
-	got, settled := settledBytes(fi, time.Now())
+	got, settled := settledBytes(fi, time.Now(), allocationSettleWindow)
 	if settled {
 		t.Fatal("a file reporting no allocation at all was believed")
 	}
@@ -108,8 +108,27 @@ func TestSettleWindowBoundary(t *testing.T) {
 		{"past the window", allocationSettleWindow + time.Second, true},
 	} {
 		fi := fakeInfo{size: 1 << 20, modTime: now.Add(-tc.age), blocks: 8}
-		if _, settled := settledBytes(fi, now); settled != tc.want {
+		if _, settled := settledBytes(fi, now, allocationSettleWindow); settled != tc.want {
 			t.Errorf("%s: settled = %v, want %v", tc.name, settled, tc.want)
 		}
+	}
+}
+
+// TestZeroSettleWindowBelievesAFreshWrite pins the XFS and ext4 behaviour: with
+// no settle window a body's allocation is believed the moment it is written,
+// while the ZFS window still holds the same fresh body back. Both filesystems
+// count delayed allocation in st_blocks at write time, so waiting there would
+// only keep an overestimate in the budget for no reason.
+func TestZeroSettleWindowBelievesAFreshWrite(t *testing.T) {
+	now := time.Now()
+	fi := fakeInfo{size: 10, modTime: now, blocks: 8} // 4 KiB, just written
+
+	xfs := filesystemForMagic(magicXFS)
+	if got, settled := settledBytes(fi, now, xfs.AllocationSettle); !settled || got != 4096 {
+		t.Fatalf("xfs: cost = %d (settled=%v), want 4096 settled at once", got, settled)
+	}
+	zfs := filesystemForMagic(magicZFS)
+	if _, settled := settledBytes(fi, now, zfs.AllocationSettle); settled {
+		t.Fatal("zfs: a body written just now was believed inside the settle window")
 	}
 }

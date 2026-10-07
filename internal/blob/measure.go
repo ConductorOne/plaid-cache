@@ -14,14 +14,15 @@ import (
 // Measure reports what a published body costs now, and whether that figure can
 // be believed.
 //
-// A body written within the settle window still reports a provisional cost, so a
-// caller correcting its accounting can tell the difference between "this is what
-// it costs" and "ask again shortly".
+// A body written within the store's settle window still reports a provisional
+// cost, so a caller correcting its accounting can tell the difference between
+// "this is what it costs" and "ask again shortly". The window is the one the
+// store was opened with, so it is zero on a filesystem that allocates at once.
 func (s *Store) Measure(id ids.OutputID, now time.Time) (bytes int64, settled bool, err error) {
 	fi, err := os.Stat(s.Path(id))
 	if err != nil {
 		return 0, false, fmt.Errorf("Measure: %w", err)
 	}
-	b, ok := settledBytes(fi, now)
+	b, ok := settledBytes(fi, now, s.fs.AllocationSettle)
 	return b, ok, nil
 }

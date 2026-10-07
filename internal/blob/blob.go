@@ -49,27 +49,44 @@ const outputDir = "output"
 // anything walking the store.
 const stagingDir = "staging"
 
-// Store is a directory of content-addressed bodies. It holds no in-memory
-// state and no locks: every operation is a filesystem syscall, so multiple
-// Stores over one root, in one process or many, are safe concurrently.
+// Store is a directory of content-addressed bodies. It holds no mutable
+// in-memory state and no locks: every operation is a filesystem syscall, so
+// multiple Stores over one root, in one process or many, are safe concurrently.
 type Store struct {
 	root string
+
+	// fs is the profile of the filesystem the store lives on, fixed at open.
+	// Only its timings are used; nothing here re-detects it.
+	fs Filesystem
 }
 
-// Open prepares root as a body store, creating it if absent.
+// Open prepares root as a body store, creating it if absent, and assumes the
+// cautious filesystem profile.
+//
+// A caller that knows the filesystem — the daemon, which detects it once at
+// startup — uses OpenAs instead. Assuming the cautious profile is what keeps a
+// store opened without that knowledge measuring the way it always has.
 func Open(root string) (*Store, error) {
+	return OpenAs(root, UnknownFilesystem())
+}
+
+// OpenAs is Open on a filesystem whose profile the caller has already detected.
+func OpenAs(root string, f Filesystem) (*Store, error) {
 	if root == "" {
-		return nil, errors.New("Open: empty root")
+		return nil, errors.New("OpenAs: empty root")
 	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
-		return nil, fmt.Errorf("Open: %w", err)
+		return nil, fmt.Errorf("OpenAs: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Join(abs, outputDir), dirPerm); err != nil {
-		return nil, fmt.Errorf("Open: %w", err)
+		return nil, fmt.Errorf("OpenAs: %w", err)
 	}
-	return &Store{root: abs}, nil
+	return &Store{root: abs, fs: f}, nil
 }
+
+// Filesystem reports the profile the store was opened with.
+func (s *Store) Filesystem() Filesystem { return s.fs }
 
 // Root returns the directory the store was opened on.
 func (s *Store) Root() string { return s.root }

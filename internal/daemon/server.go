@@ -655,6 +655,7 @@ func (s *Server) status() StatusResponse {
 		RRCC:          s.rrccMetrics(),
 	}
 	r.UploadQueueDepth, r.UploadQueueCapacity = s.cache.UploadQueue()
+	r.VolumeFSType = s.cache.Filesystem().Name
 	if total, avail, err := blob.VolumeUsage(s.cfg.Dir); err == nil && total > 0 {
 		r.HaveVolume, r.VolumeTotalBytes, r.VolumeAvailBytes = true, total, avail
 	}

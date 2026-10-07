@@ -161,10 +161,16 @@ type StatusResponse struct {
 	// They are here because DiskBytes counts only what the index records, and
 	// the disk can fill with things it does not: a 900GiB volume has run out of
 	// space with DiskBytes still below its ceiling.
+	//
+	// VolumeFSType names the filesystem detected under the cache at startup
+	// ("zfs", "xfs", "ext4", "unknown", ...), which decides how soon a body's
+	// size is believed and how long freed space is credited to the floor. It is
+	// empty from a daemon that predates detection.
 	MinFreeBytes     int64                 `json:"min_free_bytes"`
 	HaveVolume       bool                  `json:"have_volume"`
 	VolumeTotalBytes uint64                `json:"volume_total_bytes,omitempty"`
 	VolumeAvailBytes uint64                `json:"volume_avail_bytes,omitempty"`
+	VolumeFSType     string                `json:"volume_fstype,omitempty"`
 	TTL              string                `json:"ttl"`
 	Uptime           string                `json:"uptime"`
 	OldestAge        string                `json:"oldest_age,omitempty"`

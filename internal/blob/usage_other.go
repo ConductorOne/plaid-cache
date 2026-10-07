@@ -24,4 +24,6 @@ func diskBytes(fi fs.FileInfo) int64 { return fi.Size() }
 // Reporting it as untrusted keeps the re-measuring pass from replacing a
 // provisional figure with the same number it already has, so on these platforms
 // the budget stays logical — which is all it can be without st_blocks.
-func settledBytes(fi fs.FileInfo, _ time.Time) (int64, bool) { return fi.Size(), false }
+func settledBytes(fi fs.FileInfo, _ time.Time, _ time.Duration) (int64, bool) {
+	return fi.Size(), false
+}

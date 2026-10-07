@@ -53,6 +53,11 @@ type stores struct {
 	idx   *index.Index
 	blobs *blob.Store
 	rem   remote.Backend
+
+	// fsErr is why the filesystem under the cache could not be identified, nil
+	// when it was. The store has the cautious profile either way; this is only
+	// kept so the daemon can say so once at startup.
+	fsErr error
 }
 
 // close releases the tiers in reverse order of dependency.
@@ -77,7 +82,11 @@ func openStores(ctx context.Context, cfg *config.Config) (*stores, error) {
 	if err != nil {
 		return nil, fmt.Errorf("openStores: index: %w", err)
 	}
-	blobs, err := blob.Open(cfg.BlobDir())
+	// Detected on the cache directory because that is what the free-space floor
+	// reads; the body store is a subdirectory of it. A failure is not fatal — a
+	// cache must never break a build — and leaves the cautious profile in place.
+	fsys, fsErr := blob.DetectFilesystem(cfg.Dir)
+	blobs, err := blob.OpenAs(cfg.BlobDir(), fsys)
 	if err != nil {
 		_ = idx.Close()
 		return nil, fmt.Errorf("openStores: blobs: %w", err)
@@ -93,11 +102,11 @@ func openStores(ctx context.Context, cfg *config.Config) (*stores, error) {
 		if err != nil {
 			// A misconfigured bucket must not stop the local cache from
 			// working; the shared tier is an optimization.
-			return &stores{idx: idx, blobs: blobs, rem: remote.Noop{}}, nil
+			return &stores{idx: idx, blobs: blobs, rem: remote.Noop{}, fsErr: fsErr}, nil
 		}
 		rem = s3
 	}
-	return &stores{idx: idx, blobs: blobs, rem: rem}, nil
+	return &stores{idx: idx, blobs: blobs, rem: rem, fsErr: fsErr}, nil
 }
 
 // runServe runs the daemon in the foreground.
@@ -158,6 +167,10 @@ func (a *app) runServe(ctx context.Context) int {
 		return exitError
 	}
 	defer st.close()
+	if st.fsErr != nil {
+		logf("cache volume: %v; assuming the cautious profile", st.fsErr)
+	}
+	logf("cache volume: %v", st.blobs.Filesystem())
 
 	c := cache.New(cache.Params{
 		Config: cfg, Index: st.idx, Blobs: st.blobs, Remote: st.rem, Logf: logf,
@@ -536,9 +549,13 @@ func (a *app) printStatus(cfg *config.Config, actions, objects, diskBytes int64,
 	// this machine's volume, so it belongs to this report and to no other.
 	if total, avail, err := blob.VolumeUsage(cfg.Dir); err == nil && total > 0 {
 		used := total - avail
-		a.outf("volume      %s used of %s (%.1f%%, %s free)\n",
+		// The filesystem's name is one more statfs, and it explains the
+		// accounting's timings. A failed detection names it "unknown", which is
+		// also what the daemon would have assumed.
+		fsys, _ := blob.DetectFilesystem(cfg.Dir)
+		a.outf("volume      %s used of %s (%.1f%%, %s free, %s)\n",
 			config.FormatBytes(int64(used)), config.FormatBytes(int64(total)),
-			100*float64(used)/float64(total), config.FormatBytes(int64(avail)))
+			100*float64(used)/float64(total), config.FormatBytes(int64(avail)), fsys.Name)
 	}
 
 	a.printTTL(ttl)

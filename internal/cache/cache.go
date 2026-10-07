@@ -50,6 +50,10 @@ type Cache struct {
 	// real disk to the point the floor exists for.
 	volumeUsage func(dir string) (total, avail uint64, err error)
 
+	// freed is what recent passes released, credited to the floor's free-space
+	// reading for the filesystem's free lag. See freedLedger.
+	freed freedLedger
+
 	// evictSoon is signalled when a write into the store finds the disk full,
 	// so the daemon can run a pass now rather than at its next tick. It is
 	// buffered to one: a burst of failed writes is one request, not a queue.
@@ -402,6 +406,10 @@ func (c *Cache) record(a ids.ActionID, o ids.OutputID, path string, size, diskBy
 // Metrics returns a snapshot of the counters.
 func (c *Cache) Metrics() MetricsSnapshot { return c.metrics.Snapshot() }
 
+// Filesystem reports the profile of the filesystem the body store was opened
+// on, for status and metrics.
+func (c *Cache) Filesystem() blob.Filesystem { return c.blobs.Filesystem() }
+
 // UploadQueue reports how many uploads are waiting and how many may wait.
 //
 // It is not part of Metrics because it is not the same kind of number. Those
@@ -456,6 +464,9 @@ func (c *Cache) EvictWith(ctx context.Context, maxBytes int64, ttl time.Duration
 		}
 		return nil
 	})
+	// Recorded before the error check: a pass that fails part way has still
+	// committed and deleted what it pruned before failing.
+	c.freed.record(time.Now(), res.BytesFreed)
 	if err != nil {
 		return res, fmt.Errorf("EvictWith: %w", err)
 	}
@@ -475,6 +486,13 @@ func (c *Cache) EvictWith(ctx context.Context, maxBytes int64, ttl time.Duration
 // A floor that cannot be read is skipped rather than treated as zero free
 // space: refusing to cache on a platform without statfs would break a working
 // configuration to enforce a setting it cannot honour.
+//
+// The free figure is credited with what passes freed inside the filesystem's
+// free lag, because statfs has not caught up with those deletions yet. Without
+// the credit, two passes a few seconds apart on ZFS each evict the full
+// shortfall. The credit can overstate the space briefly — a recorded cost is an
+// estimate — but only for the length of the window, after which the plain
+// statfs figure decides again.
 func (c *Cache) applyFreeFloor(maxBytes int64) int64 {
 	floor := c.cfg.MinFreeBytes
 	if floor <= 0 {
@@ -485,10 +503,11 @@ func (c *Cache) applyFreeFloor(maxBytes int64) int64 {
 		c.logf("free-space floor: %v", err)
 		return maxBytes
 	}
-	if avail >= uint64(floor) {
+	credit := c.freed.recent(time.Now(), c.blobs.Filesystem().FreeLag)
+	if avail+uint64(credit) >= uint64(floor) {
 		return maxBytes
 	}
-	shortfall := floor - int64(avail)
+	shortfall := floor - int64(avail) - credit
 	st, err := c.idx.Stats()
 	if err != nil {
 		c.logf("free-space floor: %v", err)
@@ -498,8 +517,8 @@ func (c *Cache) applyFreeFloor(maxBytes int64) int64 {
 	if maxBytes > 0 && maxBytes <= target {
 		return maxBytes
 	}
-	c.logf("free-space floor: %d bytes free, want %d; evicting to %d of %d recorded bytes",
-		avail, floor, target, st.DiskBytes)
+	c.logf("free-space floor: %d bytes free (%d more freed and not yet reported), want %d; evicting to %d of %d recorded bytes",
+		avail, credit, floor, target, st.DiskBytes)
 	return target
 }
 

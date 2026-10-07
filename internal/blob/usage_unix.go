@@ -15,15 +15,6 @@ import (
 // is unrelated to the filesystem's actual block size.
 const blockSize = 512
 
-// allocationSettleWindow is how long after a write the allocated-blocks figure
-// must be left alone.
-//
-// ZFS defers allocation to the next transaction group, so a file written moments
-// ago reports one block however large it is. Five seconds is the usual txg
-// interval; doubling it costs nothing, because the only consequence of waiting
-// longer is that a body keeps its provisional figure for one more eviction pass.
-const allocationSettleWindow = 10 * time.Second
-
 // diskBytes reports a provisional cost for a body that was just written.
 //
 // It is the larger of the allocated blocks and the logical length, because
@@ -70,13 +61,18 @@ func diskBytes(fi fs.FileInfo) int64 {
 // Once the write has settled the allocated figure is simply the truth — smaller
 // than the length when the data compressed, larger when a small file was rounded
 // up to a block — so it is used as-is.
-func settledBytes(fi fs.FileInfo, now time.Time) (int64, bool) {
+//
+// settle is the filesystem's window (see Filesystem.AllocationSettle). On XFS
+// and ext4 it is zero: both count delayed-allocation reservations in st_blocks
+// as soon as the data is written, so the deferred-allocation undercount above
+// never happens there and a fresh body can be believed at once.
+func settledBytes(fi fs.FileInfo, now time.Time, settle time.Duration) (int64, bool) {
 	size := fi.Size()
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
 		return size, false
 	}
-	if now.Sub(fi.ModTime()) < allocationSettleWindow {
+	if now.Sub(fi.ModTime()) < settle {
 		return diskBytes(fi), false
 	}
 	allocated := int64(st.Blocks) * blockSize

@@ -194,6 +194,7 @@ func TestMetricsExposition(t *testing.T) {
 		HaveVolume:       true,
 		VolumeTotalBytes: 900 << 30,
 		VolumeAvailBytes: 64 << 30,
+		VolumeFSType:     "xfs",
 		TTL:              "168h0m0s",
 		TTLSeconds:       604800,
 		Uptime:           "4s",
@@ -242,7 +243,7 @@ func TestMetricsExposition(t *testing.T) {
 		"plaid_cache_min_free_bytes", "plaid_cache_volume_total_bytes", "plaid_cache_volume_avail_bytes",
 		"plaid_cache_oldest_entry_age_seconds", "plaid_cache_newest_entry_age_seconds",
 		"plaid_cache_remote_tier_enabled", "plaid_cache_activity_start_time_seconds",
-		"plaid_cache_build_info",
+		"plaid_cache_build_info", "plaid_cache_volume_info",
 		// A backlog rises and falls, so a counter here would make every
 		// dashboard built on it nonsense — and this is the one family meant to
 		// be watched climbing, before the drops it predicts have happened.
@@ -281,6 +282,7 @@ func TestMetricsExposition(t *testing.T) {
 	e.wantSample(t, "plaid_cache_remote_tier_enabled", 1)
 	e.wantSample(t, "plaid_cache_activity_start_time_seconds", 1_700_000_000)
 	e.wantSample(t, `plaid_cache_build_info{version="plaid-cache v9.9.9"}`, 1)
+	e.wantSample(t, `plaid_cache_volume_info{fstype="xfs"}`, 1)
 
 	e.wantSample(t, `plaid_cache_gets_total{result="local_hit"}`, 205)
 	e.wantSample(t, `plaid_cache_gets_total{result="remote_hit"}`, 3)
@@ -344,7 +346,9 @@ func TestMetricsExposition(t *testing.T) {
 			labels := series[i:]
 			switch {
 			case strings.HasPrefix(labels, `{result="`), strings.HasPrefix(labels, `{version="`),
-				strings.HasPrefix(labels, `{conn="`), strings.HasPrefix(labels, `{operation="`):
+				strings.HasPrefix(labels, `{conn="`), strings.HasPrefix(labels, `{operation="`),
+				// One of a fixed handful of filesystem names, so as bounded as the rest.
+				strings.HasPrefix(labels, `{fstype="`):
 			default:
 				t.Fatalf("series %s carries an unexpected label; only bounded ones belong here", series)
 			}
@@ -366,6 +370,8 @@ func TestMetricsOmitWhatIsNotKnown(t *testing.T) {
 		// here is exactly what a free-space alert fires on.
 		"plaid_cache_volume_total_bytes",
 		"plaid_cache_volume_avail_bytes",
+		// A daemon that did not report a filesystem has no info series to give.
+		"plaid_cache_volume_info",
 	} {
 		if _, ok := e.types[f]; ok {
 			t.Fatalf("%s was emitted for a cache that has no such measurement", f)

@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // volumeReporting makes the cache's volume report avail free bytes, so a test
@@ -132,6 +133,61 @@ func TestFreeFloorUnreadableVolumeFallsBackToTheCeiling(t *testing.T) {
 	}
 	if len(tc.logs.matching("free-space floor: no statfs")) == 0 {
 		t.Fatal("the skipped floor was not logged")
+	}
+}
+
+// backdateFreed ages every entry in the freed ledger by d, as if the passes that
+// recorded them had run that much earlier.
+//
+// This rather than a clock seam on Cache, for the reason age gives in
+// reconcile_test.go: the real code reads time.Now() against timestamps it stored,
+// and moving the stored timestamps exercises exactly that comparison, on the path
+// the daemon takes, without a clock field that production would never set. The
+// ledger is this package's own state, so reaching into it here is no more than
+// age's os.Chtimes on a body.
+func backdateFreed(tc *testCache, d time.Duration) {
+	tc.cache.freed.mu.Lock()
+	defer tc.cache.freed.mu.Unlock()
+	for i := range tc.cache.freed.entries {
+		tc.cache.freed.entries[i].at = tc.cache.freed.entries[i].at.Add(-d)
+	}
+}
+
+// TestFreeFloorCreditsSpaceNotYetReported pins the free-lag credit: with statfs
+// still reporting the same free space after a floor-driven pass, as ZFS does
+// until the frees land, a second pass inside the lag window evicts nothing more
+// — and once the window has passed, the unchanged figure is believed and a pass
+// evicts again.
+func TestFreeFloorCreditsSpaceNotYetReported(t *testing.T) {
+	tc := newTestCache(t, withMaxBytes(1<<40), withMinFreeBytes(1<<30))
+	ns := putFour(t, tc)
+	volumeReporting(tc, 1<<30-1) // one byte short, and it stays one byte short
+
+	if lag := tc.blobs.Filesystem().FreeLag; lag <= 0 {
+		t.Fatalf("test store has free lag %v, want the cautious non-zero window", lag)
+	}
+
+	pass := func(want int64, why string) {
+		t.Helper()
+		res, err := tc.cache.Evict(t.Context())
+		if err != nil {
+			t.Fatalf("Evict: %v", err)
+		}
+		if res.ActionsPruned != want {
+			t.Fatalf("%s: pruned %d actions, want %d", why, res.ActionsPruned, want)
+		}
+	}
+
+	pass(1, "first pass")
+	pass(0, "second pass inside the free lag")
+	if got := present(t, tc, ns); got[0] || !got[1] || !got[2] || !got[3] {
+		t.Fatalf("present = %v, want only the oldest entry gone", got)
+	}
+
+	backdateFreed(tc, tc.blobs.Filesystem().FreeLag)
+	pass(1, "pass after the free lag")
+	if got := present(t, tc, ns); got[1] || !got[2] || !got[3] {
+		t.Fatalf("present = %v, want the next oldest gone too", got)
 	}
 }
 
