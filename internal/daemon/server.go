@@ -620,6 +620,7 @@ func (s *Server) status() StatusResponse {
 		Version:       s.version,
 		RemoteEnabled: s.cfg.RemoteEnabled(),
 		MaxBytes:      s.cfg.MaxBytes,
+		MinFreeBytes:  s.cfg.MinFreeBytes,
 		TTL:           s.cfg.TTL.String(),
 		TTLSeconds:    s.cfg.TTL.Seconds(),
 		Uptime:        uptime.String(),
@@ -628,6 +629,9 @@ func (s *Server) status() StatusResponse {
 		RRCC:          s.rrccMetrics(),
 	}
 	r.UploadQueueDepth, r.UploadQueueCapacity = s.cache.UploadQueue()
+	if total, avail, err := blob.VolumeUsage(s.cfg.Dir); err == nil && total > 0 {
+		r.HaveVolume, r.VolumeTotalBytes, r.VolumeAvailBytes = true, total, avail
+	}
 	if rs, ok := s.cache.RemoteStats(); ok {
 		r.Remote = &rs
 	}

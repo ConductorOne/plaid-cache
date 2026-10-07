@@ -90,6 +90,11 @@ func TestLoadDefaults(t *testing.T) {
 	if c.TTL != defaultTTL {
 		t.Fatalf("TTL = %v, want %v", c.TTL, defaultTTL)
 	}
+	// The free-space floor is opt-in, so an existing configuration evicts
+	// exactly as it did before the floor existed.
+	if c.MinFreeBytes != 0 {
+		t.Fatalf("MinFreeBytes = %d by default, want 0 (no floor)", c.MinFreeBytes)
+	}
 	if c.TouchGranularity != defaultTouchGranularity {
 		t.Fatalf("TouchGranularity = %v, want %v", c.TouchGranularity, defaultTouchGranularity)
 	}
@@ -154,6 +159,8 @@ func TestLoadDirChain(t *testing.T) {
 func TestLoadRejectsBadValues(t *testing.T) {
 	cases := []struct{ name, value string }{
 		{"PLAID_GOCACHE_MAX_BYTES", "twenty gigs"},
+		{"PLAID_GOCACHE_MIN_FREE_BYTES", "plenty"},
+		{"PLAID_GOCACHE_MIN_FREE_BYTES", "-1"},
 		{"PLAID_GOCACHE_TTL", "7 days"},
 		{"PLAID_GOCACHE_TTL", "-1h"},
 		{"PLAID_GOCACHE_TOUCH_GRANULARITY", "soon"},
@@ -275,6 +282,7 @@ func clearEnv(t *testing.T) {
 	for _, n := range []string{
 		"PLAID_GOCACHE_DIR",
 		"PLAID_GOCACHE_MAX_BYTES",
+		"PLAID_GOCACHE_MIN_FREE_BYTES",
 		"PLAID_GOCACHE_TTL",
 		"PLAID_GOCACHE_TOUCH_GRANULARITY",
 		"PLAID_GOCACHE_S3_BUCKET",
@@ -392,5 +400,21 @@ func TestListenerSettingsAreValidFileKeys(t *testing.T) {
 	}
 	if !c.DisableBazelVerify {
 		t.Fatalf("DisableBazelVerify = false, want true")
+	}
+}
+
+// TestLoadMinFreeBytes pins that the free-space floor takes the same byte
+// syntax as the size ceiling it sits beside.
+func TestLoadMinFreeBytes(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PLAID_GOCACHE_DIR", t.TempDir())
+	t.Setenv("PLAID_GOCACHE_MIN_FREE_BYTES", "50GiB")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := int64(50 << 30); c.MinFreeBytes != want {
+		t.Fatalf("MinFreeBytes = %d, want %d", c.MinFreeBytes, want)
 	}
 }

@@ -260,7 +260,7 @@ hit rate    59.9% of 347 lookups
 ...
 ```
 
-There is no `directory`, no `config`, and no `volume` line, and `remote` says whether a shared tier is configured rather than naming the bucket. The endpoint reports counters and the limits being enforced; it does not report where the cache lives, what file configured it, or what it uploads to. A flag named `-from` and not `-remote` because in this tool "remote" is the S3 tier that every report has a line about.
+There is no `directory`, no `config`, and no `volume` line, and `remote` says whether a shared tier is configured rather than naming the bucket. The endpoint reports counters, the limits being enforced, and how full the daemon's volume is (in `/metrics`, not in this report); it does not report where the cache lives, what file configured it, or what it uploads to. A flag named `-from` and not `-remote` because in this tool "remote" is the S3 tier that every report has a line about.
 
 `/metrics` is Prometheus text exposition, which an OpenTelemetry Collector scrapes as it stands through its `prometheus` receiver — there is no push exporter here, and none is needed to get these numbers into an OTel pipeline. The gauges describe the cache now, the counters are the persisted lifetime tallies that survive the daemon's idle exit, and every number is rendered from the same report `status` prints, so a scrape and a status report taken together cannot disagree:
 
@@ -269,6 +269,8 @@ There is no `directory`, no `config`, and no `volume` line, and `remote` says wh
 | `plaid_cache_actions`, `plaid_cache_objects` | gauge | Entries and distinct bodies in the index. |
 | `plaid_cache_disk_bytes` | gauge | Bytes of stored bodies the index accounts for. |
 | `plaid_cache_max_bytes`, `plaid_cache_ttl_seconds` | gauge | The limits eviction is enforcing. Zero disables that constraint. |
+| `plaid_cache_min_free_bytes` | gauge | The free-space floor eviction keeps on the volume. Zero disables it. |
+| `plaid_cache_volume_total_bytes`, `plaid_cache_volume_avail_bytes` | gauge | The filesystem holding the cache. Absent where it cannot be measured. Alert on these, not on `disk_bytes`: the disk can fill with things the index does not count. |
 | `plaid_cache_oldest_entry_age_seconds`, `plaid_cache_newest_entry_age_seconds` | gauge | The age span, absent for a cache with no entries. |
 | `plaid_cache_uptime_seconds`, `plaid_cache_build_info` | gauge | This daemon and the build serving it. |
 | `plaid_cache_remote_tier_enabled` | gauge | 1 when a shared tier is configured. |
@@ -413,6 +415,23 @@ or the environment variable set.
 Zero is a meaningful value for either limit and disables that constraint, so
 `-max-bytes=0` prunes on age alone and `-ttl=0` on size alone.
 
+### Keeping the disk from filling
+
+`max-bytes` bounds what the index accounts for, and that is not everything on the
+disk. Partial uploads waiting to be resumed, the index itself, and any error in a
+recorded cost all sit outside it. A ceiling set a fixed margin below the volume's
+size holds only as long as those stay inside the margin. When they outgrow it, a
+900 GiB volume with an 810 GiB ceiling runs out of space, and every write fails
+while the cache still reports itself under budget.
+
+`PLAID_GOCACHE_MIN_FREE_BYTES` is the guard that reads the disk instead. When the
+volume has less free space than the floor, each eviction pass frees the
+shortfall from the oldest entries, even while the recorded total is below
+`max-bytes`. It applies to the ticker and to `gc` alike, and it can only make a
+pass prune more, never less. It is off by default. A dedicated cache volume
+should set it, for example to 5% of the volume, and keep `max-bytes` as the
+budget it is sized for.
+
 ### What `max-bytes` counts
 
 Allocated bytes on disk, not the lengths of the files.
@@ -550,6 +569,7 @@ be a surprising amount of reach for this one to have.
 | `PLAID_GOCACHE_CONFIG` | Configuration file to read, overriding the XDG lookup. A file named here must exist. | `$XDG_CONFIG_HOME/plaid-cache/config` |
 | `PLAID_GOCACHE_DIR` | Local cache root. | `$XDG_CACHE_HOME/plaid-cache`, else `os.UserCacheDir()/plaid-cache` |
 | `PLAID_GOCACHE_MAX_BYTES` | Local size ceiling. Accepts `50GB`, `1TiB`. | `20GB` |
+| `PLAID_GOCACHE_MIN_FREE_BYTES` | Free space eviction keeps on the cache's volume, whatever filled it. Same syntax as `MAX_BYTES`. See [Keeping the disk from filling](#keeping-the-disk-from-filling). | `0` (no floor) |
 | `PLAID_GOCACHE_TTL` | Local entry TTL, as a Go duration. | `168h` |
 | `PLAID_GOCACHE_S3_BUCKET` | Remote bucket. Empty means local only. | empty |
 | `PLAID_GOCACHE_S3_REGION` | Remote region. | from the AWS config chain |

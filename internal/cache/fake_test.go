@@ -264,6 +264,11 @@ func withCompactAfter(n int64) option {
 	return func(c *config.Config) { c.CompactAfterPruned = n }
 }
 
+// withMinFreeBytes sets the free-space floor on the cache's volume.
+func withMinFreeBytes(n int64) option {
+	return func(c *config.Config) { c.MinFreeBytes = n }
+}
+
 // withMaxBytes sets the eviction size ceiling.
 func withMaxBytes(n int64) option {
 	return func(c *config.Config) { c.MaxBytes = n }

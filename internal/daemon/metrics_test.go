@@ -190,6 +190,10 @@ func TestMetricsExposition(t *testing.T) {
 		Objects:          206,
 		DiskBytes:        36473344,
 		MaxBytes:         1 << 30,
+		MinFreeBytes:     50 << 30,
+		HaveVolume:       true,
+		VolumeTotalBytes: 900 << 30,
+		VolumeAvailBytes: 64 << 30,
 		TTL:              "168h0m0s",
 		TTLSeconds:       604800,
 		Uptime:           "4s",
@@ -235,6 +239,7 @@ func TestMetricsExposition(t *testing.T) {
 	for _, f := range []string{
 		"plaid_cache_actions", "plaid_cache_objects", "plaid_cache_disk_bytes",
 		"plaid_cache_max_bytes", "plaid_cache_ttl_seconds", "plaid_cache_uptime_seconds",
+		"plaid_cache_min_free_bytes", "plaid_cache_volume_total_bytes", "plaid_cache_volume_avail_bytes",
 		"plaid_cache_oldest_entry_age_seconds", "plaid_cache_newest_entry_age_seconds",
 		"plaid_cache_remote_tier_enabled", "plaid_cache_activity_start_time_seconds",
 		"plaid_cache_build_info",
@@ -265,6 +270,9 @@ func TestMetricsExposition(t *testing.T) {
 	e.wantSample(t, "plaid_cache_objects", 206)
 	e.wantSample(t, "plaid_cache_disk_bytes", 36473344)
 	e.wantSample(t, "plaid_cache_max_bytes", 1<<30)
+	e.wantSample(t, "plaid_cache_min_free_bytes", 50<<30)
+	e.wantSample(t, "plaid_cache_volume_total_bytes", 900<<30)
+	e.wantSample(t, "plaid_cache_volume_avail_bytes", 64<<30)
 	// Seconds, not the "168h0m0s" the human report prints and not milliseconds.
 	e.wantSample(t, "plaid_cache_ttl_seconds", 604800)
 	e.wantSample(t, "plaid_cache_uptime_seconds", 4)
@@ -354,6 +362,10 @@ func TestMetricsOmitWhatIsNotKnown(t *testing.T) {
 		"plaid_cache_oldest_entry_age_seconds",
 		"plaid_cache_newest_entry_age_seconds",
 		"plaid_cache_activity_start_time_seconds",
+		// A volume that could not be measured is not a full one, and a zero
+		// here is exactly what a free-space alert fires on.
+		"plaid_cache_volume_total_bytes",
+		"plaid_cache_volume_avail_bytes",
 	} {
 		if _, ok := e.types[f]; ok {
 			t.Fatalf("%s was emitted for a cache that has no such measurement", f)

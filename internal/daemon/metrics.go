@@ -68,6 +68,22 @@ func renderMetrics(r StatusResponse) []byte {
 	writeFamily(&b, "ttl_seconds", "gauge",
 		"Configured age limit for an unused entry. Zero disables the age constraint.",
 		sample{value: r.TTLSeconds})
+	writeFamily(&b, "min_free_bytes", "gauge",
+		"Configured free-space floor on the cache's volume. Zero disables it.",
+		sample{value: float64(r.MinFreeBytes)})
+
+	// The volume itself, beside the budget, because disk_bytes counts only what
+	// the index records and the disk can fill with things it does not: partial
+	// uploads, the index, a recorded cost that is wrong. Alerting on these is
+	// alerting on the thing that actually breaks builds. Absent rather than zero
+	// where the platform cannot measure the volume, since zero free bytes is the
+	// one value that must never be a placeholder.
+	if r.HaveVolume {
+		writeFamily(&b, "volume_total_bytes", "gauge",
+			"Size of the filesystem holding the cache.", sample{value: float64(r.VolumeTotalBytes)})
+		writeFamily(&b, "volume_avail_bytes", "gauge",
+			"Bytes free to this process on the filesystem holding the cache.", sample{value: float64(r.VolumeAvailBytes)})
+	}
 
 	// The age span says whether the TTL is doing anything: an oldest entry
 	// younger than the TTL means only the size ceiling is evicting. An empty

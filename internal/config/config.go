@@ -75,6 +75,18 @@ type Config struct {
 	// the size constraint, leaving only the TTL.
 	MaxBytes int64
 
+	// MinFreeBytes is the free space eviction keeps on the volume holding the
+	// cache. Zero, the default, disables it.
+	//
+	// MaxBytes bounds what the index accounts for, and that is not everything on
+	// the disk: partial uploads in the staging directory, the index itself, and
+	// any error in the recorded costs all sit outside it. A cache sized to its
+	// volume with a fixed margin below MaxBytes runs the disk out the moment
+	// those outgrow the margin; a shared Bazel cache has filled a 900GiB volume
+	// that way with an 810GiB ceiling. The floor reads the filesystem, so
+	// it holds whatever the space was spent on.
+	MinFreeBytes int64
+
 	// TTL is how long an unused entry survives. Zero disables the TTL
 	// constraint, leaving only the size ceiling.
 	TTL time.Duration
@@ -267,6 +279,12 @@ func Load() (*Config, error) {
 	if c.MaxBytes, err = envBytes(src, "PLAID_GOCACHE_MAX_BYTES", defaultMaxBytes); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
+	if c.MinFreeBytes, err = envBytes(src, "PLAID_GOCACHE_MIN_FREE_BYTES", 0); err != nil {
+		return nil, fmt.Errorf("Load: %w", err)
+	}
+	if c.MinFreeBytes < 0 {
+		return nil, fmt.Errorf("Load: PLAID_GOCACHE_MIN_FREE_BYTES: got %d, want >= 0", c.MinFreeBytes)
+	}
 	if c.TTL, err = envDuration(src, "PLAID_GOCACHE_TTL", defaultTTL); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
@@ -339,6 +357,7 @@ const configFileName = "config"
 var settingNames = map[string]bool{
 	"PLAID_GOCACHE_DIR":                  true,
 	"PLAID_GOCACHE_MAX_BYTES":            true,
+	"PLAID_GOCACHE_MIN_FREE_BYTES":       true,
 	"PLAID_GOCACHE_TTL":                  true,
 	"PLAID_GOCACHE_S3_BUCKET":            true,
 	"PLAID_GOCACHE_S3_REGION":            true,

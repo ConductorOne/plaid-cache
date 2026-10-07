@@ -147,16 +147,29 @@ type StatusResponse struct {
 	// go to is the operator's business and not something this report discloses.
 	RemoteEnabled bool `json:"remote_enabled"`
 
-	PID       int                   `json:"pid"`
-	Actions   int64                 `json:"actions"`
-	Objects   int64                 `json:"objects"`
-	DiskBytes int64                 `json:"disk_bytes"`
-	MaxBytes  int64                 `json:"max_bytes"`
-	TTL       string                `json:"ttl"`
-	Uptime    string                `json:"uptime"`
-	OldestAge string                `json:"oldest_age,omitempty"`
-	NewestAge string                `json:"newest_age,omitempty"`
-	Metrics   cache.MetricsSnapshot `json:"metrics"`
+	PID       int   `json:"pid"`
+	Actions   int64 `json:"actions"`
+	Objects   int64 `json:"objects"`
+	DiskBytes int64 `json:"disk_bytes"`
+	MaxBytes  int64 `json:"max_bytes"`
+
+	// MinFreeBytes is the configured free-space floor, zero when there is none.
+	// VolumeTotalBytes and VolumeAvailBytes are what the filesystem holding the
+	// cache reports, present only when HaveVolume is set: a platform without
+	// statfs has no figure to give, and zeros would read as a full disk.
+	//
+	// They are here because DiskBytes counts only what the index records, and
+	// the disk can fill with things it does not: a 900GiB volume has run out of
+	// space with DiskBytes still below its ceiling.
+	MinFreeBytes     int64                 `json:"min_free_bytes"`
+	HaveVolume       bool                  `json:"have_volume"`
+	VolumeTotalBytes uint64                `json:"volume_total_bytes,omitempty"`
+	VolumeAvailBytes uint64                `json:"volume_avail_bytes,omitempty"`
+	TTL              string                `json:"ttl"`
+	Uptime           string                `json:"uptime"`
+	OldestAge        string                `json:"oldest_age,omitempty"`
+	NewestAge        string                `json:"newest_age,omitempty"`
+	Metrics          cache.MetricsSnapshot `json:"metrics"`
 
 	// RRCC records local closure observations for synthetic repository-cache entries.
 	RRCC reapi.RRCCMetricsSnapshot `json:"rrcc"`

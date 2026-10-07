@@ -44,6 +44,11 @@ type Cache struct {
 	touches *toucher
 	metrics Metrics
 
+	// volumeUsage reads the filesystem holding the cache, for the free-space
+	// floor. It is blob.VolumeUsage everywhere but in tests, which cannot fill a
+	// real disk to the point the floor exists for.
+	volumeUsage func(dir string) (total, avail uint64, err error)
+
 	// prunedSinceCompact is the tombstone debt built up since the last
 	// compaction, counted across passes rather than within one: a thousand
 	// small evictions leave as many tombstones as a single large one, and a
@@ -123,6 +128,8 @@ func New(p Params) *Cache {
 		blobs: p.Blobs,
 		rem:   rem,
 		logf:  logf,
+
+		volumeUsage: blob.VolumeUsage,
 	}
 	c.uploads = newUploader(p.Config.UploadConcurrency, p.Config.UploadQueueDepth, p.Config.UploadBlockTimeout, logf, &c.metrics)
 	c.touches = newToucher(p.Index.TouchMany, p.Config.TouchGranularity, logf)
@@ -407,6 +414,7 @@ func (c *Cache) EvictWith(ctx context.Context, maxBytes int64, ttl time.Duration
 	// Decide on measured bytes, not on the estimate taken before the filesystem
 	// had allocated anything.
 	c.reconcileBeforeEvicting(ctx, maxBytes)
+	maxBytes = c.applyFreeFloor(maxBytes)
 
 	res, err := c.idx.Evict(ctx, maxBytes, ttl, time.Now().UnixNano(), func(o ids.OutputID) error {
 		if rerr := c.blobs.Remove(o); rerr != nil {
@@ -421,6 +429,46 @@ func (c *Cache) EvictWith(ctx context.Context, maxBytes int64, ttl time.Duration
 	}
 	c.maybeCompact(res.ActionsPruned)
 	return res, nil
+}
+
+// applyFreeFloor tightens maxBytes so that a pass also restores the configured
+// free space on the cache's volume, and returns the ceiling to evict against.
+//
+// The floor is expressed as a byte ceiling rather than as a third constraint in
+// the index because the index can only count what it records. The shortfall is
+// taken off the recorded total instead, which frees that many bytes of bodies
+// whatever else the space went to. The result is never zero, because zero means
+// "no size constraint" and would turn a full disk into no eviction at all.
+//
+// A floor that cannot be read is skipped rather than treated as zero free
+// space: refusing to cache on a platform without statfs would break a working
+// configuration to enforce a setting it cannot honour.
+func (c *Cache) applyFreeFloor(maxBytes int64) int64 {
+	floor := c.cfg.MinFreeBytes
+	if floor <= 0 {
+		return maxBytes
+	}
+	_, avail, err := c.volumeUsage(c.cfg.Dir)
+	if err != nil {
+		c.logf("free-space floor: %v", err)
+		return maxBytes
+	}
+	if avail >= uint64(floor) {
+		return maxBytes
+	}
+	shortfall := floor - int64(avail)
+	st, err := c.idx.Stats()
+	if err != nil {
+		c.logf("free-space floor: %v", err)
+		return maxBytes
+	}
+	target := max(st.DiskBytes-shortfall, 1)
+	if maxBytes > 0 && maxBytes <= target {
+		return maxBytes
+	}
+	c.logf("free-space floor: %d bytes free, want %d; evicting to %d of %d recorded bytes",
+		avail, floor, target, st.DiskBytes)
+	return target
 }
 
 // compactAfterPruned is the default tombstone debt that triggers a compaction.
