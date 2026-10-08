@@ -8,8 +8,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"time"
 
+	"github.com/conductorone/plaid-cache/internal/bazel"
 	"github.com/conductorone/plaid-cache/internal/cache"
 	"github.com/conductorone/plaid-cache/internal/config"
 	"github.com/conductorone/plaid-cache/internal/daemon"
@@ -18,11 +22,12 @@ import (
 
 // runStats reports the persisted activity history.
 func (a *app) runStats(ctx context.Context) int {
-	var since string
+	var since, from string
 	var asJSON bool
 	if _, err := a.parseFlags("stats", func(f *flag.FlagSet) {
 		f.StringVar(&since, "since", "24h", "how far back to report, as a Go duration")
 		f.BoolVar(&asJSON, "json", false, "emit JSON instead of a table")
+		f.StringVar(&from, "from", "", "read history from another daemon's monitoring endpoint, e.g. localhost:9095 (default: this machine's own cache)")
 	}, a.args[1:]); err != nil {
 		a.errf("plaid-cache: %v\n", err)
 		return exitUsage
@@ -36,6 +41,10 @@ func (a *app) runStats(ctx context.Context) int {
 		a.errf("plaid-cache: -since: %v is negative\n", window)
 		return exitUsage
 	}
+	if from != "" {
+		// Local configuration cannot describe, or prevent reading, another daemon.
+		return a.runStatsFrom(ctx, from, window, asJSON)
+	}
 
 	cfg, ok := a.loadConfig()
 	if !ok {
@@ -45,16 +54,107 @@ func (a *app) runStats(ctx context.Context) int {
 	if !ok {
 		return exitError
 	}
+	return a.renderStats(resp, window, cfg.RemoteEnabled(), asJSON, "")
+}
+
+// maxStatsBody leaves ample room for two weeks of hourly counters, including
+// int64-sized values, without letting a wrong endpoint stream unbounded data.
+const maxStatsBody = 1 << 20
+
+// runStatsFrom refuses failed or incomplete reports instead of inventing a cache
+// with no activity. It deliberately never opens this machine's configuration.
+func (a *app) runStatsFrom(ctx context.Context, addr string, window time.Duration, asJSON bool) int {
+	endpoint, err := monitoringEndpoint(addr, bazel.StatsPath)
+	if err != nil {
+		a.errf("plaid-cache: %v\n", err)
+		return exitUsage
+	}
+	endpoint += "?" + url.Values{"since": {window.String()}}.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		a.errf("plaid-cache: %v\n", err)
+		return exitError
+	}
+	resp, err := (&http.Client{Timeout: statusFetchTimeout}).Do(req)
+	if err != nil {
+		a.errf("plaid-cache: %s: %v\n", endpoint, err)
+		return exitError
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		a.errf("plaid-cache: %s: %s\n", endpoint, resp.Status)
+		if resp.StatusCode == http.StatusNotFound {
+			a.errf("plaid-cache: that daemon may be serving Bazel without -bazel-monitoring\n")
+		}
+		return exitError
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxStatsBody+1))
+	if err != nil {
+		a.errf("plaid-cache: %s: %v\n", endpoint, err)
+		return exitError
+	}
+	if len(body) > maxStatsBody {
+		a.errf("plaid-cache: %s: stats report exceeds %d bytes\n", endpoint, maxStatsBody)
+		return exitError
+	}
+	// Even an idle cache reports both counter sets and the selected cutoff.
+	// Pointer fields distinguish legitimate zeros from unrelated or partial JSON.
+	var fields struct {
+		Lifetime      *cache.MetricsSnapshot `json:"lifetime"`
+		LifetimeSince *int64                 `json:"lifetime_since"`
+		Window        *cache.MetricsSnapshot `json:"window"`
+		WindowSince   *int64                 `json:"window_since"`
+		Buckets       json.RawMessage        `json:"buckets"`
+		Err           string                 `json:"err"`
+	}
+	if err := json.Unmarshal(body, &fields); err != nil {
+		a.errf("plaid-cache: %s: not a stats report: %v\n", endpoint, err)
+		return exitError
+	}
+	if fields.Err != "" {
+		a.errf("plaid-cache: %s: %s\n", endpoint, fields.Err)
+		return exitError
+	}
+	if fields.Lifetime == nil || fields.LifetimeSince == nil ||
+		fields.Window == nil || fields.WindowSince == nil || len(fields.Buckets) == 0 {
+		a.errf("plaid-cache: %s: not a stats report: missing history fields\n", endpoint)
+		return exitError
+	}
+	r := daemon.StatsResponse{
+		Lifetime: *fields.Lifetime, LifetimeSince: *fields.LifetimeSince,
+		Window: *fields.Window, WindowSince: *fields.WindowSince,
+	}
+	if err := json.Unmarshal(fields.Buckets, &r.Buckets); err != nil {
+		a.errf("plaid-cache: %s: not a stats report: %v\n", endpoint, err)
+		return exitError
+	}
+	// Historical uploads remain meaningful even if the daemon's S3 tier is now
+	// disabled. Never decide whether to show them using the caller's configuration.
+	return a.renderStats(r, window, true, asJSON, endpoint)
+}
+
+// renderStats keeps local JSON unchanged; remote output also names its source.
+func (a *app) renderStats(r daemon.StatsResponse, window time.Duration, uploads, asJSON bool, endpoint string) int {
 	if asJSON {
+		var report any = r
+		if endpoint != "" {
+			report = struct {
+				Endpoint string `json:"endpoint"`
+				daemon.StatsResponse
+			}{Endpoint: endpoint, StatsResponse: r}
+		}
 		enc := json.NewEncoder(a.stdout)
 		enc.SetIndent("", "  ")
-		if err := enc.Encode(resp); err != nil {
+		if err := enc.Encode(report); err != nil {
 			a.errf("plaid-cache: %v\n", err)
 			return exitError
 		}
 		return exitOK
 	}
-	a.printStats(cfg, resp, window)
+	if endpoint != "" {
+		a.outf("endpoint    %s\n", endpoint)
+	}
+	a.printStats(uploads, r, window)
 	return exitOK
 }
 
@@ -112,9 +212,9 @@ func (a *app) collectStats(ctx context.Context, cfg *config.Config, window time.
 }
 
 // printStats renders the report.
-func (a *app) printStats(cfg *config.Config, r daemon.StatsResponse, window time.Duration) {
+func (a *app) printStats(uploads bool, r daemon.StatsResponse, window time.Duration) {
 	a.outf("window      last %s, %s\n", window, hoursWithActivity(r.Buckets))
-	a.printActivity(cfg, r.Window)
+	a.printActivity(uploads, r.Window)
 
 	if r.Lifetime.Lookups() > 0 {
 		rate, _ := r.Lifetime.HitRate()
@@ -148,7 +248,7 @@ func (a *app) printStats(cfg *config.Config, r daemon.StatsResponse, window time
 }
 
 // printActivity renders one counter set.
-func (a *app) printActivity(cfg *config.Config, act cache.MetricsSnapshot) {
+func (a *app) printActivity(uploads bool, act cache.MetricsSnapshot) {
 	if rate, ok := act.HitRate(); ok {
 		a.outf("hit rate    %.1f%% of %d lookups\n", 100*rate, act.Lookups())
 	} else {
@@ -160,7 +260,7 @@ func (a *app) printActivity(cfg *config.Config, act cache.MetricsSnapshot) {
 	if act.GetRepair > 0 {
 		a.outf("repairs     %d (index entries dropped for missing bodies)\n", act.GetRepair)
 	}
-	if cfg.RemoteEnabled() {
+	if uploads {
 		a.outf("uploads     %d ok, %d failed, %d dropped, %d skipped\n",
 			act.UploadOK, act.UploadFail, act.UploadDrop, act.UploadSkip)
 	}

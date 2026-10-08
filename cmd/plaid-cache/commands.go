@@ -112,7 +112,7 @@ func (a *app) runServe(ctx context.Context) int {
 		fs.StringVar(&bazelGRPCAddr, "bazel-grpc-addr", "",
 			"also serve Bazel's gRPC remote-cache protocol on this address, e.g. localhost:9096 (default: PLAID_GOCACHE_BAZEL_GRPC_ADDR)")
 		fs.BoolVar(&bazelMonitoring, "bazel-monitoring", false,
-			"also serve "+bazel.StatusPath+" and "+bazel.MetricsPath+" on the Bazel HTTP address (default: PLAID_GOCACHE_BAZEL_MONITORING)")
+			"also serve "+bazel.StatusPath+", "+bazel.MetricsPath+", and "+bazel.StatsPath+" on the Bazel HTTP address (default: PLAID_GOCACHE_BAZEL_MONITORING)")
 		fs.StringVar(&pprofAddr, "pprof-addr", "",
 			"serve Go runtime profiles on this address, e.g. 127.0.0.1:6060 (default: PLAID_GOCACHE_PPROF_ADDR)")
 	}
@@ -198,8 +198,8 @@ func (a *app) runServe(ctx context.Context) int {
 			// Worth a line of its own: this is the one setting that makes the
 			// listener say something about its host rather than only about the
 			// blobs it was asked for.
-			logf("serving monitoring on http://%s%s and http://%s%s",
-				bazelLn.Addr(), bazel.StatusPath, bazelLn.Addr(), bazel.MetricsPath)
+			logf("serving monitoring on http://%s%s, http://%s%s, and http://%s%s",
+				bazelLn.Addr(), bazel.StatusPath, bazelLn.Addr(), bazel.MetricsPath, bazelLn.Addr(), bazel.StatsPath)
 		}
 		listenerWG.Add(1)
 		go func() {
@@ -425,7 +425,7 @@ const maxStatusBody = 1 << 20
 // report that could not be obtained must never be mistakable for a cache with
 // nothing in it.
 func (a *app) runStatusFrom(ctx context.Context, addr string) int {
-	endpoint, err := statusEndpoint(addr)
+	endpoint, err := monitoringEndpoint(addr, bazel.StatusPath)
 	if err != nil {
 		a.errf("plaid-cache: %v\n", err)
 		return exitUsage
@@ -481,7 +481,7 @@ func (a *app) runStatusFrom(ctx context.Context, addr string) int {
 	return exitOK
 }
 
-// statusEndpoint turns what a person typed into the URL of a status route.
+// monitoringEndpoint turns what a person typed into a fixed report URL.
 //
 // A bare host and port is the common case and is what the -bazel-addr flag on
 // the other end took, so it is accepted as written and given the http scheme.
@@ -489,7 +489,7 @@ func (a *app) runStatusFrom(ctx context.Context, addr string) int {
 // place, and accepting a path would invite the same prefix confusion the cache
 // routes refuse — so the one path a caller may write is the one they would get
 // anyway.
-func statusEndpoint(addr string) (string, error) {
+func monitoringEndpoint(addr, path string) (string, error) {
 	s := strings.TrimSpace(addr)
 	if !strings.Contains(s, "://") {
 		s = "http://" + s
@@ -504,10 +504,10 @@ func statusEndpoint(addr string) (string, error) {
 	if u.Host == "" {
 		return "", fmt.Errorf("-from: %q names no host (want e.g. cache-host:9095)", addr)
 	}
-	if p := strings.TrimSuffix(u.Path, "/"); p != "" && p != bazel.StatusPath {
-		return "", fmt.Errorf("-from: %q: the endpoint is %s, and nothing is served under a prefix", addr, bazel.StatusPath)
+	if p := strings.TrimSuffix(u.Path, "/"); p != "" && p != path {
+		return "", fmt.Errorf("-from: %q: the endpoint is %s, and nothing is served under a prefix", addr, path)
 	}
-	return (&url.URL{Scheme: u.Scheme, User: u.User, Host: u.Host, Path: bazel.StatusPath}).String(), nil
+	return (&url.URL{Scheme: u.Scheme, User: u.User, Host: u.Host, Path: path}).String(), nil
 }
 
 // printStatus renders the status report for the cache this machine is

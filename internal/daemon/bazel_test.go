@@ -146,7 +146,7 @@ func TestServeBazelWithoutMonitoring(t *testing.T) {
 	s := newTestServer(t, cfg)
 	base := startBazel(t, s)
 
-	for _, p := range []string{bazel.StatusPath, bazel.MetricsPath} {
+	for _, p := range []string{bazel.StatusPath, bazel.MetricsPath, bazel.StatsPath, bazel.StatsPath + "?since=bad"} {
 		resp, _ := getBazel(t, base+p)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("GET %s = %d, want 404 from a daemon that was not asked to monitor", p, resp.StatusCode)
@@ -256,5 +256,85 @@ func TestServeBazelNeedsABodyStore(t *testing.T) {
 	if c, derr := net.DialTimeout("tcp", ln.Addr().String(), time.Second); derr == nil {
 		_ = c.Close()
 		t.Fatal("ServeBazel left its listener open after refusing to serve")
+	}
+}
+
+// TestServeBazelStatsEmptyAndReadOnly accepts an idle cache as real history,
+// defaults to 24h, refuses writes, and never serves stats under a cache prefix.
+func TestServeBazelStatsEmptyAndReadOnly(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.BazelMonitoring = true
+	s := newTestServer(t, cfg)
+	base := startBazel(t, s)
+	resp, body := getBazel(t, base+bazel.StatsPath)
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" ||
+		resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("idle stats response = %d, %v", resp.StatusCode, resp.Header)
+	}
+	var r StatsResponse
+	if err := json.Unmarshal(body, &r); err != nil {
+		t.Fatalf("stats JSON: %v", err)
+	}
+	if !r.Lifetime.IsZero() || !r.Window.IsZero() || r.LifetimeSince != 0 || len(r.Buckets) != 0 ||
+		time.Since(time.Unix(r.WindowSince, 0)) < 24*time.Hour ||
+		time.Since(time.Unix(r.WindowSince, 0)) > 25*time.Hour {
+		t.Fatalf("idle stats = %+v", r)
+	}
+	for _, tc := range []struct {
+		method string
+		path   string
+		status int
+	}{
+		{http.MethodHead, bazel.StatsPath, http.StatusOK},
+		{http.MethodPut, bazel.StatsPath, http.StatusMethodNotAllowed},
+		{http.MethodPost, bazel.StatsPath + "?since=bad", http.StatusMethodNotAllowed},
+		{http.MethodGet, bazel.StatsPath + "?since=%zz", http.StatusBadRequest},
+		{http.MethodGet, "/prefix/stats", http.StatusNotFound},
+		{http.MethodGet, "/stats/", http.StatusNotFound},
+	} {
+		req, err := http.NewRequest(tc.method, base+tc.path, nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		b, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if resp.StatusCode != tc.status || (tc.method == http.MethodHead && len(b) != 0) {
+			t.Fatalf("%s %s = %d, body %q; want %d", tc.method, tc.path, resp.StatusCode, b, tc.status)
+		}
+	}
+}
+
+// TestServeBazelStatsIndexFailure makes a failed flush or index read a 5xx,
+// never a successful empty history.
+func TestServeBazelStatsIndexFailure(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		cfg := newTestConfig(t)
+		cfg.BazelMonitoring = true
+		s := newTestServer(t, cfg)
+		base := startBazel(t, s)
+		// Finish adapter initialization before closing the index underneath it.
+		resp, _ := getBazel(t, base+bazel.StatsPath)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("initial stats = %d", resp.StatusCode)
+		}
+		if pending {
+			if _, err := s.cache.Get(context.Background(), testActionID(99)); err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+		}
+		if err := s.idx.Close(); err != nil {
+			t.Fatalf("index.Close: %v", err)
+		}
+		resp, body := getBazel(t, base+bazel.StatsPath)
+		if resp.StatusCode != http.StatusInternalServerError || !strings.Contains(string(body), "stats is unavailable") {
+			t.Fatalf("broken stats (pending %v) = %d, %s", pending, resp.StatusCode, body)
+		}
 	}
 }
