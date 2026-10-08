@@ -110,10 +110,16 @@ func (s *Server) validateRRCCLocalClosure(ctx context.Context, result *repb.Acti
 	return true
 }
 
-// hasCAS reports whether a valid digest is available locally or from the shared tier.
+// hasCAS includes the implicit empty blob without probing either storage tier.
 func (s *Server) hasCAS(ctx context.Context, d *repb.Digest) bool {
 	parsed, err := digest(d)
-	return err == nil && (s.store.Has(ctx, bazel.KindCAS, parsed) || s.store.HasRemote(ctx, bazel.KindCAS, parsed))
+	if err != nil {
+		return false
+	}
+	if d.GetSizeBytes() == 0 {
+		return parsed == emptyDigest
+	}
+	return parsed != emptyDigest && (s.store.Has(ctx, bazel.KindCAS, parsed) || s.store.HasRemote(ctx, bazel.KindCAS, parsed))
 }
 
 // rrccOutputs recognizes Bazel's synthetic remote repository-contents result shape.

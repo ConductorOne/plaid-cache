@@ -10,6 +10,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/conductorone/plaid-cache/internal/bazel"
 )
 
 // TestRRCCLocalClosureMetrics records a complete synthetic repository closure.
@@ -29,6 +31,83 @@ func TestRRCCLocalClosureMetrics(t *testing.T) {
 	}
 	if got := h.srv.RRCCMetrics(); got.Complete != 1 {
 		t.Fatalf("RRCCMetrics = %+v, want one complete closure", got)
+	}
+}
+
+// TestRRCCLocalClosureAcceptsEmptyFiles keeps implicit root and nested files readable on a repository hit.
+func TestRRCCLocalClosureAcceptsEmptyFiles(t *testing.T) {
+	h := newHarness(t)
+	marker := []byte("recorded inputs")
+	file := []byte("package refactor")
+	putBlob(t, h, marker)
+	putBlob(t, h, file)
+	empty := digestOf(nil)
+	child := &repb.Directory{Files: []*repb.FileNode{{Name: "empty.txt", Digest: empty}}}
+	childBody, err := proto.Marshal(child)
+	if err != nil {
+		t.Fatalf("marshal Directory: %v", err)
+	}
+	tree := &repb.Tree{
+		Root: &repb.Directory{
+			Files: []*repb.FileNode{
+				{Name: "empty.txt", Digest: empty},
+				{Name: "BUILD.bazel", Digest: digestOf(file)},
+			},
+			Directories: []*repb.DirectoryNode{{Name: "nested", Digest: digestOf(childBody)}},
+		},
+		Children: []*repb.Directory{child},
+	}
+	treeDigest := putTree(t, h, tree)
+	action := digestOf([]byte("rrcc empty files"))
+	putRRCCActionResult(t, h, action, digestOf(marker), treeDigest)
+
+	got, err := h.ac.GetActionResult(ctx(t), &repb.GetActionResultRequest{ActionDigest: action})
+	if err != nil {
+		t.Fatalf("GetActionResult: %v", err)
+	}
+	want := &repb.ActionResult{
+		OutputFiles:       []*repb.OutputFile{{Path: ".recorded_inputs", Digest: digestOf(marker)}},
+		OutputDirectories: []*repb.OutputDirectory{{Path: "repo_contents", TreeDigest: treeDigest}},
+	}
+	if !proto.Equal(got, want) {
+		t.Fatalf("GetActionResult = %v, want %v", got, want)
+	}
+	body, err := download(t, h, readName(empty))
+	if err != nil || len(body) != 0 {
+		t.Fatalf("Read empty file = %q, %v, want zero bytes and no error", body, err)
+	}
+	if h.store.Has(ctx(t), bazel.KindCAS, emptyDigest) {
+		t.Fatal("empty blob was physically stored")
+	}
+}
+
+// TestRRCCLocalClosureRejectsInvalidFileDigests prevents the implicit empty blob from bypassing validation.
+func TestRRCCLocalClosureRejectsInvalidFileDigests(t *testing.T) {
+	file := []byte("stored non-empty file")
+	for _, tt := range []struct {
+		name   string
+		digest *repb.Digest
+	}{
+		{name: "nil"},
+		{name: "malformed hash", digest: &repb.Digest{Hash: "not-sha256"}},
+		{name: "negative size", digest: &repb.Digest{Hash: emptyDigest.String(), SizeBytes: -1}},
+		{name: "empty hash with nonzero size", digest: &repb.Digest{Hash: emptyDigest.String(), SizeBytes: 1}},
+		{name: "nonempty hash with zero size", digest: &repb.Digest{Hash: digestOf(file).GetHash()}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			marker := []byte("recorded inputs")
+			putBlob(t, h, marker)
+			putBlob(t, h, file)
+			tree := putTree(t, h, &repb.Tree{Root: &repb.Directory{
+				Files: []*repb.FileNode{{Name: "invalid.txt", Digest: tt.digest}},
+			}})
+			action := digestOf([]byte("rrcc invalid file " + tt.name))
+			putRRCCActionResult(t, h, action, digestOf(marker), tree)
+			if _, err := h.ac.GetActionResult(ctx(t), &repb.GetActionResultRequest{ActionDigest: action}); status.Code(err) != codes.NotFound {
+				t.Fatalf("GetActionResult = %v, want NotFound", err)
+			}
+		})
 	}
 }
 
@@ -71,7 +150,10 @@ func TestRRCCLocalClosureMetricsRecordsMissingFile(t *testing.T) {
 	marker := []byte("recorded inputs")
 	putBlob(t, h, marker)
 	missing := digestOf([]byte("missing BUILD.bazel"))
-	tree := &repb.Tree{Root: &repb.Directory{Files: []*repb.FileNode{{Name: "BUILD.bazel", Digest: missing}}}}
+	tree := &repb.Tree{Root: &repb.Directory{Files: []*repb.FileNode{
+		{Name: "empty.txt", Digest: digestOf(nil)},
+		{Name: "BUILD.bazel", Digest: missing},
+	}}}
 	treeDigest := putTree(t, h, tree)
 	action := digestOf([]byte("rrcc missing file"))
 

@@ -206,6 +206,8 @@ An action-cache entry names CAS blobs that are stored, and evicted, separately f
 
 Bazel treats the resulting dangling reference as a failed download rather than as corruption, and `--experimental_remote_cache_eviction_retries` (5 by default) bounds how many times it will reset its state and retry rather than failing the build. Serving a plain miss for the absent blob is the whole of the server's obligation, and it is enough: evicting the entire cache in between a `--remote_download_outputs=minimal` build and the request for its 400 MB output re-ran the action and completed the build successfully. Verifying the reference at lookup time would mean parsing `ActionResult` and probing every blob it names on the hot path, which costs more than the occasional re-run it would save, so it is documented here rather than implemented.
 
+Bazel's experimental remote repository-contents cache (RRCC) is the exception: its synthetic action result is served only when the `.recorded_inputs` marker, repository `Tree`, and every file in that tree are available locally or from the shared tier. An incomplete repository closure is an action-cache miss. A zero-byte file with the SHA-256 empty digest is implicitly available and readable without an upload or a stored blob; it does not make an otherwise complete repository miss.
+
 If you set a lifecycle rule on the bucket, expiring action records earlier than output bodies keeps the dangling reference on the harmless side: an action record with no body is a miss, where a body with no action record is merely unreferenced.
 
 ### Runtime profiling
