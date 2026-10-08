@@ -9,13 +9,15 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/conductorone/plaid-cache/internal/cache"
 )
 
-// The monitoring routes: the two paths on this listener that are not part of
+// The monitoring routes are not part of
 // Bazel's protocol at all, but a report on the daemon serving it, for an
 // operator with no shell on the host.
 //
@@ -29,12 +31,14 @@ import (
 const (
 	StatusPath  = "/status"
 	MetricsPath = "/metrics"
+	StatsPath   = "/stats"
 )
 
-// StatusFunc produces the report [StatusPath] serves, and MetricsFunc the
-// exposition [MetricsPath] serves. A nil one leaves that route unserved.
+// StatusFunc produces the report [StatusPath] serves, MetricsFunc the exposition
+// [MetricsPath] serves, and StatsFunc the history [StatsPath] serves. A nil
+// provider leaves its route unserved.
 //
-// Both hand back what the daemon has already decided to say rather than letting
+// They hand back what the daemon has already decided to say rather than letting
 // this package assemble it, and for the same reason: the numbers belong to the
 // package that owns the counters, and a second assembly here would be a second
 // accounting path free to disagree with the first. StatusFunc returns the value
@@ -43,12 +47,13 @@ const (
 // would be an import cycle, and a second copy of it here is exactly the drift
 // that having one type avoids.
 //
-// An error from either means the daemon could not answer, and is reported to the
+// An error means the daemon could not answer, and is reported to the
 // client as one. See [Handler.serveMonitoring] for why that differs from the
 // cache routes.
 type (
 	StatusFunc  func(ctx context.Context) (any, error)
 	MetricsFunc func(ctx context.Context) ([]byte, error)
+	StatsFunc   func(ctx context.Context, window time.Duration) (any, error)
 )
 
 // metricsContentType is the Prometheus text exposition format's own media type.
@@ -65,6 +70,7 @@ type Handler struct {
 	logf    cache.Logf
 	status  StatusFunc
 	metrics MetricsFunc
+	stats   StatsFunc
 }
 
 // HandlerParams carries what a Handler serves.
@@ -72,12 +78,13 @@ type HandlerParams struct {
 	Store *Store
 	Logf  cache.Logf
 
-	// Status and Metrics serve the monitoring routes. Nil, the zero value,
+	// Status, Metrics, and Stats serve the monitoring routes. Nil, the zero value,
 	// leaves that route unrouted: the caller decides whether this listener
 	// discloses anything about its host, and a listener that has not been told
 	// to is indistinguishable from one built before the routes existed.
 	Status  StatusFunc
 	Metrics MetricsFunc
+	Stats   StatsFunc
 }
 
 // NewHandler constructs a Handler over an existing Store.
@@ -86,7 +93,7 @@ func NewHandler(p HandlerParams) *Handler {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Handler{store: p.Store, logf: logf, status: p.Status, metrics: p.Metrics}
+	return &Handler{store: p.Store, logf: logf, status: p.Status, metrics: p.Metrics, stats: p.Stats}
 }
 
 // ServeHTTP routes one request.
@@ -116,6 +123,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case MetricsPath:
 		if h.metrics != nil {
 			h.serveMonitoring(w, r, "metrics", metricsContentType, h.metrics)
+			return
+		}
+	case StatsPath:
+		if h.stats != nil {
+			h.serveStats(w, r)
 			return
 		}
 	}
@@ -189,13 +201,48 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request, k Kind, d Digest) 
 	w.WriteHeader(http.StatusOK)
 }
 
+// serveStats validates the window before asking the daemon for persisted history.
+// Bad requests are not store failures and must not look like an empty report.
+func (h *Handler) serveStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "plaid-cache: method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		http.Error(w, "plaid-cache: invalid stats query", http.StatusBadRequest)
+		return
+	}
+	since := query.Get("since")
+	if since == "" {
+		since = "24h"
+	}
+	window, err := time.ParseDuration(since)
+	if err != nil || window < 0 {
+		http.Error(w, "plaid-cache: since must be a nonnegative Go duration (want e.g. 24h, 168h)", http.StatusBadRequest)
+		return
+	}
+	h.serveMonitoring(w, r, "stats", "application/json", func(ctx context.Context) ([]byte, error) {
+		v, err := h.stats(ctx, window)
+		if err != nil {
+			return nil, err
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		return append(b, '\n'), nil
+	})
+}
+
 // serveMonitoring answers one request on a monitoring route.
 //
 // These report their failures honestly, with real status codes, and that is a
 // deliberate break from the two routes above. A cache route lies about its
 // troubles because Bazel reads any non-200 other than a miss as a build error,
 // so an honest 500 there turns a broken cache into a broken build. Nothing reads
-// these two: a scraper or an operator asking how the daemon is doing wants the
+// these routes: a scraper or an operator asking how the daemon is doing wants the
 // truth, and answering "fine" with an empty report would hide exactly the
 // failure they are asking about. The two disciplines are opposite because their
 // readers are, and neither should be extended to the other's routes.

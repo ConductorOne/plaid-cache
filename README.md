@@ -236,7 +236,7 @@ authentication, and never adds profiling routes to the Bazel HTTP listener.
 
 ### Monitoring a shared daemon
 
-`plaid-cache status` reads the local daemon over a unix socket, which is the right answer for a cache on the machine you are sitting at and no answer at all for one serving a room full of builders. `-bazel-monitoring` adds two read-only routes to the Bazel HTTP address for that case:
+`plaid-cache status` reads the local daemon over a unix socket, which is the right answer for a cache on the machine you are sitting at and no answer at all for one serving a room full of builders. `-bazel-monitoring` adds three read-only routes to the Bazel HTTP address for that case:
 
 ```sh
 plaid-cache serve -bazel-addr localhost:9095 -bazel-monitoring
@@ -244,6 +244,9 @@ plaid-cache serve -bazel-addr localhost:9095 -bazel-monitoring
 
 ```sh
 plaid-cache status -from localhost:9095
+plaid-cache stats -from localhost:9095 -since 24h
+plaid-cache stats -from localhost:9095 -since 168h -json
+curl -s 'http://localhost:9095/stats?since=24h'
 curl -s localhost:9095/metrics
 ```
 
@@ -286,11 +289,11 @@ The last three families describe this process rather than the cache, because tha
 
 Five labels, all with a short fixed set of values, and one `le` per histogram bucket. Nothing is ever labelled by digest, key, path, or client: a series is created for every distinct label value and never forgotten, so a per-request label is an unbounded leak in whatever scrapes it.
 
-**These routes are off unless asked for, and that is the conservative default on purpose.** They describe the host — pid, uptime, entry counts, byte budgets — where the cache routes beside them describe only blobs somebody already knew the digest of. `PLAID_GOCACHE_BAZEL_ADDR` takes a full address precisely because the choice between loopback and every interface is the difference between a private cache and a public one, and this is a second disclosure on top of that choice, so it is a second decision. One setting governs both routes, because they disclose the same thing and a split would offer a choice with nothing behind it.
+**These routes are off unless asked for, and that is the conservative default on purpose.** They describe the host — pid, uptime, entry counts, byte budgets, activity history — where the cache routes beside them describe only blobs somebody already knew the digest of. `PLAID_GOCACHE_BAZEL_ADDR` takes a full address precisely because the choice between loopback and every interface is the difference between a private cache and a public one, and this is a second disclosure on top of that choice, so it is a second decision. One setting governs all three routes, because they disclose the same thing and a split would offer a choice with nothing behind it.
 
-To let a scraper in without opening the daemon to the network, keep the listener on an interface only the scraper can reach — loopback with a node-local scraper or an SSH tunnel, a pod address reachable only through a network policy — or put a reverse proxy in front of it. The monitoring routes are two fixed paths that no cache request can ever take, so a proxy can serve `/status` and `/metrics` to your monitoring subnet and `/ac/…` and `/cas/…` to your builders, with different rules on each.
+To let a scraper in without opening the daemon to the network, keep the listener on an interface only the scraper can reach — loopback with a node-local scraper or an SSH tunnel, a pod address reachable only through a network policy — or put a reverse proxy in front of it. The monitoring routes are three fixed paths that no cache request can ever take, so a proxy can serve `/status`, `/metrics`, and `/stats` to your monitoring subnet and `/ac/…` and `/cas/…` to your builders, with different rules on each.
 
-Unlike the cache routes, these two report their failures honestly. A cache route answers a broken store with a miss or with a success, because Bazel reads anything else as a build error and a cache must never break a build; a monitoring route answers with a `5xx`, because a reader asking how the daemon is doing is exactly the reader who must not be told "fine". `status -from` exits non-zero on any of it, so a report that could not be obtained is never mistakable for a cache with nothing in it.
+Unlike the cache routes, these monitoring routes report their failures honestly. A cache route answers a broken store with a miss or with a success, because Bazel reads anything else as a build error and a cache must never break a build; a monitoring route answers with a `5xx`, because a reader asking how the daemon is doing is exactly the reader who must not be told "fine". `status -from` and `stats -from` exit non-zero on any of it, so a report that could not be obtained is never mistakable for a cache with nothing in it.
 
 ### Activity history
 
@@ -326,6 +329,32 @@ it is averaged over a fortnight. Hours with no activity are simply absent.
 ```sh
 plaid-cache stats -since 168h -json
 ```
+
+For the same history from another daemon, use its opt-in HTTP monitoring endpoint:
+
+```sh
+plaid-cache stats -from localhost:9095 -since 24h
+plaid-cache stats -from localhost:9095 -since 168h -json
+```
+
+`GET /stats?since=24h` returns the same JSON history as local `stats -json`:
+`lifetime`, `lifetime_since` (Unix nanoseconds), `window`, `window_since` (Unix
+seconds), and `buckets` (hour starts in Unix seconds UTC, with activity counters).
+The daemon flushes pending counters before answering. `since` defaults to `24h`
+and accepts nonnegative Go durations, including `0` and `168h`; hours overlapping
+the selected cutoff are included in full. Malformed or negative durations return
+`400`, unavailable history returns `500`, and monitoring left off returns `404`.
+`HEAD` is supported; writes return `405`. Reports have `Cache-Control: no-store`.
+
+`stats -from` never loads local configuration or opens a local cache. Its table
+starts with the endpoint, and its JSON adds an `endpoint` field beside the normal
+history fields. Remote tables always show upload counters: those are the daemon's
+persisted history, even if its shared tier is now disabled, not a claim about the
+caller's S3 configuration. Without `-from`, local table and JSON behavior is
+unchanged. Failed HTTP requests, unreachable daemons, malformed or incomplete
+reports, and daemon-side errors exit non-zero without printing successful stats.
+Remote reads share `status -from`'s HTTP/HTTPS address rules and 15-second timeout;
+responses are bounded to 1 MiB, enough for the retained hourly history.
 
 Two weeks of hourly buckets are kept, which is a few hundred bytes an hour and
 under a megabyte in total; older ones are dropped by the same write that records
@@ -567,7 +596,7 @@ be a surprising amount of reach for this one to have.
 | `PLAID_GOCACHE_BAZEL_ADDR` | Address for the Bazel HTTP remote cache, e.g. `localhost:9095`. Empty serves it not at all. | empty |
 | `PLAID_GOCACHE_BAZEL_GRPC_ADDR` | Address for the Bazel gRPC remote cache, e.g. `localhost:9096`. Empty serves it not at all. | empty |
 | `PLAID_GOCACHE_PPROF_ADDR` | Loopback address for the separate Go runtime-profiling listener, e.g. `127.0.0.1:6060`. Empty serves it not at all. | empty |
-| `PLAID_GOCACHE_BAZEL_MONITORING` | `1` also serves `/status` and `/metrics` on the Bazel HTTP address, for `plaid-cache status -from` and for a Prometheus scrape. Off by default: they describe the host rather than the cache's contents. | unset |
+| `PLAID_GOCACHE_BAZEL_MONITORING` | `1` also serves `/status`, `/metrics`, and `/stats` on the Bazel HTTP address, for `plaid-cache status -from`, `plaid-cache stats -from`, and a Prometheus scrape. Off by default: they describe the host rather than the cache's contents. | unset |
 | `PLAID_GOCACHE_DISABLE_BAZEL_VERIFY` | `1` stops both Bazel listeners from checking that an uploaded CAS body hashes to the digest naming it, and lets a gRPC client name a digest function this cache cannot compute. For clients whose digest function is not SHA-256. | unset |
 | `PLAID_GOCACHE_DISABLE_EVICTION` | `1` disables eviction entirely. | unset |
 | `PLAID_GOCACHE_DISABLE_DAEMON` | `1` forces direct in-process mode. | unset |

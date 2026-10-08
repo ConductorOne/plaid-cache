@@ -135,8 +135,9 @@ The Go toolchain invokes the first form:
 
 status describes the cache now; stats describes what it has done. The counters
 are persisted, so they survive the daemon's idle exit and cover every process
-that has used this cache rather than whichever one answers. -json emits the
-whole history for a tool to read.
+that has used this cache rather than whichever one answers. -since defaults to
+24h and accepts nonnegative Go durations (a week is 168h, not 7d). -json emits
+the selected history for a tool to read.
 
 adopt imports an existing go-cache-plugin local stage: it reconstructs the
 action-to-output mapping from that stage's records and publishes its bodies by
@@ -168,17 +169,24 @@ authentication:
   plaid-cache serve -pprof-addr 127.0.0.1:6060
   go tool pprof http://127.0.0.1:6060/debug/pprof/heap
 
--bazel-monitoring adds two routes to the HTTP address — /status and /metrics —
+-bazel-monitoring adds three routes to the HTTP address — /status, /metrics,
+and /stats —
 so a daemon serving a room full of builders can be read without a shell on its
 host. They are off unless asked for, because they describe the host rather than
 the cache's contents:
   plaid-cache serve -bazel-addr localhost:9095 -bazel-monitoring
   plaid-cache status -from localhost:9095
+  plaid-cache stats -from localhost:9095 -since 24h
+  plaid-cache stats -from localhost:9095 -since 168h -json
   curl localhost:9095/metrics
 
 /metrics is Prometheus text exposition, which an OpenTelemetry Collector
 scrapes as it stands. status -from prints the same report as a local status,
 minus the lines that would describe this machine rather than that one.
+/stats?since=24h returns persisted lifetime totals, window totals, and hourly
+buckets, flushing pending counters first. stats -from bypasses local configuration
+and names the endpoint in table and JSON output. Remote tables always show upload
+counts, including history from a shared tier that may no longer be enabled.
 
 Configuration is read from the environment; see the README for the full list.
 `)

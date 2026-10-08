@@ -179,14 +179,14 @@ type Config struct {
 	// BazelAddr so enabling diagnostics cannot add routes to the cache listener.
 	PprofAddr string
 
-	// BazelMonitoring serves the two monitoring routes — /status and /metrics —
-	// on the Bazel HTTP listener, so that `plaid-cache status -from` and a
-	// Prometheus scrape can read a daemon an operator has no shell on. False,
-	// the default, serves neither.
+	// BazelMonitoring serves /status, /metrics, and /stats on the Bazel HTTP
+	// listener, so remote status, persisted history, and a Prometheus scrape can
+	// read a daemon an operator has no shell on. False, the default, serves none.
 	//
-	// It is one setting for both because they disclose the same thing: the
+	// It is one setting for all three because they disclose the same thing: the
 	// daemon's pid and uptime, how many entries it holds, how many bytes, what
-	// limits it was configured with. Splitting them would offer a choice with no
+	// limits it was configured with, and its activity history. Splitting them
+	// would offer a choice with no
 	// meaning behind it, and would let an operator believe they had withheld
 	// something they had not.
 	//

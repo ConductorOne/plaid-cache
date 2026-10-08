@@ -317,7 +317,7 @@ func (s *Server) ServeBazel(ctx context.Context, ln net.Listener) error {
 
 	p := bazel.HandlerParams{Store: bstore, Logf: s.logf}
 	if s.cfg.BazelMonitoring {
-		p.Status, p.Metrics = s.bazelStatus, s.bazelMetrics
+		p.Status, p.Metrics, p.Stats = s.bazelStatus, s.bazelMetrics, s.bazelStats
 	}
 
 	srv := &http.Server{
@@ -389,6 +389,16 @@ func (s *Server) bazelAdapter() (*bazel.Store, error) {
 // to this one.
 func (s *Server) bazelStatus(context.Context) (any, error) {
 	r := s.status()
+	if r.Err != "" {
+		return nil, errors.New(r.Err)
+	}
+	return r, nil
+}
+
+// bazelStats uses the socket's collector so pending counters and persisted
+// history have one accounting path regardless of how the report is requested.
+func (s *Server) bazelStats(_ context.Context, window time.Duration) (any, error) {
+	r := s.stats(&StatsParams{Since: window.String()})
 	if r.Err != "" {
 		return nil, errors.New(r.Err)
 	}
@@ -691,6 +701,7 @@ func (s *Server) stats(p *StatsParams) StatsResponse {
 	}
 	if err := s.cache.FlushMetrics(); err != nil {
 		s.logf("stats: flush: %v", err)
+		return StatsResponse{Err: fmt.Sprintf("stats: flush: %v", err)}
 	}
 
 	total, since, err := s.idx.TotalActivity()
