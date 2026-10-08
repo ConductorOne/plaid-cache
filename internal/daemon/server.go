@@ -398,7 +398,7 @@ func (s *Server) bazelStatus(context.Context) (any, error) {
 // bazelStats uses the socket's collector so pending counters and persisted
 // history have one accounting path regardless of how the report is requested.
 func (s *Server) bazelStats(_ context.Context, window time.Duration) (any, error) {
-	r := s.stats(&StatsParams{Since: window.String()})
+	r := s.stats(&StatsParams{Since: window.String()}, true)
 	if r.Err != "" {
 		return nil, errors.New(r.Err)
 	}
@@ -602,7 +602,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		_ = writeJSONLine(conn, s.gc(ctx, h.GC))
 	case OpStats:
 		_ = writeJSONLine(conn, HelloResponse{Version: s.version, OK: true})
-		_ = writeJSONLine(conn, s.stats(h.Stats))
+		_ = writeJSONLine(conn, s.stats(h.Stats, false))
 	case OpAdopt:
 		_ = writeJSONLine(conn, HelloResponse{Version: s.version, OK: true})
 		_ = writeJSONLine(conn, s.adopt(ctx, h.Adopt))
@@ -686,8 +686,9 @@ const defaultStatsWindow = 24 * time.Hour
 // It flushes first, so that a report asked for immediately after a build does
 // not omit that build. The counters are otherwise written on a timer, which is
 // the right trade for a path that runs beside every compile but the wrong one
-// for somebody watching the number.
-func (s *Server) stats(p *StatsParams) StatsResponse {
+// for somebody watching the number. requireFlush makes HTTP reports fail rather
+// than serve stale counters; the socket retains its existing best-effort flush.
+func (s *Server) stats(p *StatsParams, requireFlush bool) StatsResponse {
 	window := defaultStatsWindow
 	if p != nil && p.Since != "" {
 		d, err := time.ParseDuration(p.Since)
@@ -701,7 +702,9 @@ func (s *Server) stats(p *StatsParams) StatsResponse {
 	}
 	if err := s.cache.FlushMetrics(); err != nil {
 		s.logf("stats: flush: %v", err)
-		return StatsResponse{Err: fmt.Sprintf("stats: flush: %v", err)}
+		if requireFlush {
+			return StatsResponse{Err: fmt.Sprintf("stats: flush: %v", err)}
+		}
 	}
 
 	total, since, err := s.idx.TotalActivity()
