@@ -89,7 +89,7 @@ drive-by.
 ## Module + build conventions
 
 - Module path: `github.com/conductorone/plaid-cache`.
-- Go 1.26. Non-vendored module; `-mod=mod` defaults apply.
+- Go 1.27.3. Non-vendored module; `-mod=mod` defaults apply.
 - **No cgo.** `CGO_ENABLED=0` must build. The release pipeline builds with cgo
   disabled for every target, so a cgo dependency breaks releases, not just
   purity. This rules out cgo-backed storage engines.
