@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -49,6 +50,10 @@ type S3Params struct {
 	Region      string
 	Prefix      string
 	EndpointURL string
+
+	// IdleConns is how many idle connections to the bucket the transport may
+	// keep. It should cover the upload workers; zero keeps the SDK's default.
+	IdleConns int
 }
 
 // NewS3 constructs an S3 backend.
@@ -76,13 +81,30 @@ func NewS3(ctx context.Context, p S3Params) (*S3, error) {
 		})
 	}
 
+	if p.IdleConns > 0 {
+		s3opts = append(s3opts, func(o *s3.Options) {
+			// The SDK keeps at most ten idle connections per host. A pool of
+			// upload workers larger than that closes connections it is about to
+			// want again, and every replacement pays a TCP and a TLS handshake —
+			// on a busy shared daemon with 64 workers, that was 4% of all
+			// requests and the largest single cost in uploading a put.
+			if bc, ok := o.HTTPClient.(*awshttp.BuildableClient); ok {
+				o.HTTPClient = bc.WithTransportOptions(func(tr *http.Transport) {
+					tr.MaxIdleConns = max(tr.MaxIdleConns, p.IdleConns)
+					tr.MaxIdleConnsPerHost = max(tr.MaxIdleConnsPerHost, p.IdleConns)
+				})
+			}
+		})
+	}
+
 	st := &stats{}
 	s3opts = append(s3opts, func(o *s3.Options) {
 		// Wrap the client the SDK already resolved rather than installing one of
 		// our own. By the time an option function runs, o.HTTPClient is the
 		// client this call would otherwise have used, pool settings and all, so
-		// wrapping it cannot change any of them — which is the point. Nothing
-		// here tunes the pool; this exists to find out whether it needs tuning.
+		// wrapping it cannot change any of them — which is the point. The only
+		// pool setting tuned is the idle bound above, which these counts showed
+		// was too small.
 		o.HTTPClient = newTracingClient(o.HTTPClient, st)
 	})
 

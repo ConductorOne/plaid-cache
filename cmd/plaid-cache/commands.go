@@ -89,6 +89,9 @@ func openStores(ctx context.Context, cfg *config.Config) (*stores, error) {
 			Region:      cfg.S3Region,
 			Prefix:      cfg.S3Prefix,
 			EndpointURL: cfg.S3EndpointURL,
+			// Every upload worker may hold a connection, plus as many again
+			// for reads faulting entries in while the workers are busy.
+			IdleConns: 2 * cfg.UploadConcurrency,
 		})
 		if err != nil {
 			// A misconfigured bucket must not stop the local cache from
