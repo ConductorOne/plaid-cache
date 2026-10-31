@@ -44,6 +44,10 @@ type Cache struct {
 	touches *toucher
 	metrics Metrics
 
+	// present remembers recent positive Has answers so a digest probed again
+	// within presenceTTL costs neither an index lookup nor a stat.
+	present presence
+
 	// prunedSinceCompact is the tombstone debt built up since the last
 	// compaction, counted across passes rather than within one: a thousand
 	// small evictions leave as many tombstones as a single large one, and a
@@ -250,6 +254,7 @@ func (c *Cache) bodyGone(a ids.ActionID, e index.Entry, err error) bool {
 			c.logf("blob repair %s: %v", orphan, rerr)
 		}
 	}
+	c.present.invalidate()
 	return true
 }
 
@@ -339,6 +344,12 @@ func (c *Cache) HasRemote(ctx context.Context, a ids.ActionID) bool {
 // A missing or unreadable body is reported as absent, so a caller that reacts
 // by storing it repairs the dangling entry as a side effect.
 func (c *Cache) Has(ctx context.Context, a ids.ActionID) bool {
+	now := time.Now().UnixNano()
+	if lastUsed, ok := c.present.lookup(a, now); ok {
+		c.touches.enqueue(a, lastUsed)
+		return true
+	}
+	gen := c.present.generation()
 	e, ok, err := c.idx.Get(a)
 	if err != nil || !ok {
 		return false
@@ -347,7 +358,19 @@ func (c *Cache) Has(ctx context.Context, a ids.ActionID) bool {
 		return false
 	}
 	c.touches.enqueue(a, e.LastUsedAt)
+	c.present.remember(a, gen, now, c.touchedAt(e.LastUsedAt, now))
 	return true
+}
+
+// touchedAt returns the last-used time an entry will have once the touch just
+// enqueued for it lands: now if one was due, its recorded time otherwise.
+// Remembering that rather than the recorded time keeps a memoised Has from
+// enqueueing the same touch again on every probe until the memo expires.
+func (c *Cache) touchedAt(lastUsed, now int64) int64 {
+	if g := c.cfg.TouchGranularity.Nanoseconds(); g > 0 && now-lastUsed < g {
+		return lastUsed
+	}
+	return now
 }
 
 // Put records an action's output.
@@ -475,8 +498,16 @@ func (c *Cache) EvictWith(ctx context.Context, maxBytes int64, ttl time.Duration
 			// keep pruning rather than aborting the whole pass.
 			c.logf("evict remove %s: %v", o, rerr)
 		}
+		// After the removal, so a probe that verifies the body in between is
+		// remembered under a generation this has already retired.
+		c.present.invalidate()
 		return nil
 	})
+	if res.ActionsPruned > 0 {
+		// Pruned actions whose bodies other actions still reference removed no
+		// body above, but they are no longer present either.
+		c.present.invalidate()
+	}
 	if err != nil {
 		return res, fmt.Errorf("EvictWith: %w", err)
 	}

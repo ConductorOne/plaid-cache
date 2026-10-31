@@ -44,7 +44,8 @@ func checkInstance(name string) error {
 // megabytes. An honest answer here turns all of that into one round trip.
 //
 // It is honest and it is cheap, which have to be true together. Each digest
-// costs an index lookup and a stat, never a read of the body, so answering for
+// costs at most an index lookup and a stat — nothing at all when the cache
+// verified it within the last minute — never a read of the body, so answering for
 // every output of a build at once stays proportional to the number of outputs
 // rather than to their size.
 //

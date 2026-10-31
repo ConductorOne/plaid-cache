@@ -176,6 +176,8 @@ The matching client-side setting is worth knowing about, because it differs shar
 
 **Resumable writes.** A `ByteStream.Write` that breaks leaves what it delivered on disk, registered under its resource name. `QueryWriteStatus` reports how far it got, and the next `Write` at that offset continues into the same body. A partial upload nobody resumes is released after ten minutes; at most 256 are held at once, and the longest-idle is dropped to make room rather than refusing a new one. Anything left staged by a process that died is swept at the next start.
 
+**Presence answers are remembered for a minute.** `FindMissingBlobs` is asked about the same digests over and over — every action probes the toolchain and headers it shares with every other — and each answer is an index lookup plus a stat of the body. A digest verified present is remembered for one minute, so a repeat probe inside that window costs neither. Anything the daemon deletes itself — eviction, or the repair of an entry whose body has gone — clears the memo at once. What it cannot see is a body deleted from outside the process: that is noticed within a minute instead of on the next probe, and a client told such a blob is present gets a not-found on the read, the same answer it gets when eviction races its request today. `plaid_cache_presence_memo_lookups_total` says how often the memo answers.
+
 
 #### Build without the bytes
 

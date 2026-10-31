@@ -163,8 +163,8 @@ func (s *Store) OpenLocal(ctx context.Context, k Kind, d Digest) (*os.File, int6
 // Has reports whether a digest already resolves to a readable body in a
 // keyspace, and refreshes its last use if it does.
 //
-// It is the whole of what FindMissingBlobs needs, and it is an index lookup and
-// a stat rather than a read: a presence answer must stay cheap enough to give
+// It is the whole of what FindMissingBlobs needs, and it is at most an index
+// lookup and a stat rather than a read: a presence answer must stay cheap enough to give
 // for every output of a build at once.
 //
 // The refresh is not incidental. A client told that a blob is present will not
