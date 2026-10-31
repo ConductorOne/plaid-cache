@@ -93,11 +93,7 @@ func (s *Store) Put(id ids.OutputID, body io.Reader, size int64) (string, int64,
 		return "", 0, fmt.Errorf("Put: negative size %d", size)
 	}
 	path := s.Path(id)
-	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
-		return "", 0, fmt.Errorf("Put: %w", err)
-	}
-
-	tmp, err := createTemp(path)
+	tmp, err := createTempIn(path)
 	if err != nil {
 		return "", 0, fmt.Errorf("Put: %w", err)
 	}
@@ -108,10 +104,15 @@ func (s *Store) Put(id ids.OutputID, body io.Reader, size int64) (string, int64,
 	defer func() { _ = os.Remove(tmp.Name()) }()
 
 	written, copyErr := io.Copy(tmp, body)
+	// The size of what was written comes from the descriptor rather than from
+	// a stat of the published path: the same inode, without a second path walk.
+	fi, statErr := tmp.Stat()
 	closeErr := tmp.Close()
 	switch {
 	case copyErr != nil:
 		return "", 0, fmt.Errorf("Put: %w", copyErr)
+	case statErr != nil:
+		return "", 0, fmt.Errorf("Put: %w", statErr)
 	case closeErr != nil:
 		return "", 0, fmt.Errorf("Put: %w", closeErr)
 	case written != size:
@@ -119,13 +120,9 @@ func (s *Store) Put(id ids.OutputID, body io.Reader, size int64) (string, int64,
 	}
 
 	// EEXIST means another writer published this content address first. Its
-	// bytes are equivalent to ours, so the link failure is a success.
+	// bytes are equivalent to ours, and so is their footprint, so the link
+	// failure is a success and the measurement above still describes it.
 	if err := os.Link(tmp.Name(), path); err != nil && !errors.Is(err, fs.ErrExist) {
-		return "", 0, fmt.Errorf("Put: %w", err)
-	}
-
-	fi, err := os.Stat(path)
-	if err != nil {
 		return "", 0, fmt.Errorf("Put: %w", err)
 	}
 	return path, diskBytes(fi), nil
@@ -189,11 +186,7 @@ func (s *Store) Remove(id ids.OutputID) error {
 // successful Adopt, where it is a second name for a now-published inode. A
 // process killed mid-write leaves one behind, which is what CleanTemp is for.
 func (s *Store) Stage() (*os.File, error) {
-	dir := filepath.Join(s.root, stagingDir)
-	if err := os.MkdirAll(dir, dirPerm); err != nil {
-		return nil, fmt.Errorf("Stage: %w", err)
-	}
-	f, err := createTemp(filepath.Join(dir, "body"))
+	f, err := createTempIn(filepath.Join(s.root, stagingDir, "body"))
 	if err != nil {
 		return nil, fmt.Errorf("Stage: %w", err)
 	}
@@ -290,6 +283,23 @@ func isTempName(name string) bool { return strings.Contains(name, tempMarker) }
 // contention.
 const tempAttempts = 8
 
+// createTempIn is createTemp that creates path's directory if it is missing.
+//
+// It tries the open first and creates the directory only when the open says it
+// is absent. The directories outlive every body in them, so on all but the
+// first write into each one, a MkdirAll up front is a stat that finds what it
+// always finds.
+func createTempIn(path string) (*os.File, error) {
+	f, err := createTemp(path)
+	if !errors.Is(err, fs.ErrNotExist) {
+		return f, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
+		return nil, err
+	}
+	return createTemp(path)
+}
+
 // createTemp opens "<path>.tmp.<8-hex-rand>" with O_EXCL. The name shares
 // path's directory so the subsequent link(2) is intra-filesystem; link across
 // mount points fails with EXDEV.
@@ -338,16 +348,24 @@ func (s *Store) Adopt(id ids.OutputID, srcPath string, size int64) (path string,
 	}
 
 	path = s.Path(id)
-	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
-		return "", 0, false, fmt.Errorf("Adopt: %w", err)
+	lerr := os.Link(srcPath, path)
+	if errors.Is(lerr, fs.ErrNotExist) {
+		// The fan-out directory does not exist yet; it is created on first use
+		// rather than checked for on every one.
+		if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
+			return "", 0, false, fmt.Errorf("Adopt: %w", err)
+		}
+		lerr = os.Link(srcPath, path)
 	}
 
 	// EEXIST means this address is already published, by us or by an earlier
 	// adoption. Content addressing makes those bytes equivalent, so it is
 	// success either way.
-	lerr := os.Link(srcPath, path)
 	switch {
-	case lerr == nil, errors.Is(lerr, fs.ErrExist):
+	case lerr == nil:
+		// A new name for the inode just stat'ed, so its footprint is known.
+		return path, diskBytes(src), true, nil
+	case errors.Is(lerr, fs.ErrExist):
 		fi, serr := os.Stat(path)
 		if serr != nil {
 			return "", 0, false, fmt.Errorf("Adopt: %w", serr)
