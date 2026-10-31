@@ -80,7 +80,7 @@ var ErrDigestMismatch = errors.New("body does not match its digest")
 // almost never takes — a full disk, an unreadable index — which are exactly the
 // paths this package promises something about.
 type store interface {
-	Get(ctx context.Context, a ids.ActionID) (cache.Result, error)
+	Open(ctx context.Context, a ids.ActionID) (*os.File, cache.Result, error)
 	Has(ctx context.Context, a ids.ActionID) bool
 	HasRemote(ctx context.Context, a ids.ActionID) bool
 	PutStaged(ctx context.Context, a ids.ActionID, o ids.OutputID, stagedPath string, size int64) (string, error)
@@ -138,7 +138,7 @@ func NewStore(p StoreParams) *Store {
 // nothing useful to do with the difference between "not cached" and "the index
 // is unreadable", and a cache must never break a build.
 func (s *Store) Open(ctx context.Context, k Kind, d Digest) (*os.File, int64, bool) {
-	res, err := s.cache.Get(ctx, k.actionID(d))
+	f, res, err := s.cache.Open(ctx, k.actionID(d))
 	if err != nil {
 		s.logf("bazel get %s/%s: %v", k, d, err)
 		return nil, 0, false
@@ -146,20 +146,7 @@ func (s *Store) Open(ctx context.Context, k Kind, d Digest) (*os.File, int64, bo
 	if res.Miss {
 		return nil, 0, false
 	}
-	f, err := os.Open(res.DiskPath)
-	if err != nil {
-		// The index says the body is here and it is not, or is unreadable. The
-		// cache repairs its own accounting on the next lookup; this is a miss.
-		s.logf("bazel open %s: %v", res.DiskPath, err)
-		return nil, 0, false
-	}
-	fi, err := f.Stat()
-	if err != nil {
-		s.logf("bazel stat %s: %v", res.DiskPath, err)
-		_ = f.Close()
-		return nil, 0, false
-	}
-	return f, fi.Size(), true
+	return f, res.Size, true
 }
 
 // OpenLocal returns a locally resident body without faulting one in from the remote tier.

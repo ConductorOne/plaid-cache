@@ -143,6 +143,25 @@ func (s *Store) Get(id ids.OutputID) (string, int64, error) {
 	return path, diskBytes(fi), nil
 }
 
+// Open opens a body for reading and returns it with its length.
+//
+// It exists so a reader resolves the path once. Get followed by os.Open walks
+// the path twice and stats the inode twice, and on the read-heavy REAPI path
+// those duplicate lookups were a fifth of the daemon's CPU. A miss is an error
+// wrapping fs.ErrNotExist, as for Get.
+func (s *Store) Open(id ids.OutputID) (*os.File, int64, error) {
+	f, err := os.Open(s.Path(id))
+	if err != nil {
+		return nil, 0, fmt.Errorf("Open: %w", err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close() // read-only descriptor; the stat failure is what is reported
+		return nil, 0, fmt.Errorf("Open: %w", err)
+	}
+	return f, fi.Size(), nil
+}
+
 // Remove deletes the body. Removing an absent body is not an error: eviction
 // and orphan cleanup both race with other writers, and an already-gone body
 // is the state they were asking for.
