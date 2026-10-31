@@ -197,7 +197,12 @@ func (ix *Index) Put(a ids.ActionID, e Entry, diskBytes int64) error {
 	}
 
 	ix.mu.Lock()
-	defer ix.mu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			ix.mu.Unlock()
+		}
+	}()
 
 	old, hadOld, err := ix.loadEntry(a)
 	if err != nil {
@@ -249,14 +254,24 @@ func (ix *Index) Put(a ids.ActionID, e Entry, diskBytes int64) error {
 	if err := b.Set(lruKey(e.LastUsedAt, a), nil, nil); err != nil {
 		return fmt.Errorf("Put: %w", err)
 	}
-	if err := b.Commit(pebble.Sync); err != nil {
+	// The batch is applied and published under mu, which is all the next
+	// read-modify-write needs to see it. The WAL sync is waited for after mu is
+	// released, so concurrent puts share one fsync through Pebble's commit
+	// pipeline instead of queueing one fsync each behind the lock. Put still
+	// returns only once its own batch is durable.
+	if err := ix.db.ApplyNoSyncWait(b, pebble.Sync); err != nil {
 		return fmt.Errorf("Put: %w", err)
 	}
-
 	ix.actions.Add(dActions)
 	ix.objects.Add(dObjects)
 	ix.diskBytes.Add(dDisk)
 	ix.zeroRefs.Add(dZero)
+	ix.mu.Unlock()
+	locked = false
+
+	if err := b.SyncWait(); err != nil {
+		return fmt.Errorf("Put: %w", err)
+	}
 	return nil
 }
 
