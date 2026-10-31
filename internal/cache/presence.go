@@ -47,6 +47,12 @@ const presenceShardCap = 1 << 13
 type presence struct {
 	gen    atomic.Uint64
 	shards [presenceShards]presenceShard
+
+	// hits and misses count lookups, process-local. Their ratio is the share
+	// of presence probes the memo saved from the index and the filesystem,
+	// which is what decides whether presenceTTL is earning its keep.
+	hits   atomic.Int64
+	misses atomic.Int64
 }
 
 // presenceShard is one independently locked slice of the memo.
@@ -85,9 +91,18 @@ func (p *presence) lookup(a ids.ActionID, now int64) (int64, bool) {
 	e, ok := s.m[a]
 	s.mu.Unlock()
 	if !ok || e.gen != gen || now >= e.expires {
+		p.misses.Add(1)
 		return 0, false
 	}
+	p.hits.Add(1)
 	return e.lastUsed, true
+}
+
+// PresenceSnapshot reports how often a presence probe was answered from the
+// memo rather than verified against the index and the body store.
+type PresenceSnapshot struct {
+	Hits   int64 `json:"hits"`
+	Misses int64 `json:"misses"`
 }
 
 // remember records that an action was verified present under gen.

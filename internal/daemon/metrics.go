@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/conductorone/plaid-cache/internal/reapi"
 	"github.com/conductorone/plaid-cache/internal/remote"
 )
 
@@ -158,6 +159,26 @@ func renderMetrics(r StatusResponse) []byte {
 	// dashboard can be understood as covering a week or an afternoon. Nanos on
 	// the wire, seconds here, because seconds is the unit this format uses for
 	// everything and a timestamp is no exception.
+	writeFamily(&b, "presence_memo_lookups_total", "counter",
+		"Presence probes (FindMissingBlobs, write short-circuits) by whether the in-memory memo answered them. "+
+			"A miss is verified against the index and the body store. Process-local.",
+		sample{labels: labels("result", "hit"), value: float64(r.Presence.Hits)},
+		sample{labels: labels("result", "miss"), value: float64(r.Presence.Misses)})
+
+	if rpc := r.RPC; rpc != nil {
+		writeFamily(&b, "grpc_presence_digests_total", "counter",
+			"Digests asked about by FindMissingBlobs, by answer. Divided by that method's call count it is the average batch size. Process-local.",
+			sample{labels: labels("result", "present"), value: float64(rpc.DigestsPresent)},
+			sample{labels: labels("result", "missing"), value: float64(rpc.DigestsMissing)})
+		writeFamily(&b, "grpc_blob_bytes_total", "counter",
+			"Uncompressed blob bytes served to (read) and received from (write) gRPC clients, batch and streaming. Process-local.",
+			sample{labels: labels("direction", "read"), value: float64(rpc.BytesRead)},
+			sample{labels: labels("direction", "write"), value: float64(rpc.BytesWritten)})
+		writeRPCHistogram(&b, "grpc_request_duration_seconds",
+			"How long each gRPC call took, by method and outcome. not_found is the normal answer to a lookup that misses. Process-local.",
+			rpc.Calls)
+	}
+
 	if r.LifetimeSince > 0 {
 		writeFamily(&b, "activity_start_time_seconds", "gauge",
 			"When the first activity these counters include was recorded, as Unix seconds.",
@@ -245,6 +266,31 @@ func writeHistogram(b *strings.Builder, name, help string, dists []remote.OpDura
 // label, because a series is created for every distinct value and never
 // forgotten, so an unbounded label is an unbounded memory leak in whatever
 // scrapes this.
+// writeRPCHistogram renders the gRPC call-duration histogram. The snapshot's
+// buckets are per-bucket counts; the exposition format wants them cumulative.
+func writeRPCHistogram(b *strings.Builder, name, help string, calls []reapi.RPCMethodSnapshot) {
+	if len(calls) == 0 {
+		return
+	}
+	edges := reapi.RPCBuckets()
+	writeHeader(b, name, "histogram", help)
+	for _, c := range calls {
+		var cum int64
+		for i, n := range c.Buckets {
+			if i >= len(edges) {
+				break
+			}
+			cum += n
+			writeSample(b, name+"_bucket",
+				labels("method", c.Method, "outcome", c.Outcome, "le", formatValue(edges[i])), float64(cum))
+		}
+		writeSample(b, name+"_bucket", labels("method", c.Method, "outcome", c.Outcome, "le", "+Inf"), float64(c.Count))
+		labelSet := labels("method", c.Method, "outcome", c.Outcome)
+		writeSample(b, name+"_sum", labelSet, c.SumSeconds)
+		writeSample(b, name+"_count", labelSet, float64(c.Count))
+	}
+}
+
 func labels(pairs ...string) string {
 	if len(pairs) == 0 {
 		return ""

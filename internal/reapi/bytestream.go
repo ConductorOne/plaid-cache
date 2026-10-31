@@ -72,6 +72,9 @@ func (b *byteStreamService) Read(req *bytestream.ReadRequest, stream bytestream.
 	if limit > 0 && limit < remaining {
 		remaining = limit
 	}
+	// Counted as requested rather than as delivered: a reader that hangs up
+	// part-way is rare, and the counter exists to size the load, not to bill it.
+	b.srv.rpc.bytesRead.Add(remaining)
 	src := io.LimitReader(f, remaining)
 	out := &chunkWriter{stream: stream, buf: make([]byte, 0, readChunkSize)}
 
@@ -197,6 +200,7 @@ func (b *byteStreamService) Write(stream bytestream.ByteStream_WriteServer) erro
 
 	b.srv.uploads.release(p, false)
 	p.discard()
+	b.srv.rpc.bytesWritten.Add(p.res.size)
 	return stream.SendAndClose(&bytestream.WriteResponse{CommittedSize: committed})
 }
 

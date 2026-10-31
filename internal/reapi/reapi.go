@@ -98,6 +98,7 @@ type Server struct {
 	logf    cache.Logf
 
 	rrccMetrics rrccMetrics
+	rpc         rpcMetrics
 
 	// verify mirrors the store's digest checking. It is read here to decide
 	// whether a client may name a digest function this server cannot check,

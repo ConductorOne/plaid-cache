@@ -447,6 +447,13 @@ func (c *Cache) record(a ids.ActionID, o ids.OutputID, path string, size, diskBy
 // Metrics returns a snapshot of the counters.
 func (c *Cache) Metrics() MetricsSnapshot { return c.metrics.Snapshot() }
 
+// Presence reports the presence memo's hits and misses since this process
+// started. It is not part of Metrics, which is persisted across processes: a
+// memo's effectiveness describes this process's memory, not the cache's.
+func (c *Cache) Presence() PresenceSnapshot {
+	return PresenceSnapshot{Hits: c.present.hits.Load(), Misses: c.present.misses.Load()}
+}
+
 // UploadQueue reports how many uploads are waiting and how many may wait.
 //
 // It is not part of Metrics because it is not the same kind of number. Those

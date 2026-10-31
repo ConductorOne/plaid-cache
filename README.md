@@ -285,6 +285,10 @@ There is no `directory`, no `config`, and no `volume` line, and `remote` says wh
 | `plaid_cache_upload_queue_depth`, `plaid_cache_upload_queue_capacity` | gauge | Uploads waiting on this daemon's pool, and how many may wait. Depth at capacity means uploads are being dropped. |
 | `plaid_cache_remote_requests_total{conn}` | counter | Requests to the shared tier by connection: `reused` or `new`. `new` paid for a handshake. |
 | `plaid_cache_remote_operation_duration_seconds{operation,outcome}` | histogram | How long a shared-tier operation took, by `get_action`/`put_action`/`get_object`/`put_object` and `ok`/`miss`/`error`. |
+| `plaid_cache_grpc_request_duration_seconds{method,outcome}` | histogram | Each gRPC call's duration by REAPI/ByteStream method and `ok`/`not_found`/`error`. `not_found` is a lookup miss, not a fault. Buckets run from 100µs to 30s. Process-local; absent without a gRPC listener. |
+| `plaid_cache_grpc_presence_digests_total{result}` | counter | Digests `FindMissingBlobs` was asked about, `present` or `missing`. Divided by that method's call count it is the average batch size. Process-local. |
+| `plaid_cache_grpc_blob_bytes_total{direction}` | counter | Uncompressed blob bytes `read` by and `write`n from gRPC clients. Process-local. |
+| `plaid_cache_presence_memo_lookups_total{result}` | counter | Presence probes answered from the in-memory memo (`hit`) or verified against the index and a stat (`miss`). Process-local. |
 | `plaid_cache_activity_start_time_seconds` | gauge | When the counters above started counting. |
 
 The last three families describe this process rather than the cache, because that is what they are about: a connection pool and a network path exist only while the daemon holding them does. The two remote families are absent altogether when no shared tier is configured — a local-only cache has not failed to reuse a connection, it has not tried.

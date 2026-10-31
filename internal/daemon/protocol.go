@@ -162,6 +162,16 @@ type StatusResponse struct {
 	RRCC reapi.RRCCMetricsSnapshot `json:"rrcc"`
 	Err  string                    `json:"err,omitempty"`
 
+	// RPC is what the gRPC listener has been asked to do since this process
+	// started: calls by method and outcome with their durations, presence-check
+	// answers per digest, and blob bytes each way. It is nil when the listener
+	// is not serving. Like the queue below it is this process's own.
+	RPC *reapi.RPCMetricsSnapshot `json:"rpc,omitempty"`
+
+	// Presence is how often a presence probe was answered from the in-memory
+	// memo rather than by the index and a stat, since this process started.
+	Presence cache.PresenceSnapshot `json:"presence"`
+
 	// UploadQueueDepth is how many uploads to the shared tier are waiting on
 	// this daemon's pool right now, and UploadQueueCapacity how many may.
 	//

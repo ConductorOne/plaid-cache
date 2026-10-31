@@ -78,6 +78,8 @@ func (c *casService) FindMissingBlobs(ctx context.Context, req *repb.FindMissing
 			return nil, status.FromContextError(err).Err()
 		}
 	}
+	c.srv.rpc.digestsMissing.Add(int64(len(missing)))
+	c.srv.rpc.digestsPresent.Add(int64(len(req.GetBlobDigests()) - len(missing)))
 	return &repb.FindMissingBlobsResponse{MissingBlobDigests: missing}, nil
 }
 
@@ -133,6 +135,7 @@ func (c *casService) updateOne(ctx context.Context, r *repb.BatchUpdateBlobsRequ
 			"plaid-cache: blob %s is %d bytes, not the %d it declares", d, len(data), want).Proto()
 	}
 
+	c.srv.rpc.bytesWritten.Add(int64(len(data)))
 	if err := c.srv.store.Put(ctx, bazel.KindCAS, d, bytes.NewReader(data)); err != nil {
 		if errors.Is(err, bazel.ErrDigestMismatch) {
 			return status.Newf(codes.InvalidArgument, "plaid-cache: blob does not hash to %s", d).Proto()
@@ -219,6 +222,7 @@ func (c *casService) readOne(ctx context.Context, bd *repb.Digest, compressor re
 		return out
 	}
 
+	c.srv.rpc.bytesRead.Add(int64(len(data)))
 	if compressor == repb.Compressor_ZSTD {
 		encoded, err := encodeAll(data)
 		if err != nil {
