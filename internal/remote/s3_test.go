@@ -61,6 +61,13 @@ func (f *fakeS3) all() []recordedReq {
 // setup, and retries are disabled so one call is one request.
 func newTestS3(t *testing.T, prefix string, h func(*fakeS3, http.ResponseWriter, *http.Request)) (*S3, *fakeS3) {
 	t.Helper()
+	return newTestS3With(t, S3Params{Prefix: prefix}, h)
+}
+
+// newTestS3With is newTestS3 for a caller that sets backend parameters beyond
+// the prefix. The endpoint, bucket and region are always the test's own.
+func newTestS3With(t *testing.T, p S3Params, h func(*fakeS3, http.ResponseWriter, *http.Request)) (*S3, *fakeS3) {
+	t.Helper()
 
 	f := &fakeS3{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,12 +86,8 @@ func newTestS3(t *testing.T, prefix string, h func(*fakeS3, http.ResponseWriter,
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 	t.Setenv("AWS_MAX_ATTEMPTS", "1")
 
-	s, err := NewS3(context.Background(), S3Params{
-		EndpointURL: srv.URL,
-		Bucket:      testBucket,
-		Region:      "us-west-2",
-		Prefix:      prefix,
-	})
+	p.EndpointURL, p.Bucket, p.Region = srv.URL, testBucket, "us-west-2"
+	s, err := NewS3(context.Background(), p)
 	if err != nil {
 		t.Fatalf("NewS3: %v", err)
 	}
@@ -500,5 +503,56 @@ func TestS3CancelledContextIsNotMiss(t *testing.T) {
 	}
 	if errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("GetAction with a cancelled context reported a miss: %v", err)
+	}
+}
+
+// TestS3IdleConnsKeepsAWorkerPoolsConnections pins what IdleConns is for: a
+// wave of concurrent requests as wide as the pool, followed by a second wave,
+// reuses every connection the first opened. With the SDK's default of ten idle
+// connections per host the second wave would open most of its own again, each
+// paying a handshake.
+func TestS3IdleConnsKeepsAWorkerPoolsConnections(t *testing.T) {
+	const width = 24
+	var mu sync.Mutex
+	arrived := 0
+	release := make(chan struct{})
+	s, _ := newTestS3With(t, S3Params{IdleConns: width}, func(f *fakeS3, w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		// Hold every request of the first wave until all have arrived, so the
+		// wave genuinely needs width connections at once.
+		mu.Lock()
+		arrived++
+		if arrived == width {
+			close(release)
+		}
+		mu.Unlock()
+		<-release
+		w.WriteHeader(http.StatusOK)
+	})
+
+	wave := func() {
+		var wg sync.WaitGroup
+		for i := range width {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				body := strings.NewReader("body")
+				if err := s.PutObject(testCtx(t), mkOutput(byte(i)), body, int64(body.Len())); err != nil {
+					t.Errorf("PutObject: %v", err)
+				}
+			}()
+		}
+		wg.Wait()
+	}
+	wave()
+	first := s.Stats()
+	wave()
+	second := s.Stats()
+
+	if first.ConnsNew != width {
+		t.Fatalf("first wave opened %d connections, want %d", first.ConnsNew, width)
+	}
+	if opened := second.ConnsNew - first.ConnsNew; opened != 0 {
+		t.Fatalf("second wave opened %d new connections, want every one reused", opened)
 	}
 }

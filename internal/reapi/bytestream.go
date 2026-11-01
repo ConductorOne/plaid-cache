@@ -72,6 +72,9 @@ func (b *byteStreamService) Read(req *bytestream.ReadRequest, stream bytestream.
 	if limit > 0 && limit < remaining {
 		remaining = limit
 	}
+	// Counted as requested rather than as delivered: a reader that hangs up
+	// part-way is rare, and the counter exists to size the load, not to bill it.
+	b.srv.rpc.bytesRead.Add(remaining)
 	src := io.LimitReader(f, remaining)
 	out := &chunkWriter{stream: stream, buf: make([]byte, 0, readChunkSize)}
 
@@ -88,7 +91,7 @@ func (b *byteStreamService) Read(req *bytestream.ReadRequest, stream bytestream.
 		if err := enc.Close(); err != nil {
 			return err
 		}
-	} else if _, err := io.CopyBuffer(out, src, make([]byte, readChunkSize)); err != nil {
+	} else if _, err := out.ReadFrom(src); err != nil {
 		return err
 	}
 	return out.Flush()
@@ -118,6 +121,29 @@ func (c *chunkWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return written, nil
+}
+
+// ReadFrom fills chunks straight from r, so a plain read moves each byte from
+// the file into the message buffer once rather than through an intermediate
+// copy buffer first.
+func (c *chunkWriter) ReadFrom(r io.Reader) (int64, error) {
+	var total int64
+	for {
+		n, err := r.Read(c.buf[len(c.buf):readChunkSize])
+		c.buf = c.buf[:len(c.buf)+n]
+		total += int64(n)
+		if len(c.buf) == readChunkSize {
+			if ferr := c.Flush(); ferr != nil {
+				return total, ferr
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return total, nil
+		}
+		if err != nil {
+			return total, err
+		}
+	}
 }
 
 // Flush sends whatever is buffered.
@@ -197,6 +223,7 @@ func (b *byteStreamService) Write(stream bytestream.ByteStream_WriteServer) erro
 
 	b.srv.uploads.release(p, false)
 	p.discard()
+	b.srv.rpc.bytesWritten.Add(p.res.size)
 	return stream.SendAndClose(&bytestream.WriteResponse{CommittedSize: committed})
 }
 

@@ -51,7 +51,7 @@ func (s *Server) ServeBazelGRPC(ctx context.Context, ln net.Listener) error {
 	})
 	s.setREAPI(svc)
 	defer s.setREAPI(nil)
-	g := grpc.NewServer(reapi.ServerOptions()...)
+	g := grpc.NewServer(append(reapi.ServerOptions(), svc.Interceptors()...)...)
 	svc.Register(g)
 
 	done := make(chan struct{})

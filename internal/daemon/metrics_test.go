@@ -459,3 +459,40 @@ func TestMetricsAgreeWithTheStatusReport(t *testing.T) {
 		t.Fatalf("status = %+v, want a cache holding the entry just stored", status)
 	}
 }
+
+// TestMetricsExposeTheGRPCSurface pins the gRPC and presence families: the
+// histogram is cumulative with +Inf equal to the count, the digest and byte
+// counters carry their direction labels, and none of the gRPC families appear
+// for a daemon whose gRPC listener is not serving.
+func TestMetricsExposeTheGRPCSurface(t *testing.T) {
+	buckets := make([]int64, len(reapi.RPCBuckets()))
+	buckets[0], buckets[3] = 2, 1
+	e := parseExposition(t, string(renderMetrics(StatusResponse{
+		Version:  testVersion,
+		Presence: cache.PresenceSnapshot{Hits: 7, Misses: 3},
+		RPC: &reapi.RPCMetricsSnapshot{
+			Calls: []reapi.RPCMethodSnapshot{{
+				Method: "FindMissingBlobs", Outcome: "ok", Buckets: buckets, Count: 4, SumSeconds: 0.5,
+			}},
+			DigestsPresent: 90, DigestsMissing: 10, BytesRead: 1 << 20, BytesWritten: 512,
+		},
+	})))
+	e.wantSample(t, `plaid_cache_presence_memo_lookups_total{result="hit"}`, 7)
+	e.wantSample(t, `plaid_cache_grpc_presence_digests_total{result="missing"}`, 10)
+	e.wantSample(t, `plaid_cache_grpc_blob_bytes_total{direction="read"}`, 1<<20)
+	e.wantSample(t, `plaid_cache_grpc_request_duration_seconds_bucket{method="FindMissingBlobs",outcome="ok",le="0.0001"}`, 2)
+	e.wantSample(t, `plaid_cache_grpc_request_duration_seconds_bucket{method="FindMissingBlobs",outcome="ok",le="0.001"}`, 3)
+	e.wantSample(t, `plaid_cache_grpc_request_duration_seconds_bucket{method="FindMissingBlobs",outcome="ok",le="+Inf"}`, 4)
+	e.wantSample(t, `plaid_cache_grpc_request_duration_seconds_count{method="FindMissingBlobs",outcome="ok"}`, 4)
+
+	none := parseExposition(t, string(renderMetrics(StatusResponse{Version: testVersion})))
+	for _, f := range []string{
+		"plaid_cache_grpc_presence_digests_total",
+		"plaid_cache_grpc_blob_bytes_total",
+		"plaid_cache_grpc_request_duration_seconds",
+	} {
+		if _, ok := none.types[f]; ok {
+			t.Fatalf("%s was emitted for a daemon with no gRPC listener", f)
+		}
+	}
+}

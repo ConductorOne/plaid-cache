@@ -160,6 +160,18 @@ func (s *Server) rrccMetrics() reapi.RRCCMetricsSnapshot {
 	return s.reapi.RRCCMetrics()
 }
 
+// rpcMetrics returns the current gRPC service's call accounting, or nil when
+// no gRPC listener is serving.
+func (s *Server) rpcMetrics() *reapi.RPCMetricsSnapshot {
+	s.reapiMu.RLock()
+	defer s.reapiMu.RUnlock()
+	if s.reapi == nil {
+		return nil
+	}
+	m := s.reapi.RPCMetrics()
+	return &m
+}
+
 // Listen binds the unix socket.
 //
 // A socket file left behind by a daemon that died without cleaning up would
@@ -636,6 +648,8 @@ func (s *Server) status() StatusResponse {
 		UptimeSeconds: uptime.Seconds(),
 		Metrics:       s.cache.Metrics(),
 		RRCC:          s.rrccMetrics(),
+		RPC:           s.rpcMetrics(),
+		Presence:      s.cache.Presence(),
 	}
 	r.UploadQueueDepth, r.UploadQueueCapacity = s.cache.UploadQueue()
 	if rs, ok := s.cache.RemoteStats(); ok {

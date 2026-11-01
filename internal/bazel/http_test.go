@@ -412,9 +412,9 @@ func totalAlloc() uint64 {
 // disk or an unreadable index.
 type failingStore struct{}
 
-// Get always fails.
-func (failingStore) Get(context.Context, ids.ActionID) (cache.Result, error) {
-	return cache.Result{}, errors.New("index is unreadable")
+// Open always fails.
+func (failingStore) Open(context.Context, ids.ActionID) (*os.File, cache.Result, error) {
+	return nil, cache.Result{}, errors.New("index is unreadable")
 }
 
 // Has always reports absent, so an upload is always attempted.

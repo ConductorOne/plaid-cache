@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/vfs"
 
 	"github.com/conductorone/plaid-cache/internal/ids"
@@ -83,7 +84,11 @@ func Open(dir string) (*Index, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Open: %w: %w", ErrLocked, err)
 	}
-	db, err := pebble.Open(dir, &pebble.Options{Lock: lock})
+	opts := pebbleOptions(lock)
+	db, err := pebble.Open(dir, opts)
+	// Open took its own reference to the block cache; the DB releases it on
+	// Close, so this one is no longer needed whatever Open returned.
+	opts.Cache.Unref()
 	if err != nil {
 		_ = lock.Close()
 		return nil, fmt.Errorf("Open: %w", err)
@@ -99,6 +104,29 @@ func Open(dir string) (*Index, error) {
 	ix.wg.Add(1)
 	go ix.persistLoop()
 	return ix, nil
+}
+
+// indexCacheBytes is the Pebble block cache.
+//
+// Pebble's default is 8 MiB, sized for an embedded store nobody reads hot. This
+// index is read on every probe and every hit — FindMissingBlobs asks about
+// thousands of digests at once — and production's runs to about a million
+// entries, a couple of hundred megabytes of tables. With the default, most
+// lookups decoded a block read back from the page cache. The cache is filled
+// lazily, so a small index never costs this much memory.
+const indexCacheBytes = 256 << 20
+
+// pebbleOptions returns the options the index is opened with.
+//
+// Bloom filters let a lookup for an absent key — every new upload's presence
+// check, and the absent share of every FindMissingBlobs — skip a table without
+// reading its blocks.
+func pebbleOptions(lock *pebble.Lock) *pebble.Options {
+	opts := &pebble.Options{Lock: lock, Cache: pebble.NewCache(indexCacheBytes)}
+	for i := range opts.Levels {
+		opts.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
+	}
+	return opts
 }
 
 // Close persists the counters, writes the clean-shutdown marker, and releases
@@ -197,7 +225,12 @@ func (ix *Index) Put(a ids.ActionID, e Entry, diskBytes int64) error {
 	}
 
 	ix.mu.Lock()
-	defer ix.mu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			ix.mu.Unlock()
+		}
+	}()
 
 	old, hadOld, err := ix.loadEntry(a)
 	if err != nil {
@@ -249,14 +282,24 @@ func (ix *Index) Put(a ids.ActionID, e Entry, diskBytes int64) error {
 	if err := b.Set(lruKey(e.LastUsedAt, a), nil, nil); err != nil {
 		return fmt.Errorf("Put: %w", err)
 	}
-	if err := b.Commit(pebble.Sync); err != nil {
+	// The batch is applied and published under mu, which is all the next
+	// read-modify-write needs to see it. The WAL sync is waited for after mu is
+	// released, so concurrent puts share one fsync through Pebble's commit
+	// pipeline instead of queueing one fsync each behind the lock. Put still
+	// returns only once its own batch is durable.
+	if err := ix.db.ApplyNoSyncWait(b, pebble.Sync); err != nil {
 		return fmt.Errorf("Put: %w", err)
 	}
-
 	ix.actions.Add(dActions)
 	ix.objects.Add(dObjects)
 	ix.diskBytes.Add(dDisk)
 	ix.zeroRefs.Add(dZero)
+	ix.mu.Unlock()
+	locked = false
+
+	if err := b.SyncWait(); err != nil {
+		return fmt.Errorf("Put: %w", err)
+	}
 	return nil
 }
 

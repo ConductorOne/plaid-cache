@@ -44,6 +44,10 @@ type Cache struct {
 	touches *toucher
 	metrics Metrics
 
+	// present remembers recent positive Has answers so a digest probed again
+	// within presenceTTL costs neither an index lookup nor a stat.
+	present presence
+
 	// prunedSinceCompact is the tombstone debt built up since the last
 	// compaction, counted across passes rather than within one: a thousand
 	// small evictions leave as many tombstones as a single large one, and a
@@ -166,30 +170,92 @@ func (c *Cache) Get(ctx context.Context, a ids.ActionID) (Result, error) {
 				Time:     time.Unix(0, e.CreatedAt),
 			}, nil
 		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			// The body may well be fine and simply unreadable right now — a
-			// transient I/O error, or a permissions change. Treat it as a miss
-			// so the build proceeds, but leave the index alone: deleting the
-			// entry would discard a good body and its refcount on the strength
-			// of a temporary failure.
-			c.logf("blob get %s: %v", e.OutputID, err)
-			c.metrics.GetMiss.Add(1)
+		if !c.bodyGone(a, e, err) {
 			return Result{Miss: true}, nil
-		}
-		// The body is genuinely gone — someone deleted the blob tree by hand,
-		// or a partial clean ran. Drop the dangling entry so the accounting
-		// stays honest, then fall through to the remote.
-		c.metrics.GetRepair.Add(1)
-		if orphan, isOrphan, derr := c.idx.Delete(a); derr != nil {
-			c.logf("index repair %s: %v", a, derr)
-		} else if isOrphan {
-			if rerr := c.blobs.Remove(orphan); rerr != nil {
-				c.logf("blob repair %s: %v", orphan, rerr)
-			}
 		}
 	}
 
 	return c.getRemote(ctx, a)
+}
+
+// Open resolves an action like Get and returns its body already open.
+//
+// A reader that is going to open the body anyway should not have Get stat it
+// first: the stat and the open each walk the path, and on the REAPI read path
+// that duplicate was a measurable share of the daemon's CPU. Here the open is
+// the presence check. Result.Size is the length of the opened file rather than
+// the indexed one, so a caller streaming it cannot be handed a length the body
+// disagrees with. On a miss the file is nil.
+func (c *Cache) Open(ctx context.Context, a ids.ActionID) (*os.File, Result, error) {
+	e, ok, err := c.idx.Get(a)
+	if err != nil {
+		// A broken index must not fail the build; see Get.
+		c.logf("index get %s: %v", a, err)
+		c.metrics.GetMiss.Add(1)
+		return nil, Result{Miss: true}, nil
+	}
+	if ok {
+		f, size, err := c.blobs.Open(e.OutputID)
+		if err == nil {
+			c.touches.enqueue(a, e.LastUsedAt)
+			c.metrics.GetLocalHit.Add(1)
+			return f, Result{
+				OutputID: e.OutputID,
+				Size:     size,
+				DiskPath: f.Name(),
+				Time:     time.Unix(0, e.CreatedAt),
+			}, nil
+		}
+		if !c.bodyGone(a, e, err) {
+			return nil, Result{Miss: true}, nil
+		}
+	}
+
+	res, err := c.getRemote(ctx, a)
+	if err != nil || res.Miss {
+		return nil, res, err
+	}
+	f, size, err := c.blobs.Open(res.OutputID)
+	if err != nil {
+		// Faulted in a moment ago and already unreadable: a miss, like any
+		// other body that cannot be served.
+		c.logf("blob open %s: %v", res.OutputID, err)
+		return nil, Result{Miss: true}, nil
+	}
+	res.Size = size
+	return f, res, nil
+}
+
+// bodyGone handles an indexed entry whose body could not be reached, and
+// reports whether the caller should fall through to the shared tier.
+//
+// It is shared by Get and Open so the two cannot disagree about when an entry
+// is repaired: only a body that is genuinely absent is, never one that is
+// merely unreadable right now.
+func (c *Cache) bodyGone(a ids.ActionID, e index.Entry, err error) bool {
+	if !errors.Is(err, fs.ErrNotExist) {
+		// The body may well be fine and simply unreadable right now — a
+		// transient I/O error, or a permissions change. Treat it as a miss
+		// so the build proceeds, but leave the index alone: deleting the
+		// entry would discard a good body and its refcount on the strength
+		// of a temporary failure.
+		c.logf("blob get %s: %v", e.OutputID, err)
+		c.metrics.GetMiss.Add(1)
+		return false
+	}
+	// The body is genuinely gone — someone deleted the blob tree by hand,
+	// or a partial clean ran. Drop the dangling entry so the accounting
+	// stays honest, then fall through to the remote.
+	c.metrics.GetRepair.Add(1)
+	if orphan, isOrphan, derr := c.idx.Delete(a); derr != nil {
+		c.logf("index repair %s: %v", a, derr)
+	} else if isOrphan {
+		if rerr := c.blobs.Remove(orphan); rerr != nil {
+			c.logf("blob repair %s: %v", orphan, rerr)
+		}
+	}
+	c.present.invalidate()
+	return true
 }
 
 // getRemote faults an entry in from the shared tier.
@@ -278,6 +344,12 @@ func (c *Cache) HasRemote(ctx context.Context, a ids.ActionID) bool {
 // A missing or unreadable body is reported as absent, so a caller that reacts
 // by storing it repairs the dangling entry as a side effect.
 func (c *Cache) Has(ctx context.Context, a ids.ActionID) bool {
+	now := time.Now().UnixNano()
+	if lastUsed, ok := c.present.lookup(a, now); ok {
+		c.touches.enqueue(a, lastUsed)
+		return true
+	}
+	gen := c.present.generation()
 	e, ok, err := c.idx.Get(a)
 	if err != nil || !ok {
 		return false
@@ -286,7 +358,19 @@ func (c *Cache) Has(ctx context.Context, a ids.ActionID) bool {
 		return false
 	}
 	c.touches.enqueue(a, e.LastUsedAt)
+	c.present.remember(a, gen, now, c.touchedAt(e.LastUsedAt, now))
 	return true
+}
+
+// touchedAt returns the last-used time an entry will have once the touch just
+// enqueued for it lands: now if one was due, its recorded time otherwise.
+// Remembering that rather than the recorded time keeps a memoised Has from
+// enqueueing the same touch again on every probe until the memo expires.
+func (c *Cache) touchedAt(lastUsed, now int64) int64 {
+	if g := c.cfg.TouchGranularity.Nanoseconds(); g > 0 && now-lastUsed < g {
+		return lastUsed
+	}
+	return now
 }
 
 // Put records an action's output.
@@ -363,6 +447,13 @@ func (c *Cache) record(a ids.ActionID, o ids.OutputID, path string, size, diskBy
 // Metrics returns a snapshot of the counters.
 func (c *Cache) Metrics() MetricsSnapshot { return c.metrics.Snapshot() }
 
+// Presence reports the presence memo's hits and misses since this process
+// started. It is not part of Metrics, which is persisted across processes: a
+// memo's effectiveness describes this process's memory, not the cache's.
+func (c *Cache) Presence() PresenceSnapshot {
+	return PresenceSnapshot{Hits: c.present.hits.Load(), Misses: c.present.misses.Load()}
+}
+
 // UploadQueue reports how many uploads are waiting and how many may wait.
 //
 // It is not part of Metrics because it is not the same kind of number. Those
@@ -414,8 +505,16 @@ func (c *Cache) EvictWith(ctx context.Context, maxBytes int64, ttl time.Duration
 			// keep pruning rather than aborting the whole pass.
 			c.logf("evict remove %s: %v", o, rerr)
 		}
+		// After the removal, so a probe that verifies the body in between is
+		// remembered under a generation this has already retired.
+		c.present.invalidate()
 		return nil
 	})
+	if res.ActionsPruned > 0 {
+		// Pruned actions whose bodies other actions still reference removed no
+		// body above, but they are no longer present either.
+		c.present.invalidate()
+	}
 	if err != nil {
 		return res, fmt.Errorf("EvictWith: %w", err)
 	}

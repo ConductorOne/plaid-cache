@@ -44,7 +44,8 @@ func checkInstance(name string) error {
 // megabytes. An honest answer here turns all of that into one round trip.
 //
 // It is honest and it is cheap, which have to be true together. Each digest
-// costs an index lookup and a stat, never a read of the body, so answering for
+// costs at most an index lookup and a stat — nothing at all when the cache
+// verified it within the last minute — never a read of the body, so answering for
 // every output of a build at once stays proportional to the number of outputs
 // rather than to their size.
 //
@@ -77,6 +78,8 @@ func (c *casService) FindMissingBlobs(ctx context.Context, req *repb.FindMissing
 			return nil, status.FromContextError(err).Err()
 		}
 	}
+	c.srv.rpc.digestsMissing.Add(int64(len(missing)))
+	c.srv.rpc.digestsPresent.Add(int64(len(req.GetBlobDigests()) - len(missing)))
 	return &repb.FindMissingBlobsResponse{MissingBlobDigests: missing}, nil
 }
 
@@ -132,6 +135,7 @@ func (c *casService) updateOne(ctx context.Context, r *repb.BatchUpdateBlobsRequ
 			"plaid-cache: blob %s is %d bytes, not the %d it declares", d, len(data), want).Proto()
 	}
 
+	c.srv.rpc.bytesWritten.Add(int64(len(data)))
 	if err := c.srv.store.Put(ctx, bazel.KindCAS, d, bytes.NewReader(data)); err != nil {
 		if errors.Is(err, bazel.ErrDigestMismatch) {
 			return status.Newf(codes.InvalidArgument, "plaid-cache: blob does not hash to %s", d).Proto()
@@ -218,6 +222,7 @@ func (c *casService) readOne(ctx context.Context, bd *repb.Digest, compressor re
 		return out
 	}
 
+	c.srv.rpc.bytesRead.Add(int64(len(data)))
 	if compressor == repb.Compressor_ZSTD {
 		encoded, err := encodeAll(data)
 		if err != nil {
