@@ -274,6 +274,7 @@ func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, n := range []string{
 		"PLAID_GOCACHE_DIR",
+		"PLAID_GOCACHE_BAZEL_INSTANCE_NAMES",
 		"PLAID_GOCACHE_MAX_BYTES",
 		"PLAID_GOCACHE_TTL",
 		"PLAID_GOCACHE_TOUCH_GRANULARITY",
@@ -392,5 +393,42 @@ func TestListenerSettingsAreValidFileKeys(t *testing.T) {
 	}
 	if !c.DisableBazelVerify {
 		t.Fatalf("DisableBazelVerify = false, want true")
+	}
+}
+
+// TestLoadBazelInstanceNames pins how the instance-name list is read: trimmed,
+// de-duplicated, and empty by default.
+func TestLoadBazelInstanceNames(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PLAID_GOCACHE_DIR", t.TempDir())
+
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(c.BazelInstanceNames) != 0 {
+		t.Fatalf("BazelInstanceNames = %v by default, want none", c.BazelInstanceNames)
+	}
+
+	t.Setenv("PLAID_GOCACHE_BAZEL_INSTANCE_NAMES", " ci-v1 , team/linux-arm64,ci-v1")
+	if c, err = Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"ci-v1", "team/linux-arm64"}
+	if strings.Join(c.BazelInstanceNames, "|") != strings.Join(want, "|") {
+		t.Fatalf("BazelInstanceNames = %v, want %v", c.BazelInstanceNames, want)
+	}
+}
+
+// TestLoadRejectsUnservableInstanceNames pins that a name the server could not
+// find in a resource name is an error at startup, not a silently dropped entry.
+func TestLoadRejectsUnservableInstanceNames(t *testing.T) {
+	for _, v := range []string{"a,,b", ",", "a//b", "/a", "a/", "team/blobs", "uploads", "x/compressed-blobs/y"} {
+		clearEnv(t)
+		t.Setenv("PLAID_GOCACHE_DIR", t.TempDir())
+		t.Setenv("PLAID_GOCACHE_BAZEL_INSTANCE_NAMES", v)
+		if c, err := Load(); err == nil {
+			t.Fatalf("Load with %q = %v, want an error", v, c.BazelInstanceNames)
+		}
 	}
 }

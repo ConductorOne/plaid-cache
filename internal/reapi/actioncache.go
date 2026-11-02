@@ -34,6 +34,9 @@ type actionCacheService struct {
 // the API allows and every client already handles, and which keeps this from
 // reading blobs nobody may want.
 func (a *actionCacheService) GetActionResult(ctx context.Context, req *repb.GetActionResultRequest) (*repb.ActionResult, error) {
+	if err := a.srv.instances.check(req.GetInstanceName()); err != nil {
+		return nil, err
+	}
 	if err := a.srv.checkDigestFunction(req.GetDigestFunction()); err != nil {
 		return nil, err
 	}
@@ -83,6 +86,9 @@ func (a *actionCacheService) GetActionResult(ctx context.Context, req *repb.GetA
 // therefore store a valid encoding of the same message, which is all either
 // needs of the other.
 func (a *actionCacheService) UpdateActionResult(ctx context.Context, req *repb.UpdateActionResultRequest) (*repb.ActionResult, error) {
+	if err := a.srv.instances.check(req.GetInstanceName()); err != nil {
+		return nil, err
+	}
 	if err := a.srv.checkDigestFunction(req.GetDigestFunction()); err != nil {
 		return nil, err
 	}

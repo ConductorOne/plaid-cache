@@ -23,15 +23,28 @@ type casService struct {
 	srv *Server
 }
 
-// checkInstance rejects a named instance, for the same reason a resource name
-// carrying one is rejected: one keyspace serving several instance names would
-// let two logically separate caches share entries without saying so.
-func checkInstance(name string) error {
-	if name != "" {
-		return status.Errorf(codes.InvalidArgument,
-			"plaid-cache: instance %q is not served; this cache serves a single unnamed instance", name)
+// instanceSet is the set of instance names a server answers to. The empty name
+// is always a member.
+type instanceSet map[string]bool
+
+func newInstanceSet(names []string) instanceSet {
+	s := instanceSet{"": true}
+	for _, n := range names {
+		s[n] = true
 	}
-	return nil
+	return s
+}
+
+// check refuses an instance name the operator did not list, for the same reason
+// a resource name carrying one is refused: one keyspace serving names nobody
+// declared to be one cache would let two logically separate caches share
+// entries without saying so.
+func (s instanceSet) check(name string) error {
+	if s[name] {
+		return nil
+	}
+	return status.Errorf(codes.InvalidArgument,
+		"plaid-cache: instance %q is not served by this cache", name)
 }
 
 // FindMissingBlobs reports which of a client's digests this cache does not
@@ -53,7 +66,7 @@ func checkInstance(name string) error {
 // in use. Without that, the answer would be a promise the cache was free to
 // break between here and the client's later read.
 func (c *casService) FindMissingBlobs(ctx context.Context, req *repb.FindMissingBlobsRequest) (*repb.FindMissingBlobsResponse, error) {
-	if err := checkInstance(req.GetInstanceName()); err != nil {
+	if err := c.srv.instances.check(req.GetInstanceName()); err != nil {
 		return nil, err
 	}
 	if err := c.srv.checkDigestFunction(req.GetDigestFunction()); err != nil {
@@ -89,7 +102,7 @@ func (c *casService) FindMissingBlobs(ctx context.Context, req *repb.FindMissing
 // blobs in the batch stored fine, and a client told the whole batch failed
 // would resend all of them.
 func (c *casService) BatchUpdateBlobs(ctx context.Context, req *repb.BatchUpdateBlobsRequest) (*repb.BatchUpdateBlobsResponse, error) {
-	if err := checkInstance(req.GetInstanceName()); err != nil {
+	if err := c.srv.instances.check(req.GetInstanceName()); err != nil {
 		return nil, err
 	}
 	if err := c.srv.checkDigestFunction(req.GetDigestFunction()); err != nil {
@@ -154,7 +167,7 @@ func (c *casService) updateOne(ctx context.Context, r *repb.BatchUpdateBlobsRequ
 // batch against the advertised limit never sees this, and one that ignored the
 // limit is better told so than handed a short answer it has to notice.
 func (c *casService) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsRequest) (*repb.BatchReadBlobsResponse, error) {
-	if err := checkInstance(req.GetInstanceName()); err != nil {
+	if err := c.srv.instances.check(req.GetInstanceName()); err != nil {
 		return nil, err
 	}
 	if err := c.srv.checkDigestFunction(req.GetDigestFunction()); err != nil {

@@ -33,9 +33,9 @@ func TestParseReadResource(t *testing.T) {
 		{"empty blob", "blobs/" + h + "/0", repb.Compressor_IDENTITY, "", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseReadResource(tc.in)
+			got, err := parseReadResource(tc.in, newInstanceSet(nil))
 			if err != nil {
-				t.Fatalf("parseReadResource(%q): %v", tc.in, err)
+				t.Fatalf("parseReadResource(%q, newInstanceSet(nil)): %v", tc.in, err)
 			}
 			if got.compressor != tc.compressor {
 				t.Fatalf("compressor = %v, want %v", got.compressor, tc.compressor)
@@ -68,9 +68,9 @@ func TestParseWriteResource(t *testing.T) {
 		{"zstd with metadata", "uploads/some-uuid/compressed-blobs/zstd/" + h + "/12/out.o"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseWriteResource(tc.in)
+			got, err := parseWriteResource(tc.in, newInstanceSet(nil))
 			if err != nil {
-				t.Fatalf("parseWriteResource(%q): %v", tc.in, err)
+				t.Fatalf("parseWriteResource(%q, newInstanceSet(nil)): %v", tc.in, err)
 			}
 			if got.digest.String() != h || got.size != 12 {
 				t.Fatalf("parsed %s/%d, want %s/12", got.digest, got.size, h)
@@ -99,8 +99,8 @@ func TestMalformedResourcesAreRejected(t *testing.T) {
 		"compressed-blobs/" + h + "/12",
 	}
 	for _, in := range read {
-		if got, err := parseReadResource(in); err == nil {
-			t.Fatalf("parseReadResource(%q) = %+v, want an error", in, got)
+		if got, err := parseReadResource(in, newInstanceSet(nil)); err == nil {
+			t.Fatalf("parseReadResource(%q, newInstanceSet(nil)) = %+v, want an error", in, got)
 		}
 	}
 
@@ -113,8 +113,8 @@ func TestMalformedResourcesAreRejected(t *testing.T) {
 		"instance/uploads/uuid/blobs/" + h + "/12",
 	}
 	for _, in := range write {
-		if got, err := parseWriteResource(in); err == nil {
-			t.Fatalf("parseWriteResource(%q) = %+v, want an error", in, got)
+		if got, err := parseWriteResource(in, newInstanceSet(nil)); err == nil {
+			t.Fatalf("parseWriteResource(%q, newInstanceSet(nil)) = %+v, want an error", in, got)
 		}
 	}
 }
@@ -122,7 +122,7 @@ func TestMalformedResourcesAreRejected(t *testing.T) {
 // TestNegativeSizeIsRejected pins that a size which cannot describe a body is
 // refused, since it would otherwise reach the read path as a length.
 func TestNegativeSizeIsRejected(t *testing.T) {
-	if _, err := parseReadResource("blobs/" + hexOf("body") + "/-1"); err == nil {
+	if _, err := parseReadResource("blobs/"+hexOf("body")+"/-1", newInstanceSet(nil)); err == nil {
 		t.Fatalf("a negative size was accepted")
 	}
 }

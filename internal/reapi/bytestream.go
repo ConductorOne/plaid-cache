@@ -29,7 +29,7 @@ type byteStreamService struct {
 
 // Read streams a blob to the client.
 func (b *byteStreamService) Read(req *bytestream.ReadRequest, stream bytestream.ByteStream_ReadServer) error {
-	res, err := parseReadResource(req.GetResourceName())
+	res, err := parseReadResource(req.GetResourceName(), b.srv.instances)
 	if err != nil {
 		return err
 	}
@@ -175,7 +175,7 @@ func (b *byteStreamService) Write(stream bytestream.ByteStream_WriteServer) erro
 		}
 		return err
 	}
-	res, err := parseWriteResource(first.GetResourceName())
+	res, err := parseWriteResource(first.GetResourceName(), b.srv.instances)
 	if err != nil {
 		return err
 	}
@@ -366,7 +366,7 @@ func drain(stream bytestream.ByteStream_WriteServer, req *bytestream.WriteReques
 
 // QueryWriteStatus reports how far a write got, so a client can resume it.
 func (b *byteStreamService) QueryWriteStatus(ctx context.Context, req *bytestream.QueryWriteStatusRequest) (*bytestream.QueryWriteStatusResponse, error) {
-	res, err := parseWriteResource(req.GetResourceName())
+	res, err := parseWriteResource(req.GetResourceName(), b.srv.instances)
 	if err != nil {
 		return nil, err
 	}

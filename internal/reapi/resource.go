@@ -59,8 +59,8 @@ var resourceKeywords = map[string]bool{
 
 // parseReadResource decodes `{instance}/blobs/{df/}{hash}/{size}` and its
 // compressed form.
-func parseReadResource(name string) (resource, error) {
-	segs, err := trimInstance(name)
+func parseReadResource(name string, instances instanceSet) (resource, error) {
+	segs, err := trimInstance(name, instances)
 	if err != nil {
 		return resource{}, err
 	}
@@ -80,8 +80,8 @@ func parseReadResource(name string) (resource, error) {
 // parseWriteResource decodes
 // `{instance}/uploads/{uuid}/blobs/{df/}{hash}/{size}{/metadata}` and its
 // compressed form.
-func parseWriteResource(name string) (resource, error) {
-	segs, err := trimInstance(name)
+func parseWriteResource(name string, instances instanceSet) (resource, error) {
+	segs, err := trimInstance(name, instances)
 	if err != nil {
 		return resource{}, err
 	}
@@ -100,18 +100,16 @@ func parseWriteResource(name string) (resource, error) {
 	return res, err
 }
 
-// trimInstance strips the instance-name prefix, which this server serves only
-// as the empty one, and returns the remaining segments.
-func trimInstance(name string) ([]string, error) {
+// trimInstance strips the instance-name prefix, refusing one the server does
+// not answer to, and returns the remaining segments.
+func trimInstance(name string, instances instanceSet) ([]string, error) {
 	segs := strings.Split(name, "/")
 	for i, s := range segs {
 		if resourceKeywords[s] {
-			if i != 0 {
-				return nil, status.Errorf(codes.InvalidArgument,
-					"plaid-cache: resource %q names instance %q; this cache serves a single unnamed instance",
-					name, strings.Join(segs[:i], "/"))
+			if err := instances.check(strings.Join(segs[:i], "/")); err != nil {
+				return nil, err
 			}
-			return segs, nil
+			return segs[i:], nil
 		}
 	}
 	return nil, status.Errorf(codes.InvalidArgument,

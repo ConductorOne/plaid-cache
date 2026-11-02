@@ -199,6 +199,18 @@ type Config struct {
 	// file path, no bucket name.
 	BazelMonitoring bool
 
+	// BazelInstanceNames are the REAPI instance names the gRPC listener answers
+	// to besides the empty one. Empty, the default, serves only the unnamed
+	// instance.
+	//
+	// Every name listed is served from the one keyspace the unnamed instance
+	// uses. The list exists so a fleet of clients that already sends a name
+	// can be pointed here without first changing every client: the operator
+	// states that those names are one cache. A name not on the list is still
+	// refused, so a client that changes its name to get a separate cache is
+	// told it has none rather than silently sharing this one.
+	BazelInstanceNames []string
+
 	// DisableBazelVerify stops the Bazel listener from checking that an
 	// uploaded CAS body hashes to the digest naming it. It exists for a client
 	// whose digest function is not SHA-256, since only the bare hash appears in
@@ -303,6 +315,9 @@ func Load() (*Config, error) {
 	if c.BazelMonitoring, err = envBool(src, "PLAID_GOCACHE_BAZEL_MONITORING"); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
+	if c.BazelInstanceNames, err = envInstanceNames(src, "PLAID_GOCACHE_BAZEL_INSTANCE_NAMES"); err != nil {
+		return nil, fmt.Errorf("Load: %w", err)
+	}
 	if c.DisableBazelVerify, err = envBool(src, "PLAID_GOCACHE_DISABLE_BAZEL_VERIFY"); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
@@ -355,6 +370,7 @@ var settingNames = map[string]bool{
 	"PLAID_GOCACHE_BAZEL_ADDR":           true,
 	"PLAID_GOCACHE_BAZEL_GRPC_ADDR":      true,
 	"PLAID_GOCACHE_BAZEL_MONITORING":     true,
+	"PLAID_GOCACHE_BAZEL_INSTANCE_NAMES": true,
 	"PLAID_GOCACHE_PPROF_ADDR":           true,
 	"PLAID_GOCACHE_DISABLE_BAZEL_VERIFY": true,
 	"PLAID_GOCACHE_DISABLE_EVICTION":     true,
@@ -570,6 +586,48 @@ func envBool(src source, name string) (bool, error) {
 	default:
 		return false, fmt.Errorf("envBool: %s: got %q, want one of: 0, 1", name, v)
 	}
+}
+
+// ReservedInstanceSegments are the ByteStream resource-name keywords an
+// instance name may not contain as a segment. A server finds where an instance
+// name ends by looking for the first of them, so a name containing one could
+// never be parsed back out of a resource name.
+var ReservedInstanceSegments = []string{
+	"blobs", "uploads", "actions", "actionResults", "operations", "capabilities", "compressed-blobs",
+}
+
+// envInstanceNames reads a comma-separated list of REAPI instance names.
+//
+// A name that could not be served is an error rather than dropped: a list that
+// silently lost an entry would refuse the very clients it was set for.
+func envInstanceNames(src source, name string) ([]string, error) {
+	v := src(name)
+	if v == "" {
+		return nil, nil
+	}
+	var names []string
+	seen := map[string]bool{}
+	for _, n := range strings.Split(v, ",") {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			return nil, fmt.Errorf("envInstanceNames: %s: %q has an empty name", name, v)
+		}
+		for _, seg := range strings.Split(n, "/") {
+			if seg == "" {
+				return nil, fmt.Errorf("envInstanceNames: %s: %q has an empty path segment", name, n)
+			}
+			for _, r := range ReservedInstanceSegments {
+				if seg == r {
+					return nil, fmt.Errorf("envInstanceNames: %s: %q contains the reserved segment %q", name, n, seg)
+				}
+			}
+		}
+		if !seen[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
+	return names, nil
 }
 
 // envLogLevel reads a log level name.
