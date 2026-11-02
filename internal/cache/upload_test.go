@@ -96,6 +96,50 @@ func TestUploadWritesObjectBeforeAction(t *testing.T) {
 	}
 }
 
+// TestUploadOfASupersededBodyIsSkippedNotFailed pins what happens to a queued
+// upload whose body was reaped because its action was re-recorded with another
+// output before the queue reached it.
+//
+// The newer output is queued behind it and carries the action, so the shared
+// tier loses nothing; counting the older one as a failure made a host whose
+// builds re-record actions look like it was failing to reach the bucket.
+func TestUploadOfASupersededBodyIsSkippedNotFailed(t *testing.T) {
+	tc := newTestCache(t, withRemote())
+	unblock := pinPool(t, tc)
+
+	// Occupy the only worker so the two puts below stay queued.
+	tc.put(t, mkAction(40), mkOutput(40), []byte("holds the worker"))
+	a := mkAction(41)
+	tc.put(t, a, mkOutput(41), []byte("first result"))
+	tc.put(t, a, mkOutput(42), []byte("second result"))
+
+	// The first output now has no references, so eviction removes its body
+	// while its upload is still waiting in the queue.
+	if _, err := tc.cache.Evict(t.Context()); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	unblock()
+	if err := tc.cache.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	m := tc.cache.Metrics()
+	if m.UploadFail != 0 {
+		t.Fatalf("UploadFail = %d, want 0: the superseded body's upload is not a failure", m.UploadFail)
+	}
+	if m.UploadSkip != 1 || m.UploadOK != 2 {
+		t.Fatalf("UploadSkip = %d, UploadOK = %d, want 1 and 2", m.UploadSkip, m.UploadOK)
+	}
+	rec, ok := tc.rem.storedAction(a)
+	if !ok || rec.output != mkOutput(42) {
+		t.Fatalf("shared tier records %v (present %v) for the action, want the newer output", rec.output, ok)
+	}
+	if got := tc.logs.matching("upload open"); len(got) != 0 {
+		t.Fatalf("logged %q for a superseded body, want nothing", got)
+	}
+}
+
 // pinPool holds every upload inside PutObject until the returned function is
 // called, so a test can fill the queue without racing the workers.
 //
