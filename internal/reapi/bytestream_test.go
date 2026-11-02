@@ -598,3 +598,130 @@ func waitClaimed(t *testing.T, h *harness, name string) {
 	}
 	t.Fatalf("the server never took a claim on %q", name)
 }
+
+// TestCompressedReadsSurviveABrokenOne pins that a compressed read which fails
+// part-way leaves nothing behind for the next one. Encoders and read buffers
+// are pooled, so a failed read that returned its encoder mid-frame would hand
+// the next reader a stream that starts in the middle of someone else's.
+func TestCompressedReadsSurviveABrokenOne(t *testing.T) {
+	h := newHarness(t)
+	body := compressibleBody(t, 3<<20)
+	d := digestOf(body)
+	if got := upload(t, h, writeName("upload-1", d), body, 256<<10); got != int64(len(body)) {
+		t.Fatalf("committed size = %d, want %d", got, len(body))
+	}
+	name := fmt.Sprintf("compressed-blobs/zstd/%s/%d", d.GetHash(), d.GetSizeBytes())
+
+	bs := &byteStreamService{srv: h.srv}
+	broken := errors.New("client went away")
+	for range 4 {
+		err := bs.Read(&bytestream.ReadRequest{ResourceName: name}, &discardReadStream{ctx: ctx(t), fail: broken})
+		if !errors.Is(err, broken) {
+			t.Fatalf("broken Read = %v, want %v", err, broken)
+		}
+	}
+
+	for range 4 {
+		got, err := download(t, h, name)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		back, err := decodeAll(got)
+		if err != nil {
+			t.Fatalf("decodeAll: %v", err)
+		}
+		if !bytes.Equal(back, body) {
+			t.Fatalf("read back %d bytes that differ from the %d written", len(back), len(body))
+		}
+	}
+}
+
+// compressibleBody is a body that compresses roughly the way build outputs do:
+// runs of repeated structure broken up by stretches that do not repeat.
+func compressibleBody(tb testing.TB, n int) []byte {
+	tb.Helper()
+	r := rand.NewChaCha8([32]byte{9})
+	words := make([][]byte, 256)
+	for i := range words {
+		words[i] = make([]byte, 4+i%13)
+		_, _ = r.Read(words[i])
+	}
+	b := make([]byte, 0, n+64)
+	var pick [2]byte
+	for len(b) < n {
+		_, _ = r.Read(pick[:])
+		if pick[0] < 8 {
+			// A stretch of noise, which nothing can shrink.
+			noise := make([]byte, 16+int(pick[1]))
+			_, _ = r.Read(noise)
+			b = append(b, noise...)
+			continue
+		}
+		b = append(b, words[pick[1]]...)
+	}
+	return b[:n]
+}
+
+// BenchmarkByteStreamRead measures the server's cost of one Read, plain and
+// compressed, at the sizes a build reads most: small source and metadata blobs,
+// mid-sized archives, and linked binaries.
+func BenchmarkByteStreamRead(b *testing.B) {
+	for _, size := range []int{4 << 10, 256 << 10, 4 << 20} {
+		h := newHarness(b)
+		body := compressibleBody(b, size)
+		d := digestOf(body)
+		key, err := digest(d)
+		if err != nil {
+			b.Fatalf("digest: %v", err)
+		}
+		if err := h.store.Put(b.Context(), bazel.KindCAS, key, bytes.NewReader(body)); err != nil {
+			b.Fatalf("Put: %v", err)
+		}
+		bs := &byteStreamService{srv: h.srv}
+		for _, comp := range []string{"identity", "zstd"} {
+			name := readName(d)
+			if comp == "zstd" {
+				name = fmt.Sprintf("compressed-blobs/zstd/%s/%d", d.GetHash(), d.GetSizeBytes())
+			}
+			b.Run(fmt.Sprintf("%s/%dKiB", comp, size>>10), func(b *testing.B) {
+				b.SetBytes(int64(size))
+				b.ReportAllocs()
+				var sent int64
+				for b.Loop() {
+					s := &discardReadStream{ctx: b.Context()}
+					if err := bs.Read(&bytestream.ReadRequest{ResourceName: name}, s); err != nil {
+						b.Fatalf("Read: %v", err)
+					}
+					sent += s.sent
+				}
+				b.ReportMetric(float64(sent)/float64(b.N)/float64(size), "wire/byte")
+			})
+		}
+	}
+}
+
+// BenchmarkDecodeSink measures the decode a compressed upload pays, apart from
+// the disk write it feeds.
+func BenchmarkDecodeSink(b *testing.B) {
+	for _, size := range []int{4 << 10, 256 << 10, 4 << 20} {
+		packed, err := encodeAll(compressibleBody(b, size))
+		if err != nil {
+			b.Fatalf("encodeAll: %v", err)
+		}
+		b.Run(fmt.Sprintf("%dKiB", size>>10), func(b *testing.B) {
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			for b.Loop() {
+				sink := newDecodeSink(io.Discard)
+				for off := 0; off < len(packed); off += 64 << 10 {
+					if _, err := sink.Write(packed[off:min(off+64<<10, len(packed))]); err != nil {
+						b.Fatalf("Write: %v", err)
+					}
+				}
+				if err := sink.Finish(); err != nil {
+					b.Fatalf("Finish: %v", err)
+				}
+			}
+		})
+	}
+}

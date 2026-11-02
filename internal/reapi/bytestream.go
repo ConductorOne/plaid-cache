@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"google.golang.org/genproto/googleapis/bytestream"
@@ -76,26 +77,46 @@ func (b *byteStreamService) Read(req *bytestream.ReadRequest, stream bytestream.
 	// part-way is rare, and the counter exists to size the load, not to bill it.
 	b.srv.rpc.bytesRead.Add(remaining)
 	src := io.LimitReader(f, remaining)
-	out := &chunkWriter{stream: stream, buf: make([]byte, 0, readChunkSize)}
+	buf := getChunk()
+	defer putChunk(buf)
+	out := &chunkWriter{stream: stream, buf: (*buf)[:0]}
 
 	if res.compressor == repb.Compressor_ZSTD {
-		enc, err := encodeReader(out)
+		enc, err := getEncoder(out)
 		if err != nil {
 			b.srv.logf("bazel grpc: compress %s: %v", res.digest, err)
 			return status.Errorf(codes.Internal, "plaid-cache: cannot compress blob %s", res.digest)
 		}
-		if _, err := io.CopyBuffer(enc, src, make([]byte, readChunkSize)); err != nil {
-			_ = enc.Close()
+		// The encoder reads the file into its own block buffer, so there is no
+		// copy buffer between the two. An encoder whose stream failed is not
+		// returned to the pool.
+		if _, err := enc.ReadFrom(src); err != nil {
 			return err
 		}
 		if err := enc.Close(); err != nil {
 			return err
 		}
+		putEncoder(enc)
 	} else if _, err := out.ReadFrom(src); err != nil {
 		return err
 	}
 	return out.Flush()
 }
+
+// chunks holds the response buffers reads fill, one readChunkSize each.
+//
+// A Read used to allocate one per call, which on a busy cache made the read
+// buffers the largest single source of allocation in the process. Reusing one
+// once its Read returns relies on the same property chunkWriter.Flush already
+// does within a read: gRPC has serialised a message by the time Send returns.
+var chunks = sync.Pool{New: func() any {
+	b := make([]byte, readChunkSize)
+	return &b
+}}
+
+func getChunk() *[]byte { return chunks.Get().(*[]byte) }
+
+func putChunk(b *[]byte) { chunks.Put(b) }
 
 // chunkWriter cuts a stream of writes into response messages of a bounded size.
 //

@@ -40,20 +40,20 @@ type harness struct {
 }
 
 // newHarness starts a server on a loopback listener and dials it.
-func newHarness(t *testing.T) *harness {
+func newHarness(t testing.TB) *harness {
 	t.Helper()
 	return newHarnessWithVerify(t, true)
 }
 
 // newHarnessWithVerify starts a server with digest verification on or off.
-func newHarnessWithVerify(t *testing.T, verify bool) *harness {
+func newHarnessWithVerify(t testing.TB, verify bool) *harness {
 	t.Helper()
 	return newHarnessWithInstances(t, verify, nil)
 }
 
 // newHarnessWithInstances starts a server that also answers to the given
 // instance names.
-func newHarnessWithInstances(t *testing.T, verify bool, instances []string) *harness {
+func newHarnessWithInstances(t testing.TB, verify bool, instances []string) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := &config.Config{
@@ -127,3 +127,25 @@ func digestOf(b []byte) *repb.Digest {
 
 // ctx is a per-test context.
 func ctx(t *testing.T) context.Context { return t.Context() }
+
+// discardReadStream is a Read stream that counts what it is sent and drops it,
+// so a benchmark measures the server's side of a read and not a transport.
+type discardReadStream struct {
+	grpc.ServerStream
+	ctx  context.Context
+	sent int64
+
+	// fail, when set, is what every Send returns, as a client that hung up
+	// part-way would cause.
+	fail error
+}
+
+func (s *discardReadStream) Context() context.Context { return s.ctx }
+
+func (s *discardReadStream) Send(r *bytestream.ReadResponse) error {
+	if s.fail != nil {
+		return s.fail
+	}
+	s.sent += int64(len(r.GetData()))
+	return nil
+}
