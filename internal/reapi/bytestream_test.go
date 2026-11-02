@@ -725,3 +725,147 @@ func BenchmarkDecodeSink(b *testing.B) {
 		})
 	}
 }
+
+// zstdReadName is the resource name a client downloads a blob compressed under.
+func zstdReadName(d *repb.Digest) string {
+	return fmt.Sprintf("compressed-blobs/zstd/%s/%d", d.GetHash(), d.GetSizeBytes())
+}
+
+// TestCompressedUploadIsServedAsSent pins compression at rest: a compressible
+// body uploaded compressed is kept in the encoding it arrived in, a compressed
+// reader is sent those bytes untouched, and a plain reader, a reader at an
+// offset and the Go-side Get all still see the plain body.
+func TestCompressedUploadIsServedAsSent(t *testing.T) {
+	h := newHarness(t)
+	body := compressibleBody(t, 3<<20)
+	d := digestOf(body)
+	packed, err := encodeAll(body)
+	if err != nil {
+		t.Fatalf("encodeAll: %v", err)
+	}
+	if got := upload(t, h, compressedWriteName("zstd-at-rest", d), packed, 64<<10); got != int64(len(packed)) {
+		t.Fatalf("committed size = %d, want %d", got, len(packed))
+	}
+
+	key, err := digest(d)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	zf, _, atRest, ok := h.store.OpenZstd(ctx(t), bazel.KindCAS, key)
+	if !ok || !atRest {
+		t.Fatalf("OpenZstd = ok %v, compressed %v; want a body held compressed", ok, atRest)
+	}
+	_ = zf.Close()
+
+	got, err := download(t, h, zstdReadName(d))
+	if err != nil {
+		t.Fatalf("compressed Read: %v", err)
+	}
+	if !bytes.Equal(got, packed) {
+		t.Fatalf("compressed read is %d bytes, not the %d-byte stream uploaded", len(got), len(packed))
+	}
+
+	plain, err := download(t, h, readName(d))
+	if err != nil {
+		t.Fatalf("plain Read: %v", err)
+	}
+	if !bytes.Equal(plain, body) {
+		t.Fatalf("plain read differs from the body")
+	}
+
+	stream, err := h.bs.Read(ctx(t), &bytestream.ReadRequest{ResourceName: readName(d), ReadOffset: 1 << 20, ReadLimit: 4096})
+	if err != nil {
+		t.Fatalf("Read at offset: %v", err)
+	}
+	msg, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if !bytes.Equal(msg.GetData(), body[1<<20:1<<20+4096]) {
+		t.Fatalf("read at an offset differs from the body")
+	}
+
+	f, size, ok := h.store.Open(ctx(t), bazel.KindCAS, key)
+	if !ok {
+		t.Fatalf("plain Open missed a compressed body")
+	}
+	defer func() { _ = f.Close() }()
+	back, err := io.ReadAll(f)
+	if err != nil || size != int64(len(body)) || !bytes.Equal(back, body) {
+		t.Fatalf("plain Open = %d bytes (size %d), err %v; want the %d-byte body", len(back), size, err, len(body))
+	}
+}
+
+// TestIncompressibleUploadIsStoredPlain pins the other side of the policy: a
+// compressed upload that saves too little is kept plain, and still read back
+// compressed by encoding it.
+func TestIncompressibleUploadIsStoredPlain(t *testing.T) {
+	h := newHarness(t)
+	body := bigBody(t, 1<<20)
+	d := digestOf(body)
+	packed, err := encodeAll(body)
+	if err != nil {
+		t.Fatalf("encodeAll: %v", err)
+	}
+	upload(t, h, compressedWriteName("incompressible", d), packed, 64<<10)
+
+	key, err := digest(d)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	f, _, atRest, ok := h.store.OpenZstd(ctx(t), bazel.KindCAS, key)
+	if !ok {
+		t.Fatalf("OpenZstd missed")
+	}
+	_ = f.Close()
+	if atRest {
+		t.Fatalf("an incompressible body was kept compressed")
+	}
+	got, err := download(t, h, zstdReadName(d))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if back, err := decodeAll(got); err != nil || !bytes.Equal(back, body) {
+		t.Fatalf("compressed read does not decode to the body: %v", err)
+	}
+}
+
+// BenchmarkByteStreamReadStoredCompressed is BenchmarkByteStreamRead for a body
+// that was uploaded compressed and is held that way.
+func BenchmarkByteStreamReadStoredCompressed(b *testing.B) {
+	for _, size := range []int{256 << 10, 4 << 20} {
+		h := newHarness(b)
+		body := compressibleBody(b, size)
+		d := digestOf(body)
+		packed, err := encodeAll(body)
+		if err != nil {
+			b.Fatalf("encodeAll: %v", err)
+		}
+		w, err := h.bs.Write(b.Context())
+		if err != nil {
+			b.Fatalf("Write: %v", err)
+		}
+		if err := w.Send(&bytestream.WriteRequest{ResourceName: compressedWriteName("bench", d), Data: packed, FinishWrite: true}); err != nil {
+			b.Fatalf("Send: %v", err)
+		}
+		if _, err := w.CloseAndRecv(); err != nil {
+			b.Fatalf("CloseAndRecv: %v", err)
+		}
+		bs := &byteStreamService{srv: h.srv}
+		for _, comp := range []string{"identity", "zstd"} {
+			name := readName(d)
+			if comp == "zstd" {
+				name = zstdReadName(d)
+			}
+			b.Run(fmt.Sprintf("%s/%dKiB", comp, size>>10), func(b *testing.B) {
+				b.SetBytes(int64(size))
+				b.ReportAllocs()
+				for b.Loop() {
+					if err := bs.Read(&bytestream.ReadRequest{ResourceName: name}, &discardReadStream{ctx: b.Context()}); err != nil {
+						b.Fatalf("Read: %v", err)
+					}
+				}
+			})
+		}
+	}
+}

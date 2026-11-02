@@ -160,6 +160,13 @@ func (c *Cache) Get(ctx context.Context, a ids.ActionID) (Result, error) {
 	}
 	if ok {
 		path, _, err := c.blobs.Get(e.OutputID)
+		if errors.Is(err, fs.ErrNotExist) {
+			if expanded, xerr := c.expand(e.OutputID, e.Size); xerr != nil {
+				c.logf("blob expand %s: %v", e.OutputID, xerr)
+			} else if expanded {
+				path, _, err = c.blobs.Get(e.OutputID)
+			}
+		}
 		if err == nil {
 			c.touches.enqueue(a, e.LastUsedAt)
 			c.metrics.GetLocalHit.Add(1)
@@ -196,6 +203,13 @@ func (c *Cache) Open(ctx context.Context, a ids.ActionID) (*os.File, Result, err
 	}
 	if ok {
 		f, size, err := c.blobs.Open(e.OutputID)
+		if errors.Is(err, fs.ErrNotExist) {
+			if expanded, xerr := c.expand(e.OutputID, e.Size); xerr != nil {
+				c.logf("blob expand %s: %v", e.OutputID, xerr)
+			} else if expanded {
+				f, size, err = c.blobs.Open(e.OutputID)
+			}
+		}
 		if err == nil {
 			c.touches.enqueue(a, e.LastUsedAt)
 			c.metrics.GetLocalHit.Add(1)
@@ -354,7 +368,7 @@ func (c *Cache) Has(ctx context.Context, a ids.ActionID) bool {
 	if err != nil || !ok {
 		return false
 	}
-	if _, _, err := c.blobs.Get(e.OutputID); err != nil {
+	if _, err := c.blobs.StatAny(e.OutputID); err != nil {
 		return false
 	}
 	c.touches.enqueue(a, e.LastUsedAt)
@@ -787,7 +801,7 @@ func (u *uploader) run(j uploadJob) {
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	defer cancel()
 
-	f, err := os.Open(j.path)
+	f, release, err := plainUploadSource(j.path)
 	if err != nil {
 		u.metrics.UploadFail.Add(1)
 		u.logf("upload open %s: %v", j.output, err)
@@ -795,7 +809,7 @@ func (u *uploader) run(j uploadJob) {
 	}
 	// Read-only, so there is no buffered write for Close to fail on; the upload
 	// itself is what can fail, and it is checked.
-	defer func() { _ = f.Close() }()
+	defer release()
 
 	if err := j.backend.PutObject(ctx, j.output, f, j.size); err != nil {
 		u.metrics.UploadFail.Add(1)

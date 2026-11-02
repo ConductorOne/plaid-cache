@@ -55,7 +55,7 @@ func (b *byteStreamService) Read(req *bytestream.ReadRequest, stream bytestream.
 	}
 
 	ctx := stream.Context()
-	f, size, ok := b.srv.store.Open(ctx, bazel.KindCAS, res.digest)
+	f, size, atRest, ok := b.srv.store.OpenZstd(ctx, bazel.KindCAS, res.digest)
 	if !ok {
 		return status.Errorf(codes.NotFound, "plaid-cache: no blob %s", res.digest)
 	}
@@ -63,10 +63,6 @@ func (b *byteStreamService) Read(req *bytestream.ReadRequest, stream bytestream.
 
 	if offset > size {
 		return status.Errorf(codes.OutOfRange, "plaid-cache: read offset %d is past the end of a %d-byte blob", offset, size)
-	}
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		b.srv.logf("bazel grpc: seek %s: %v", res.digest, err)
-		return status.Errorf(codes.Internal, "plaid-cache: cannot read blob %s", res.digest)
 	}
 
 	remaining := size - offset
@@ -76,7 +72,56 @@ func (b *byteStreamService) Read(req *bytestream.ReadRequest, stream bytestream.
 	// Counted as requested rather than as delivered: a reader that hangs up
 	// part-way is rare, and the counter exists to size the load, not to bill it.
 	b.srv.rpc.bytesRead.Add(remaining)
-	src := io.LimitReader(f, remaining)
+
+	var body io.Reader = f
+	switch {
+	case atRest && res.compressor == repb.Compressor_ZSTD && offset == 0:
+		// Held in the encoding the reader asked for: the stored stream is the
+		// answer, sent as it is, with nothing encoded.
+		buf := getChunk()
+		defer putChunk(buf)
+		out := &chunkWriter{stream: stream, buf: (*buf)[:0]}
+		if _, err := out.ReadFrom(f); err != nil {
+			return err
+		}
+		return out.Flush()
+	case atRest:
+		dec, err := getDecoder(f)
+		if err != nil {
+			b.srv.logf("bazel grpc: decompress %s: %v", res.digest, err)
+			return status.Errorf(codes.Internal, "plaid-cache: cannot read blob %s", res.digest)
+		}
+		clean := false
+		defer func() {
+			if clean {
+				putDecoder(dec)
+			} else {
+				dec.Close()
+			}
+		}()
+		if _, err := io.CopyN(io.Discard, dec, offset); err != nil {
+			b.srv.logf("bazel grpc: decompress %s: %v", res.digest, err)
+			return status.Errorf(codes.Internal, "plaid-cache: cannot read blob %s", res.digest)
+		}
+		body = dec
+		if err := b.stream(stream, res, body, remaining); err != nil {
+			return err
+		}
+		clean = true
+		return nil
+	default:
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			b.srv.logf("bazel grpc: seek %s: %v", res.digest, err)
+			return status.Errorf(codes.Internal, "plaid-cache: cannot read blob %s", res.digest)
+		}
+	}
+	return b.stream(stream, res, body, remaining)
+}
+
+// stream sends remaining plain bytes of body to the client, compressing them if
+// the client asked for that.
+func (b *byteStreamService) stream(stream bytestream.ByteStream_ReadServer, res resource, body io.Reader, remaining int64) error {
+	src := io.LimitReader(body, remaining)
 	buf := getChunk()
 	defer putChunk(buf)
 	out := &chunkWriter{stream: stream, buf: (*buf)[:0]}
@@ -270,6 +315,10 @@ func (b *byteStreamService) startStream(res resource, offset int64) (*pending, e
 		p.streamBytes = 0
 		if p.compressed() {
 			p.sink = newDecodeSink(p.up)
+			if err := p.up.TeeZstd(); err != nil {
+				// Only costs the chance to keep it compressed.
+				b.srv.logf("bazel grpc: stage %s compressed: %v", res.digest, err)
+			}
 		}
 		return p, nil
 	}
@@ -292,6 +341,9 @@ func (b *byteStreamService) startStream(res resource, offset int64) (*pending, e
 	if p.compressed() {
 		// A resuming client compresses again from the offset it was given, so
 		// what arrives next is a new frame rather than the rest of the old one.
+		// The compressed bytes kept so far end in a truncated frame, so the
+		// body can only be kept plain.
+		p.up.BreakZstd()
 		p.sink = newDecodeSink(p.up)
 	}
 	return p, nil
@@ -318,6 +370,9 @@ func (b *byteStreamService) receive(stream bytestream.ByteStream_WriteServer, p 
 			if _, err := dst.Write(data); err != nil {
 				b.srv.logf("bazel grpc: receive %s: %v", p.res.digest, err)
 				return 0, status.Errorf(codes.Internal, "plaid-cache: cannot store blob %s", p.res.digest)
+			}
+			if p.sink != nil {
+				p.up.WriteZstd(data)
 			}
 			p.streamBytes += int64(len(data))
 		}

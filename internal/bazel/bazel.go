@@ -86,6 +86,14 @@ type store interface {
 	PutStaged(ctx context.Context, a ids.ActionID, o ids.OutputID, stagedPath string, size int64) (string, error)
 }
 
+// zstdStore is the part of [cache.Cache] that holds bodies compressed at rest.
+// It is separate from store so test fakes that do not care need not grow it; a
+// cache that does not implement it simply never stores compressed.
+type zstdStore interface {
+	OpenZstd(ctx context.Context, a ids.ActionID) (*os.File, cache.Result, bool, error)
+	PutStagedZstd(ctx context.Context, a ids.ActionID, o ids.OutputID, stagedPath string, size int64) (string, error)
+}
+
 // stager opens the staging files uploads are streamed into. It is the part of
 // blob.Store the adapter uses.
 type stager interface {
@@ -147,6 +155,26 @@ func (s *Store) Open(ctx context.Context, k Kind, d Digest) (*os.File, int64, bo
 		return nil, 0, false
 	}
 	return f, res.Size, true
+}
+
+// OpenZstd returns a CAS body's compressed encoding when one is held, and
+// otherwise its plain body as Open does. size is always the plain length;
+// compressed reports which of the two f holds.
+func (s *Store) OpenZstd(ctx context.Context, k Kind, d Digest) (f *os.File, size int64, compressed, ok bool) {
+	zs, can := s.cache.(zstdStore)
+	if !can {
+		f, size, ok = s.Open(ctx, k, d)
+		return f, size, false, ok
+	}
+	f, res, compressed, err := zs.OpenZstd(ctx, k.actionID(d))
+	if err != nil {
+		s.logf("bazel get %s/%s: %v", k, d, err)
+		return nil, 0, false, false
+	}
+	if res.Miss {
+		return nil, 0, false, false
+	}
+	return f, res.Size, compressed, true
 }
 
 // OpenLocal returns a locally resident body without faulting one in from the remote tier.

@@ -159,14 +159,97 @@ func (s *Store) Open(id ids.OutputID) (*os.File, int64, error) {
 	return f, fi.Size(), nil
 }
 
-// Remove deletes the body. Removing an absent body is not an error: eviction
-// and orphan cleanup both race with other writers, and an already-gone body
-// is the state they were asking for.
+// Remove deletes the body, in both of the encodings it may be held in.
+// Removing an absent body is not an error: eviction and orphan cleanup both
+// race with other writers, and an already-gone body is the state they were
+// asking for.
 func (s *Store) Remove(id ids.OutputID) error {
-	if err := os.Remove(s.Path(id)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("Remove: %w", err)
+	for _, p := range []string{s.Path(id), s.ZstdPath(id)} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("Remove: %w", err)
+		}
 	}
 	return nil
+}
+
+// zstdSuffix names the compressed encoding of a body.
+//
+// A body may be held as its plain bytes, as a zstd stream that decodes to them,
+// or both. The plain name is the one every pre-existing cache holds and the
+// one the Go toolchain is handed a path to, so it never changes meaning; the
+// compressed encoding lives beside it under a name no older reader looks for.
+const zstdSuffix = ".zst"
+
+// ZstdPath returns where the compressed encoding of an output lives, whether or
+// not it exists.
+func (s *Store) ZstdPath(id ids.OutputID) string { return s.Path(id) + zstdSuffix }
+
+// OpenZstd opens the compressed encoding of a body and returns it with its
+// length on disk, which is its compressed length. A miss wraps fs.ErrNotExist.
+func (s *Store) OpenZstd(id ids.OutputID) (*os.File, int64, error) {
+	f, err := os.Open(s.ZstdPath(id))
+	if err != nil {
+		return nil, 0, fmt.Errorf("OpenZstd: %w", err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close() // read-only descriptor; the stat failure is what is reported
+		return nil, 0, fmt.Errorf("OpenZstd: %w", err)
+	}
+	return f, fi.Size(), nil
+}
+
+// StatAny reports the real disk consumption of whichever encodings of a body
+// are present. A body held in neither wraps fs.ErrNotExist.
+func (s *Store) StatAny(id ids.OutputID) (int64, error) {
+	var total int64
+	found := false
+	for _, p := range []string{s.Path(id), s.ZstdPath(id)} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return 0, fmt.Errorf("StatAny: %w", err)
+		}
+		found = true
+		total += diskBytes(fi)
+	}
+	if !found {
+		return 0, fmt.Errorf("StatAny: %w", fs.ErrNotExist)
+	}
+	return total, nil
+}
+
+// AdoptZstd publishes a staged zstd stream as the compressed encoding of id,
+// by hardlink, first writer wins. The caller has already checked that the
+// stream decodes to the body id names; nothing here can.
+func (s *Store) AdoptZstd(id ids.OutputID, srcPath string) (path string, nbytes int64, err error) {
+	src, err := os.Stat(srcPath)
+	if err != nil {
+		return "", 0, fmt.Errorf("AdoptZstd: %w", err)
+	}
+	path = s.ZstdPath(id)
+	lerr := os.Link(srcPath, path)
+	if errors.Is(lerr, fs.ErrNotExist) {
+		if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
+			return "", 0, fmt.Errorf("AdoptZstd: %w", err)
+		}
+		lerr = os.Link(srcPath, path)
+	}
+	switch {
+	case lerr == nil:
+		return path, diskBytes(src), nil
+	case errors.Is(lerr, fs.ErrExist):
+		fi, serr := os.Stat(path)
+		if serr != nil {
+			return "", 0, fmt.Errorf("AdoptZstd: %w", serr)
+		}
+		return path, diskBytes(fi), nil
+	default:
+		// Staging is under the store root, so EXDEV cannot happen here.
+		return "", 0, fmt.Errorf("AdoptZstd: link: %w", lerr)
+	}
 }
 
 // Stage opens an empty file for a body whose content address is not yet known.

@@ -35,7 +35,67 @@ type Upload struct {
 	sum    hash.Hash
 	off    int64
 	done   bool
+
+	// zfile, when set, receives the compressed bytes a client sent, so the
+	// body can be published in the encoding it arrived in rather than encoded
+	// again on every compressed read. It is only usable while zvalid: a
+	// stream that broke part-way leaves a truncated frame in it, and the
+	// resumed stream starts a new one, so the two no longer decode to the body.
+	zfile  *os.File
+	zoff   int64
+	zvalid bool
 }
+
+// zstdMinSaving is the least a compressed encoding must save to be kept
+// instead of the plain body: a whole filesystem block and a tenth of the body.
+// Below that, the plain body costs the same disk and no decode for a plain
+// reader.
+const (
+	zstdBlock         = 4096
+	zstdMinSavingFrac = 10
+)
+
+// worthCompressed reports whether a compressed encoding of zlen bytes is worth
+// keeping in place of a plain body of plen bytes.
+func worthCompressed(zlen, plen int64) bool {
+	blocks := func(n int64) int64 { return (n + zstdBlock - 1) / zstdBlock }
+	return blocks(zlen) < blocks(plen) && zlen*zstdMinSavingFrac < plen*(zstdMinSavingFrac-1)
+}
+
+// TeeZstd starts keeping the compressed bytes of this upload alongside the
+// plain ones. It is only meaningful for a CAS upload into a cache that can
+// hold compressed bodies, and is a no-op otherwise.
+func (u *Upload) TeeZstd() error {
+	if u.kind != KindCAS || u.zfile != nil {
+		return nil
+	}
+	if _, can := u.store.cache.(zstdStore); !can {
+		return nil
+	}
+	f, err := u.store.blobs.Stage()
+	if err != nil {
+		return fmt.Errorf("TeeZstd: %w", err)
+	}
+	u.zfile, u.zvalid = f, true
+	return nil
+}
+
+// WriteZstd records compressed bytes the client sent. A failure only makes the
+// compressed encoding unusable; the plain body is unaffected.
+func (u *Upload) WriteZstd(p []byte) {
+	if !u.zvalid {
+		return
+	}
+	n, err := u.zfile.Write(p)
+	u.zoff += int64(n)
+	if err != nil {
+		u.zvalid = false
+	}
+}
+
+// BreakZstd marks the compressed encoding unusable, because the stream it came
+// from broke part-way.
+func (u *Upload) BreakZstd() { u.zvalid = false }
 
 // Begin opens an upload of one digest in one keyspace.
 //
@@ -104,6 +164,20 @@ func (u *Upload) Commit(ctx context.Context) error {
 		output = u.digest.outputID()
 	}
 
+	if u.zvalid && worthCompressed(u.zoff, u.off) {
+		zerr := u.zfile.Close()
+		if zerr == nil {
+			// TeeZstd only sets zfile when the cache implements zstdStore.
+			zs := u.store.cache.(zstdStore)
+			_, zerr = zs.PutStagedZstd(ctx, u.kind.actionID(u.digest), output, u.zfile.Name(), u.off)
+		}
+		if zerr == nil {
+			return nil
+		}
+		// Fall back to the plain body, which is always valid.
+		u.store.logf("bazel put cas/%s: keep compressed: %v", u.digest, zerr)
+	}
+
 	if _, err := u.store.cache.PutStaged(ctx, u.kind.actionID(u.digest), output, u.file.Name(), u.off); err != nil {
 		return fmt.Errorf("Commit: %w", err)
 	}
@@ -118,8 +192,13 @@ func (u *Upload) Commit(ctx context.Context) error {
 // will ever look for.
 func (u *Upload) Discard() {
 	u.done = true
-	_ = u.file.Close()
-	if err := os.Remove(u.file.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
-		u.store.logf("bazel unstage %s: %v", u.file.Name(), err)
+	for _, f := range []*os.File{u.file, u.zfile} {
+		if f == nil {
+			continue
+		}
+		_ = f.Close()
+		if err := os.Remove(f.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			u.store.logf("bazel unstage %s: %v", f.Name(), err)
+		}
 	}
 }
