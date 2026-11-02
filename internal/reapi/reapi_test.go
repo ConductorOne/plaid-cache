@@ -48,6 +48,13 @@ func newHarness(t *testing.T) *harness {
 // newHarnessWithVerify starts a server with digest verification on or off.
 func newHarnessWithVerify(t *testing.T, verify bool) *harness {
 	t.Helper()
+	return newHarnessWithInstances(t, verify, nil)
+}
+
+// newHarnessWithInstances starts a server that also answers to the given
+// instance names.
+func newHarnessWithInstances(t *testing.T, verify bool, instances []string) *harness {
+	t.Helper()
 	dir := t.TempDir()
 	cfg := &config.Config{
 		Dir:               dir,
@@ -71,7 +78,7 @@ func newHarnessWithVerify(t *testing.T, verify bool) *harness {
 	t.Cleanup(func() { _ = c.Close() })
 
 	store := bazel.NewStore(bazel.StoreParams{Cache: c, Blobs: blobs, Verify: verify, Logf: t.Logf})
-	srv := New(Params{Store: store, Logf: t.Logf, Verify: verify})
+	srv := New(Params{Store: store, Logf: t.Logf, Verify: verify, InstanceNames: instances})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

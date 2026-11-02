@@ -35,10 +35,17 @@
 //
 // # Instance names
 //
-// A resource name may carry an instance name, and this server accepts only the
-// empty one. Serving several instance names out of one keyspace would let two
-// logically separate caches silently share entries, which is the same
+// A request may carry an instance name, and by default this server accepts only
+// the empty one. Serving several instance names out of one keyspace would let
+// two logically separate caches silently share entries, which is the same
 // cache-poisoning shape the HTTP transport rejects a path prefix for.
+//
+// An operator may name further instances in [Params.InstanceNames]. Each is
+// served from the same keyspace as the empty one; listing a name is the
+// operator's statement that those clients are one cache. Every service checks
+// the name the same way, the action cache included, so a client is either
+// served whole or refused whole and never finds its action results answered
+// while every blob they name is refused.
 package reapi
 
 import (
@@ -100,6 +107,9 @@ type Server struct {
 	rrccMetrics rrccMetrics
 	rpc         rpcMetrics
 
+	// instances are the instance names served besides the empty one.
+	instances instanceSet
+
 	// verify mirrors the store's digest checking. It is read here to decide
 	// whether a client may name a digest function this server cannot check,
 	// which is the one protocol-level consequence of turning verification off.
@@ -114,6 +124,11 @@ type Params struct {
 	// Verify reports whether the store checks that an uploaded CAS body hashes
 	// to the digest naming it. It must match what the store was built with.
 	Verify bool
+
+	// InstanceNames are the instance names served besides the empty one, all
+	// from the one keyspace. Names are expected to have been validated by the
+	// configuration that supplied them.
+	InstanceNames []string
 }
 
 // New constructs a Server.
@@ -122,7 +137,13 @@ func New(p Params) *Server {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Server{store: p.Store, uploads: newUploads(logf), logf: logf, verify: p.Verify}
+	return &Server{
+		store:     p.Store,
+		uploads:   newUploads(logf),
+		logf:      logf,
+		verify:    p.Verify,
+		instances: newInstanceSet(p.InstanceNames),
+	}
 }
 
 // Register attaches every service this package implements to a gRPC server.

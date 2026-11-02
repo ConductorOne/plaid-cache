@@ -48,6 +48,8 @@ func (s *Server) ServeBazelGRPC(ctx context.Context, ln net.Listener) error {
 		Store:  bstore,
 		Logf:   s.logf,
 		Verify: !s.cfg.DisableBazelVerify,
+
+		InstanceNames: s.cfg.BazelInstanceNames,
 	})
 	s.setREAPI(svc)
 	defer s.setREAPI(nil)
