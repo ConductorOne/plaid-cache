@@ -4,10 +4,13 @@
 package reapi
 
 import (
+	"context"
 	"sync"
 	"time"
 
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/conductorone/plaid-cache/internal/bazel"
 	"github.com/conductorone/plaid-cache/internal/cache"
@@ -57,6 +60,11 @@ type pending struct {
 	// refused rather than allowed to corrupt the first.
 	claimed bool
 
+	// released is closed when the current claim ends, so a status query that
+	// arrives while the stream is still being torn down can wait for the
+	// answer instead of being told there is nothing to resume.
+	released chan struct{}
+
 	idleSince time.Time
 }
 
@@ -100,8 +108,14 @@ func (u *uploads) claim(name string) (p *pending, busy bool) {
 	if p.claimed {
 		return nil, true
 	}
-	p.claimed = true
+	p.takeClaim()
 	return p, false
+}
+
+// takeClaim marks the write as being streamed into. The caller holds u.mu.
+func (p *pending) takeClaim() {
+	p.claimed = true
+	p.released = make(chan struct{})
 }
 
 // release returns a claimed write to the registry, or drops it.
@@ -109,6 +123,7 @@ func (u *uploads) release(p *pending, keep bool) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	p.claimed = false
+	close(p.released)
 	p.idleSince = time.Now()
 	if !keep {
 		delete(u.byID, p.res.name)
@@ -131,7 +146,7 @@ func (u *uploads) begin(p *pending) bool {
 		p.discard()
 		return false
 	}
-	p.claimed = true
+	p.takeClaim()
 	p.idleSince = time.Now()
 	u.byID[p.res.name] = p
 	evicted := u.makeRoomLocked()
@@ -140,8 +155,12 @@ func (u *uploads) begin(p *pending) bool {
 	if existed {
 		old.discard()
 	}
+	now := time.Now()
 	for _, e := range evicted {
-		u.logf("bazel grpc: dropped an abandoned upload of %s to stay under %d", e.res.digest, maxPendingUploads)
+		// The idle time is what says whether the cap is shedding uploads their
+		// clients gave up on long ago, or ones about to be resumed.
+		u.logf("bazel grpc: dropped an abandoned upload of %s, idle %v, to stay under %d",
+			e.res.digest, now.Sub(e.idleSince).Round(time.Millisecond), maxPendingUploads)
 		e.discard()
 	}
 	return true
@@ -178,21 +197,24 @@ func (u *uploads) makeRoomLocked() []*pending {
 
 // status reports what a QueryWriteStatus should say about a resource name, if
 // there is a pending write for it.
-func (u *uploads) status(name string) (committed int64, ok bool) {
+//
+// A write that is still claimed has no answer yet, and busy is closed when it
+// does. A live stream's offset is moving as it is read, so quoting it would
+// hand back a number that is already stale. The client asking is almost always
+// the one whose stream just broke: it saw its own deadline pass and asked at
+// once, while this side was still unwinding the handler. Saying "not found"
+// then made the client give up on an upload it could have resumed.
+func (u *uploads) status(name string) (committed int64, busy <-chan struct{}, ok bool) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	p, ok := u.byID[name]
 	if !ok {
-		return 0, false
+		return 0, nil, false
 	}
 	if p.claimed {
-		// A live stream's offset is moving as it is read, so quoting it would
-		// hand back a number that is already stale. The client asking is
-		// recovering from a break, so this is a race it does not run in
-		// practice; saying nothing is the honest answer to it.
-		return 0, false
+		return 0, p.released, false
 	}
-	return p.committed(), true
+	return p.committed(), nil, true
 }
 
 // sweep discards writes idle past the timeout, and reports how many.
@@ -251,3 +273,36 @@ func (p *pending) abortStream() {
 
 // compressed reports whether the client is sending compressed bytes.
 func (p *pending) compressed() bool { return p.res.compressor != repb.Compressor_IDENTITY }
+
+// maxStatusWait bounds how long a status query waits for a claimed write to
+// be released when the query carries no deadline of its own.
+const maxStatusWait = 30 * time.Second
+
+// awaitStatus is status for a QueryWriteStatus: it waits for a claimed write's
+// handler to let go rather than answering while it still holds it.
+//
+// Waiting out the claim, rather than answering not found, is what keeps the
+// upload resumable: Bazel treats NOT_FOUND from QueryWriteStatus as final and
+// abandons the upload, while UNAVAILABLE is retried. So a wait that runs out is
+// reported as UNAVAILABLE.
+func (u *uploads) awaitStatus(ctx context.Context, name string) (committed int64, ok bool, err error) {
+	var timeout <-chan time.Time
+	for {
+		committed, busy, ok := u.status(name)
+		if ok || busy == nil {
+			return committed, ok, nil
+		}
+		if timeout == nil {
+			t := time.NewTimer(maxStatusWait)
+			defer t.Stop()
+			timeout = t.C
+		}
+		select {
+		case <-busy:
+		case <-ctx.Done():
+			return 0, false, status.Errorf(codes.Unavailable, "plaid-cache: a write to %q is still in progress", name)
+		case <-timeout:
+			return 0, false, status.Errorf(codes.Unavailable, "plaid-cache: a write to %q is still in progress", name)
+		}
+	}
+}

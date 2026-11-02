@@ -374,7 +374,11 @@ func (b *byteStreamService) QueryWriteStatus(ctx context.Context, req *bytestrea
 		return nil, err
 	}
 
-	if committed, ok := b.srv.uploads.status(req.GetResourceName()); ok {
+	committed, ok, err := b.srv.uploads.awaitStatus(ctx, req.GetResourceName())
+	if err != nil {
+		return nil, err
+	}
+	if ok {
 		return &bytestream.QueryWriteStatusResponse{CommittedSize: committed}, nil
 	}
 	if res.digest == emptyDigest || b.srv.store.Has(ctx, bazel.KindCAS, res.digest) {

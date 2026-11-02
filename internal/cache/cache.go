@@ -129,6 +129,7 @@ func New(p Params) *Cache {
 		logf:  logf,
 	}
 	c.uploads = newUploader(p.Config.UploadConcurrency, p.Config.UploadQueueDepth, p.Config.UploadBlockTimeout, logf, &c.metrics)
+	c.uploads.superseded = c.superseded
 	c.touches = newToucher(p.Index.TouchMany, p.Config.TouchGranularity, logf)
 	return c
 }
@@ -444,6 +445,14 @@ func (c *Cache) record(a ids.ActionID, o ids.OutputID, path string, size, diskBy
 	})
 }
 
+// superseded reports whether an action no longer records an output, which is
+// what makes that output's queued upload unnecessary: the shared tier is offered
+// whatever the action records now, by the put that recorded it.
+func (c *Cache) superseded(a ids.ActionID, o ids.OutputID) bool {
+	e, ok, err := c.idx.Get(a)
+	return err == nil && ok && e.OutputID != o
+}
+
 // Metrics returns a snapshot of the counters.
 func (c *Cache) Metrics() MetricsSnapshot { return c.metrics.Snapshot() }
 
@@ -628,6 +637,11 @@ type uploader struct {
 	metrics *Metrics
 	once    sync.Once
 
+	// superseded reports whether an action has since been recorded with a
+	// different output. A queued upload whose body is gone for that reason is
+	// skipped rather than failed; nil treats every missing body as a failure.
+	superseded func(ids.ActionID, ids.OutputID) bool
+
 	// blockFor is how long submit waits for room before dropping. Zero, the
 	// default, never waits.
 	blockFor time.Duration
@@ -789,6 +803,15 @@ func (u *uploader) run(j uploadJob) {
 
 	f, err := os.Open(j.path)
 	if err != nil {
+		// An action re-recorded with a different output releases the old one,
+		// and eviction reaps it, often before a busy queue gets this far. The
+		// newer output's upload is queued behind this one and carries the
+		// action, so nothing is lost; calling it a failure would bury the
+		// uploads that really did fail.
+		if errors.Is(err, fs.ErrNotExist) && u.superseded != nil && u.superseded(j.action, j.output) {
+			u.metrics.UploadSkip.Add(1)
+			return
+		}
 		u.metrics.UploadFail.Add(1)
 		u.logf("upload open %s: %v", j.output, err)
 		return
