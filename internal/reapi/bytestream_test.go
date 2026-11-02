@@ -5,6 +5,7 @@ package reapi
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -213,6 +214,65 @@ func TestQueryWriteStatusOfNothingIsNotFound(t *testing.T) {
 	})
 	if status.Code(err) != codes.NotFound {
 		t.Fatalf("unknown resource = %v, want NotFound", err)
+	}
+}
+
+// TestQueryWriteStatusWaitsForABreakingStream pins the answer to a client that
+// asks where its upload got to while the server is still unwinding the stream
+// that broke.
+//
+// That is the ordinary order of events when a client's deadline cuts a long
+// write: it sees the deadline first and asks at once. Answering NOT_FOUND then
+// is final to Bazel, which abandons an upload it could have resumed; the
+// server must wait for the handler to let go and quote the offset it reached.
+func TestQueryWriteStatusWaitsForABreakingStream(t *testing.T) {
+	h := newHarness(t)
+	body := bigBody(t, 64<<10)
+	d := digestOf(body)
+	name := writeName("breaking", d)
+	half := len(body) / 2
+
+	first, err := h.bs.Write(ctx(t))
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := first.Send(&bytestream.WriteRequest{ResourceName: name, Data: body[:half]}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitClaimed(t, h, name)
+
+	// A query that gives up while the stream is still claimed is told to retry,
+	// never that there is nothing to resume.
+	short, cancel := context.WithTimeout(ctx(t), 20*time.Millisecond)
+	defer cancel()
+	if _, err := h.bs.QueryWriteStatus(short, &bytestream.QueryWriteStatusRequest{ResourceName: name}); status.Code(err) == codes.NotFound {
+		t.Fatalf("query during a live stream = %v, want a retryable code", err)
+	}
+
+	type answer struct {
+		st  *bytestream.QueryWriteStatusResponse
+		err error
+	}
+	got := make(chan answer, 1)
+	go func() {
+		st, err := h.bs.QueryWriteStatus(ctx(t), &bytestream.QueryWriteStatusRequest{ResourceName: name})
+		got <- answer{st, err}
+	}()
+	select {
+	case a := <-got:
+		t.Fatalf("query answered (%v, %v) while the stream was still claimed", a.st, a.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if _, err := first.CloseAndRecv(); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("abandoned stream = %v, want InvalidArgument for the missing finish_write", err)
+	}
+	a := <-got
+	if a.err != nil {
+		t.Fatalf("QueryWriteStatus: %v", a.err)
+	}
+	if a.st.GetCommittedSize() != int64(half) || a.st.GetComplete() {
+		t.Fatalf("status = (%d, complete=%v), want (%d, false)", a.st.GetCommittedSize(), a.st.GetComplete(), half)
 	}
 }
 
