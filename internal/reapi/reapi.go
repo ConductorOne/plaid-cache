@@ -104,8 +104,9 @@ type Server struct {
 	uploads *uploads
 	logf    cache.Logf
 
-	rrccMetrics rrccMetrics
-	rpc         rpcMetrics
+	rrccMetrics  rrccMetrics
+	resultChecks actionResultChecks
+	rpc          rpcMetrics
 
 	// instances are the instance names served besides the empty one.
 	instances instanceSet

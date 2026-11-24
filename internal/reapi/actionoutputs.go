@@ -6,6 +6,7 @@ package reapi
 import (
 	"context"
 	"io"
+	"sync/atomic"
 	"time"
 
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
@@ -13,6 +14,27 @@ import (
 
 	"github.com/conductorone/plaid-cache/internal/bazel"
 )
+
+// ActionResultChecksSnapshot counts ordinary action-cache hits by whether
+// every output they name could be served. An incomplete one was answered as a
+// miss. Repository-contents results are counted by RRCCMetricsSnapshot.
+type ActionResultChecksSnapshot struct {
+	Complete   int64 `json:"complete"`
+	Incomplete int64 `json:"incomplete"`
+}
+
+type actionResultChecks struct {
+	complete   atomic.Int64
+	incomplete atomic.Int64
+}
+
+// ActionResultChecks returns the completeness counts accumulated by this server.
+func (s *Server) ActionResultChecks() ActionResultChecksSnapshot {
+	return ActionResultChecksSnapshot{
+		Complete:   s.resultChecks.complete.Load(),
+		Incomplete: s.resultChecks.incomplete.Load(),
+	}
+}
 
 // actionOutputCheckTimeout bounds the total cost of probing a shared tier
 // whose output metadata may outlive its blobs.

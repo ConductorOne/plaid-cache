@@ -150,6 +150,17 @@ func (s *Server) setREAPI(svc *reapi.Server) {
 	s.reapi = svc
 }
 
+// actionResultChecks returns the current gRPC service's action-result
+// completeness counts.
+func (s *Server) actionResultChecks() reapi.ActionResultChecksSnapshot {
+	s.reapiMu.RLock()
+	defer s.reapiMu.RUnlock()
+	if s.reapi == nil {
+		return reapi.ActionResultChecksSnapshot{}
+	}
+	return s.reapi.ActionResultChecks()
+}
+
 // rrccMetrics returns the current gRPC service's RRCC observations.
 func (s *Server) rrccMetrics() reapi.RRCCMetricsSnapshot {
 	s.reapiMu.RLock()
@@ -648,6 +659,8 @@ func (s *Server) status() StatusResponse {
 		UptimeSeconds: uptime.Seconds(),
 		Metrics:       s.cache.Metrics(),
 		RRCC:          s.rrccMetrics(),
+		ActionResults: s.actionResultChecks(),
+		Refresh:       s.cache.Refresh(),
 		RPC:           s.rpcMetrics(),
 		Presence:      s.cache.Presence(),
 	}

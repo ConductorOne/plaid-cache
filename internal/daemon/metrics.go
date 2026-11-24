@@ -138,6 +138,19 @@ func renderMetrics(r StatusResponse) []byte {
 		sample{labels: labels("result", "tree_missing"), value: float64(r.RRCC.TreeMissing)},
 		sample{labels: labels("result", "file_missing"), value: float64(r.RRCC.FileMissing)},
 		sample{labels: labels("result", "malformed"), value: float64(r.RRCC.Malformed)})
+	writeFamily(&b, "action_result_checks_total", "counter",
+		"Action-cache hits by whether every blob they name could be served. An incomplete one is answered as a miss so the client re-runs the action. Process-local.",
+		sample{labels: labels("result", "complete"), value: float64(r.ActionResults.Complete)},
+		sample{labels: labels("result", "incomplete"), value: float64(r.ActionResults.Incomplete)})
+	writeFamily(&b, "remote_refresh_total", "counter",
+		"Shared-tier entries in local use, by what the refresher did about their remote age. Process-local.",
+		sample{labels: labels("result", "checked"), value: float64(r.Refresh.Checked)},
+		sample{labels: labels("result", "rewritten"), value: float64(r.Refresh.Rewritten)},
+		sample{labels: labels("result", "copied"), value: float64(r.Refresh.Copied)},
+		sample{labels: labels("result", "uploaded"), value: float64(r.Refresh.Uploaded)},
+		sample{labels: labels("result", "failed"), value: float64(r.Refresh.Failed)},
+		sample{labels: labels("result", "dropped"), value: float64(r.Refresh.Dropped)},
+		sample{labels: labels("result", "superseded"), value: float64(r.Refresh.Superseded)})
 
 	// The shared tier's transport, which is the only part of this report about how
 	// the cache reaches the network rather than about what it holds. Absent when

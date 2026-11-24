@@ -180,6 +180,36 @@ func (s *S3) putAction(ctx context.Context, a ids.ActionID, o ids.OutputID, mtim
 	return nil
 }
 
+// PutActionIf writes an action record only if it is still the one with the
+// given ETag, or still absent when etag is empty.
+func (s *S3) PutActionIf(ctx context.Context, a ids.ActionID, o ids.OutputID, mtime time.Time, etag string) (bool, error) {
+	start := time.Now()
+	body := formatActionRecord(o, mtime)
+	in := &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(s.keys.actionKey(a)),
+		Body:          strings.NewReader(body),
+		ContentLength: aws.Int64(int64(len(body))),
+	}
+	if etag == "" {
+		in.IfNoneMatch = aws.String("*")
+	} else {
+		in.IfMatch = aws.String(etag)
+	}
+	_, err := s.client.PutObject(ctx, in)
+	if err != nil && (isPreconditionFailed(err) || isConditionalConflict(err)) {
+		// The record moved under us. That is the other writer winning, which
+		// is an answer rather than a failure.
+		s.stats.observe(opPutAction, nil, time.Since(start))
+		return false, nil
+	}
+	s.stats.observe(opPutAction, err, time.Since(start))
+	if err != nil {
+		return false, fmt.Errorf("PutActionIf: %w", err)
+	}
+	return true, nil
+}
+
 // GetObject opens a body from the bucket.
 func (s *S3) GetObject(ctx context.Context, o ids.OutputID) (io.ReadCloser, int64, error) {
 	start := time.Now()
@@ -248,6 +278,161 @@ func (s *S3) putObject(ctx context.Context, o ids.OutputID, r io.ReadSeeker, siz
 	return nil
 }
 
+// Freshness reports when the action record and the body o were last written.
+func (s *S3) Freshness(ctx context.Context, a ids.ActionID, o ids.OutputID) (Freshness, error) {
+	var f Freshness
+	recStart := time.Now()
+	rec, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.keys.actionKey(a)),
+	})
+	switch {
+	case err == nil:
+		s.stats.observe(opGetAction, nil, time.Since(recStart))
+		body, rerr := io.ReadAll(io.LimitReader(rec.Body, 256))
+		_ = rec.Body.Close() // read-only; the read error above is what matters
+		if rerr != nil {
+			return Freshness{}, fmt.Errorf("Freshness: read action: %w", rerr)
+		}
+		f.ActionETag = aws.ToString(rec.ETag)
+		// A malformed record counts as absent, as it does for GetAction: the
+		// repair for it is the same rewrite, which the ETag above permits.
+		if out, _, perr := parseActionRecord(body); perr == nil && rec.LastModified != nil {
+			f.Output = out
+			f.ActionWritten = *rec.LastModified
+		}
+	case isNotFound(err):
+		s.stats.observe(opGetAction, ErrMiss, time.Since(recStart))
+	default:
+		s.stats.observe(opGetAction, err, time.Since(recStart))
+		return Freshness{}, fmt.Errorf("Freshness: get action: %w", err)
+	}
+
+	start := time.Now()
+	head, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.keys.objectKey(o)),
+	})
+	switch {
+	case err == nil:
+		s.stats.observe(opHeadObject, nil, time.Since(start))
+		if head.LastModified != nil {
+			f.ObjectWritten = *head.LastModified
+		}
+		f.ObjectETag = aws.ToString(head.ETag)
+		f.ObjectSize = aws.ToInt64(head.ContentLength)
+		f.object = objectAttrs{
+			contentType:        aws.ToString(head.ContentType),
+			contentEncoding:    aws.ToString(head.ContentEncoding),
+			contentDisposition: aws.ToString(head.ContentDisposition),
+			contentLanguage:    aws.ToString(head.ContentLanguage),
+			cacheControl:       aws.ToString(head.CacheControl),
+			metadata:           head.Metadata,
+			sse:                string(head.ServerSideEncryption),
+			sseKMSKeyID:        aws.ToString(head.SSEKMSKeyId),
+			bucketKeyEnabled:   head.BucketKeyEnabled,
+			storageClass:       string(head.StorageClass),
+		}
+	case isNotFound(err):
+		s.stats.observe(opHeadObject, ErrMiss, time.Since(start))
+	default:
+		s.stats.observe(opHeadObject, err, time.Since(start))
+		return Freshness{}, fmt.Errorf("Freshness: head object: %w", err)
+	}
+	return f, nil
+}
+
+// maxSingleCopyBytes is the largest object one CopyObject request may copy.
+// Past it S3 requires a multipart copy, which is not worth its complexity
+// here: the local body is a fallback that works at any size.
+const maxSingleCopyBytes = 5 << 30
+
+// CopyObjectInPlace copies a body onto itself so that its last-modified time,
+// which an age-based lifecycle rule counts from, starts again, without the
+// daemon sending the bytes.
+//
+// The copy is conditional on the ETag the Freshness read saw, so it cannot
+// resurrect an object deleted since or copy over one replaced since. It
+// replaces the metadata, as a self-copy must, with exactly what the read
+// found, and restates the encryption and storage class, which a copy would
+// otherwise reset to the bucket defaults.
+//
+// On a versioned bucket every copy is a new version, and each request costs
+// what a PUT does; the refresher's window is what bounds how often either
+// happens.
+func (s *S3) CopyObjectInPlace(ctx context.Context, o ids.OutputID, f Freshness) error {
+	if f.ObjectSize > maxSingleCopyBytes {
+		return ErrCopyTooLarge
+	}
+	key := s.keys.objectKey(o)
+	in := &s3.CopyObjectInput{
+		Bucket:            aws.String(s.bucket),
+		Key:               aws.String(key),
+		CopySource:        aws.String(s.bucket + "/" + key),
+		MetadataDirective: types.MetadataDirectiveReplace,
+		Metadata:          f.object.metadata,
+	}
+	if f.ObjectETag != "" {
+		in.CopySourceIfMatch = aws.String(f.ObjectETag)
+	}
+	a := f.object
+	setIf := func(dst **string, v string) {
+		if v != "" {
+			*dst = aws.String(v)
+		}
+	}
+	setIf(&in.ContentType, a.contentType)
+	setIf(&in.ContentEncoding, a.contentEncoding)
+	setIf(&in.ContentDisposition, a.contentDisposition)
+	setIf(&in.ContentLanguage, a.contentLanguage)
+	setIf(&in.CacheControl, a.cacheControl)
+	if a.sse != "" {
+		in.ServerSideEncryption = types.ServerSideEncryption(a.sse)
+	}
+	setIf(&in.SSEKMSKeyId, a.sseKMSKeyID)
+	in.BucketKeyEnabled = a.bucketKeyEnabled
+	if a.storageClass != "" {
+		in.StorageClass = types.StorageClass(a.storageClass)
+	}
+
+	start := time.Now()
+	_, err := s.client.CopyObject(ctx, in)
+	switch {
+	case err == nil:
+		s.stats.observe(opCopyObject, nil, time.Since(start))
+		return nil
+	case isNotFound(err):
+		s.stats.observe(opCopyObject, ErrMiss, time.Since(start))
+		return ErrMiss
+	case isPreconditionFailed(err):
+		// Replaced since the read. The key is content-addressed, so the
+		// replacement holds the same bytes, and it was just written.
+		s.stats.observe(opCopyObject, nil, time.Since(start))
+		return nil
+	default:
+		s.stats.observe(opCopyObject, err, time.Since(start))
+		return fmt.Errorf("CopyObjectInPlace: %w", err)
+	}
+}
+
+// RewriteObject stores a body without the existence precondition PutObject
+// uses, so that the object's last-modified time, which is what an age-based
+// lifecycle rule counts from, starts again.
+func (s *S3) RewriteObject(ctx context.Context, o ids.OutputID, r io.ReadSeeker, size int64) error {
+	start := time.Now()
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(s.keys.objectKey(o)),
+		Body:          r,
+		ContentLength: aws.Int64(size),
+	})
+	s.stats.observe(opRewriteObject, err, time.Since(start))
+	if err != nil {
+		return fmt.Errorf("RewriteObject: %w", err)
+	}
+	return nil
+}
+
 // Close releases the backend. The SDK client holds no resources needing an
 // explicit shutdown, so this exists only to satisfy Backend.
 func (s *S3) Close() error { return nil }
@@ -285,6 +470,17 @@ func isPreconditionFailed(err error) bool {
 		return true
 	}
 	return httpStatus(err) == http.StatusPreconditionFailed
+}
+
+// isConditionalConflict reports whether err means a conditional write raced
+// another write to the same key in flight, which S3 answers with 409 rather
+// than 412. Either way, the other write is the one that counts.
+func isConditionalConflict(err error) bool {
+	var ae smithy.APIError
+	if errors.As(err, &ae) && ae.ErrorCode() == "ConditionalRequestConflict" {
+		return true
+	}
+	return httpStatus(err) == http.StatusConflict
 }
 
 // httpStatus extracts the HTTP status code from a smithy transport error, or

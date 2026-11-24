@@ -111,6 +111,17 @@ type Config struct {
 	// but expensive-to-compute work first.
 	MinUploadSize int64
 
+	// RemoteRefreshAfter is how old a shared-tier entry in active local use may
+	// get before it is written to the bucket again. Zero disables refreshing.
+	//
+	// Uploads skip a body the bucket already holds and a hit never writes, so
+	// without this an entry's remote age counts from its first upload however
+	// often it is used, and an age-based lifecycle rule expires the busiest
+	// entries on schedule. Set it well under the rule's expiry: what is left
+	// between the two is how long an entry this daemon vouched for is
+	// guaranteed to outlive the vouching.
+	RemoteRefreshAfter time.Duration
+
 	// UploadConcurrency bounds in-flight remote uploads.
 	UploadConcurrency int
 
@@ -236,6 +247,7 @@ const (
 	defaultTTL              = 168 * time.Hour
 	defaultTouchGranularity = time.Hour
 	defaultMinUploadSize    = 0
+	defaultRemoteRefresh    = 24 * time.Hour
 	defaultUploadQueueDepth = 64
 	defaultIdleTimeout      = 30 * time.Minute
 	defaultEvictInterval    = time.Minute
@@ -286,6 +298,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
 	if c.MinUploadSize, err = envBytes(src, "PLAID_GOCACHE_MIN_UPLOAD_SIZE", defaultMinUploadSize); err != nil {
+		return nil, fmt.Errorf("Load: %w", err)
+	}
+	if c.RemoteRefreshAfter, err = envDuration(src, "PLAID_GOCACHE_REMOTE_REFRESH_AFTER", defaultRemoteRefresh); err != nil {
 		return nil, fmt.Errorf("Load: %w", err)
 	}
 	if c.IdleTimeout, err = envDuration(src, "PLAID_GOCACHE_IDLE_TIMEOUT", defaultIdleTimeout); err != nil {
@@ -360,6 +375,7 @@ var settingNames = map[string]bool{
 	"PLAID_GOCACHE_S3_PREFIX":            true,
 	"PLAID_GOCACHE_S3_ENDPOINT_URL":      true,
 	"PLAID_GOCACHE_MIN_UPLOAD_SIZE":      true,
+	"PLAID_GOCACHE_REMOTE_REFRESH_AFTER": true,
 	"PLAID_GOCACHE_UPLOAD_CONCURRENCY":   true,
 	"PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH":   true,
 	"PLAID_GOCACHE_UPLOAD_BLOCK_TIMEOUT": true,

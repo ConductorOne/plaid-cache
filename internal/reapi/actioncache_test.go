@@ -182,3 +182,30 @@ func TestActionCacheRejectsAMalformedDigest(t *testing.T) {
 		t.Fatalf("short digest = %v, want InvalidArgument", err)
 	}
 }
+
+// TestActionCacheCountsResultCompleteness pins the counters that say how often
+// an action result was refused because an output it names could not be served.
+func TestActionCacheCountsResultCompleteness(t *testing.T) {
+	h := newHarness(t)
+	action := digestOf([]byte("an action whose output expired"))
+	out := []byte("compiled package metadata")
+	res := &repb.ActionResult{
+		OutputFiles: []*repb.OutputFile{{Path: "pkg.a", Digest: digestOf(out)}},
+	}
+	if _, err := h.ac.UpdateActionResult(ctx(t), &repb.UpdateActionResultRequest{
+		ActionDigest: action, ActionResult: res,
+	}); err != nil {
+		t.Fatalf("UpdateActionResult: %v", err)
+	}
+	if _, err := h.ac.GetActionResult(ctx(t), &repb.GetActionResultRequest{ActionDigest: action}); status.Code(err) != codes.NotFound {
+		t.Fatalf("result naming an absent output = %v, want NotFound", err)
+	}
+
+	putBlob(t, h, out)
+	if _, err := h.ac.GetActionResult(ctx(t), &repb.GetActionResultRequest{ActionDigest: action}); err != nil {
+		t.Fatalf("GetActionResult once the output is back: %v", err)
+	}
+	if c := h.srv.ActionResultChecks(); c.Incomplete != 1 || c.Complete != 1 {
+		t.Fatalf("checks = %+v, want one incomplete then one complete", c)
+	}
+}
