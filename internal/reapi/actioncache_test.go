@@ -209,3 +209,22 @@ func TestActionCacheCountsResultCompleteness(t *testing.T) {
 		t.Fatalf("checks = %+v, want one incomplete then one complete", c)
 	}
 }
+
+// TestActionCacheServesAResultNamingTheEmptyBlob pins that the empty blob,
+// which is never stored, does not make a result incomplete.
+func TestActionCacheServesAResultNamingTheEmptyBlob(t *testing.T) {
+	h := newHarness(t)
+	action := digestOf([]byte("an action with empty output"))
+	res := &repb.ActionResult{
+		OutputFiles:  []*repb.OutputFile{{Path: "empty", Digest: digestOf(nil)}},
+		StdoutDigest: digestOf([]byte{}),
+	}
+	if _, err := h.ac.UpdateActionResult(ctx(t), &repb.UpdateActionResultRequest{
+		ActionDigest: action, ActionResult: res,
+	}); err != nil {
+		t.Fatalf("UpdateActionResult: %v", err)
+	}
+	if _, err := h.ac.GetActionResult(ctx(t), &repb.GetActionResultRequest{ActionDigest: action}); err != nil {
+		t.Fatalf("GetActionResult: %v", err)
+	}
+}
