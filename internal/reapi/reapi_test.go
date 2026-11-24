@@ -55,6 +55,12 @@ func newHarnessWithVerify(t testing.TB, verify bool) *harness {
 // instance names.
 func newHarnessWithInstances(t testing.TB, verify bool, instances []string) *harness {
 	t.Helper()
+	return newHarnessWithRemote(t, verify, instances, nil)
+}
+
+// newHarnessWithRemote exercises a cache node backed by an optional shared tier.
+func newHarnessWithRemote(t testing.TB, verify bool, instances []string, backend remote.Backend) *harness {
+	t.Helper()
 	dir := t.TempDir()
 	cfg := &config.Config{
 		Dir:               dir,
@@ -74,7 +80,12 @@ func newHarnessWithInstances(t testing.TB, verify bool, instances []string) *har
 	if err != nil {
 		t.Fatalf("blob.Open: %v", err)
 	}
-	c := cache.New(cache.Params{Config: cfg, Index: ix, Blobs: blobs, Remote: remote.Noop{}})
+	if backend == nil {
+		backend = remote.Noop{}
+	} else {
+		cfg.S3Bucket = "test-shared-cache"
+	}
+	c := cache.New(cache.Params{Config: cfg, Index: ix, Blobs: blobs, Remote: backend})
 	t.Cleanup(func() { _ = c.Close() })
 
 	store := bazel.NewStore(bazel.StoreParams{Cache: c, Blobs: blobs, Verify: verify, Logf: t.Logf})

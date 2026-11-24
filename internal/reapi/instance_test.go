@@ -41,6 +41,7 @@ func TestListedInstanceSharesTheUnnamedKeyspace(t *testing.T) {
 
 	// Action cache: written under the name, read without it.
 	action := digestOf([]byte("some action"))
+	putBlob(t, h, []byte("it worked"))
 	if _, err := h.ac.UpdateActionResult(ctx(t), &repb.UpdateActionResultRequest{
 		InstanceName: name,
 		ActionDigest: action,
