@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/conductorone/plaid-cache/internal/ids"
+	"github.com/conductorone/plaid-cache/internal/remote"
 )
 
 // The shared tier's age problem.
@@ -31,8 +32,8 @@ import (
 //
 // The refresher closes that gap from the side that knows an entry is in use:
 // every local hit offers its action here, and an action whose remote record or
-// body is older than RemoteRefreshAfter is written to the bucket again from the
-// local copy. A hit therefore keeps an entry alive in the shared tier the same
+// body is older than RemoteRefreshAfter is refreshed in the bucket. A missing
+// body is restored from the local copy. A hit therefore keeps an entry alive in the shared tier the same
 // way it keeps it alive in the local one.
 
 // refreshShards spreads the recently-checked set over independent locks, for
@@ -67,8 +68,8 @@ type RefreshSnapshot struct {
 	Failed int64 `json:"failed"`
 	// Dropped is how many offers found the queue full.
 	Dropped int64 `json:"dropped"`
-	// Superseded is how many record rewrites were skipped because another
-	// writer changed the record after it was read.
+	// Superseded counts refreshes skipped after a concurrent change to the
+	// shared body or action record.
 	Superseded int64 `json:"superseded"`
 }
 
@@ -198,8 +199,7 @@ func (r *refresher) Snapshot() RefreshSnapshot {
 }
 
 // refreshRemote makes sure the shared tier's copy of a locally held action is
-// no older than RemoteRefreshAfter, writing it again from the local copy where
-// it is.
+// no older than RemoteRefreshAfter, restoring a missing body from the local tier.
 func (c *Cache) refreshRemote(ctx context.Context, a ids.ActionID) {
 	r := c.refresh
 	e, ok, err := c.idx.Get(a)
@@ -230,22 +230,18 @@ func (c *Cache) refreshRemote(ctx context.Context, a ids.ActionID) {
 	}
 
 	if staleBody {
-		body, size, err := c.blobs.Open(e.OutputID)
+		retained, err := c.refreshBody(ctx, e.OutputID, f)
 		if err != nil {
-			if !errors.Is(err, context.Canceled) {
-				c.logf("refresh %s: open %s: %v", a, e.OutputID, err)
-			}
 			r.failed.Add(1)
+			c.logf("refresh %s: body %s: %v", a, e.OutputID, err)
 			return
 		}
-		err = c.rem.RewriteObject(ctx, e.OutputID, body, size)
-		_ = body.Close() // read-only; the rewrite's error is the one that matters
-		if err != nil {
-			r.failed.Add(1)
-			c.logf("refresh %s: rewrite %s: %v", a, e.OutputID, err)
+		if !retained {
+			r.superseded.Add(1)
 			return
 		}
 	}
+
 	// The record is written after the body, as on upload, and also whenever
 	// the body was: a record older than its body would expire first and turn a
 	// refreshed body into an unreferenced one.
@@ -267,4 +263,25 @@ func (c *Cache) refreshRemote(ctx context.Context, a ids.ActionID) {
 		return
 	}
 	r.rewritten.Add(1)
+}
+
+// refreshBody keeps an existing body entirely in the shared tier. The normal
+// conditional upload restores a missing body without replacing a concurrent write.
+func (c *Cache) refreshBody(ctx context.Context, output ids.OutputID, f remote.Freshness) (bool, error) {
+	if !f.ObjectWritten.IsZero() {
+		refreshed, err := c.rem.TouchObject(ctx, output, f.ObjectETag)
+		if !errors.Is(err, remote.ErrMiss) {
+			return refreshed, err
+		}
+	}
+
+	body, size, err := c.blobs.Open(output)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = body.Close() }() // read-only; the upload error is what matters
+	if err := c.rem.PutObject(ctx, output, body, size); err != nil {
+		return false, err
+	}
+	return true, nil
 }

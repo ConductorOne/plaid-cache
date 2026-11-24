@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -316,9 +318,11 @@ func (s *S3) Freshness(ctx context.Context, a ids.ActionID, o ids.OutputID) (Fre
 	switch {
 	case err == nil:
 		s.stats.observe(opHeadObject, nil, time.Since(start))
-		if head.LastModified != nil {
-			f.ObjectWritten = *head.LastModified
+		if head.LastModified == nil || aws.ToString(head.ETag) == "" {
+			return Freshness{}, errors.New("Freshness: object response lacks last-modified or ETag")
 		}
+		f.ObjectWritten = *head.LastModified
+		f.ObjectETag = *head.ETag
 	case isNotFound(err):
 		s.stats.observe(opHeadObject, ErrMiss, time.Since(start))
 	default:
@@ -328,22 +332,95 @@ func (s *S3) Freshness(ctx context.Context, a ids.ActionID, o ids.OutputID) (Fre
 	return f, nil
 }
 
-// RewriteObject stores a body without the existence precondition PutObject
-// uses, so that the object's last-modified time, which is what an age-based
-// lifecycle rule counts from, starts again.
-func (s *S3) RewriteObject(ctx context.Context, o ids.OutputID, r io.ReadSeeker, size int64) error {
-	start := time.Now()
-	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(s.bucket),
-		Key:           aws.String(s.keys.objectKey(o)),
-		Body:          r,
-		ContentLength: aws.Int64(size),
-	})
-	s.stats.observe(opRewriteObject, err, time.Since(start))
-	if err != nil {
-		return fmt.Errorf("RewriteObject: %w", err)
+// maxSelfCopyBytes is the single-request copy limit. Ordinary cache uploads
+// also use single requests, so oversized objects can only come from elsewhere.
+const maxSelfCopyBytes = 5 << 30
+
+// TouchObject renews S3's lifecycle clock with a conditional server-side copy.
+// Only stale objects need the extra HEAD for the metadata to preserve.
+func (s *S3) TouchObject(ctx context.Context, o ids.OutputID, etag string) (bool, error) {
+	if etag == "" {
+		return false, errors.New("TouchObject: missing ETag")
 	}
-	return nil
+	key := s.keys.objectKey(o)
+	start := time.Now()
+	head, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket:  aws.String(s.bucket),
+		Key:     aws.String(key),
+		IfMatch: aws.String(etag),
+	})
+	headOK, headErr := touchResult("head", err)
+	s.stats.observe(opHeadObject, headErr, time.Since(start))
+	if !headOK {
+		return false, headErr
+	}
+	if head.ContentLength == nil || *head.ContentLength > maxSelfCopyBytes {
+		return false, errors.New("TouchObject: object size unavailable or exceeds the single-copy limit")
+	}
+	if aws.ToInt32(head.MissingMeta) > 0 {
+		return false, errors.New("TouchObject: existing user metadata is incomplete")
+	}
+	var expires *time.Time
+	if head.ExpiresString != nil {
+		value, err := http.ParseTime(*head.ExpiresString)
+		if err != nil {
+			return false, fmt.Errorf("TouchObject: preserve expires: %w", err)
+		}
+		expires = &value
+	}
+
+	metadata := make(map[string]string, len(head.Metadata)+1)
+	maps.Copy(metadata, head.Metadata)
+	// Changing a metadata value makes this a permitted same-key copy.
+	metadata["plaid-cache-refreshed-at"] = time.Now().UTC().Format(time.RFC3339Nano)
+	in := &s3.CopyObjectInput{
+		Bucket:                    aws.String(s.bucket),
+		Key:                       aws.String(key),
+		CopySource:                aws.String(url.PathEscape(s.bucket + "/" + key)),
+		CopySourceIfMatch:         aws.String(etag),
+		IfMatch:                   aws.String(etag),
+		MetadataDirective:         types.MetadataDirectiveReplace,
+		Metadata:                  metadata,
+		CacheControl:              head.CacheControl,
+		ContentDisposition:        head.ContentDisposition,
+		ContentEncoding:           head.ContentEncoding,
+		ContentLanguage:           head.ContentLanguage,
+		ContentType:               head.ContentType,
+		Expires:                   expires,
+		WebsiteRedirectLocation:   head.WebsiteRedirectLocation,
+		StorageClass:              head.StorageClass,
+		ObjectLockLegalHoldStatus: head.ObjectLockLegalHoldStatus,
+		ObjectLockMode:            head.ObjectLockMode,
+		ObjectLockRetainUntilDate: head.ObjectLockRetainUntilDate,
+	}
+	if strings.HasSuffix(s.bucket, "--x-s3") {
+		// Directory buckets enforce the destination bucket's default encryption.
+		in.AnnotationDirective = types.AnnotationDirectiveExclude
+	} else {
+		in.ServerSideEncryption = head.ServerSideEncryption
+		in.SSEKMSKeyId = head.SSEKMSKeyId
+		in.BucketKeyEnabled = head.BucketKeyEnabled
+	}
+	start = time.Now()
+	_, err = s.client.CopyObject(ctx, in)
+	copied, copyErr := touchResult("copy", err)
+	s.stats.observe(opCopyObject, copyErr, time.Since(start))
+	return copied, copyErr
+}
+
+// touchResult keeps a confirmed miss distinct from concurrent change and
+// other errors, so only a missing object is restored from local disk.
+func touchResult(op string, err error) (bool, error) {
+	switch {
+	case err == nil:
+		return true, nil
+	case isNotFound(err):
+		return false, ErrMiss
+	case isPreconditionFailed(err) || isConditionalConflict(err):
+		return false, nil
+	default:
+		return false, fmt.Errorf("TouchObject: %s: %w", op, err)
+	}
 }
 
 // Close releases the backend. The SDK client holds no resources needing an

@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -573,6 +574,7 @@ func TestS3FreshnessReportsLastModified(t *testing.T) {
 			_, _ = io.WriteString(w, out.String()+" 1")
 		case r.Method == http.MethodHead && strings.Contains(r.URL.Path, "/output/"):
 			w.Header().Set("Last-Modified", objectAt.Format(http.TimeFormat))
+			w.Header().Set("ETag", `"obj-1"`)
 			w.Header().Set("Content-Length", "3")
 		default:
 			writeS3Error(w, http.StatusBadRequest, "Unexpected")
@@ -582,7 +584,7 @@ func TestS3FreshnessReportsLastModified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Freshness: %v", err)
 	}
-	if got.Output != out || !got.ActionWritten.Equal(recordAt) || !got.ObjectWritten.Equal(objectAt) || got.ActionETag != `"rec-1"` {
+	if got.Output != out || !got.ActionWritten.Equal(recordAt) || !got.ObjectWritten.Equal(objectAt) || got.ActionETag != `"rec-1"` || got.ObjectETag != `"obj-1"` {
 		t.Fatalf("Freshness = %+v, want output %v written %v, body written %v", got, out, recordAt, objectAt)
 	}
 }
@@ -619,26 +621,102 @@ func TestS3FreshnessReportsTransportFailure(t *testing.T) {
 	}
 }
 
-// TestS3RewriteObjectIsUnconditional pins that a rewrite carries no
-// If-None-Match, which is the precondition that makes PutObject leave an
-// existing object, and its age, alone.
-func TestS3RewriteObjectIsUnconditional(t *testing.T) {
-	s, f := newTestS3(t, "", func(f *fakeS3, w http.ResponseWriter, r *http.Request) {
+// TestS3TouchObjectPreservesMetadata verifies that a server-side copy sends
+// no object body and checks both sides of the same-key copy.
+func TestS3TouchObjectPreservesMetadata(t *testing.T) {
+	const etag = `"before"`
+	s, f := newTestS3(t, "a prefix", func(f *fakeS3, w http.ResponseWriter, r *http.Request) {
 		f.record(r)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "9")
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Cache-Control", "max-age=600")
+			w.Header().Set("Expires", "Tue, 24 Nov 2026 01:00:00 GMT")
+			w.Header().Set("ETag", etag)
+			w.Header().Set("X-Amz-Meta-Owner", "build")
+			w.Header().Set("X-Amz-Storage-Class", "STANDARD_IA")
+			w.Header().Set("X-Amz-Server-Side-Encryption", "aws:kms")
+			w.Header().Set("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", "existing-key")
+			w.Header().Set("X-Amz-Server-Side-Encryption-Bucket-Key-Enabled", "true")
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = io.WriteString(w, `<CopyObjectResult><ETag>"after"</ETag><LastModified>2026-11-24T00:00:00Z</LastModified></CopyObjectResult>`)
 	})
-	body := []byte("refreshed")
-	if err := s.RewriteObject(testCtx(t), mkOutput(3), bytes.NewReader(body), int64(len(body))); err != nil {
-		t.Fatalf("RewriteObject: %v", err)
+	if copied, err := s.TouchObject(testCtx(t), mkOutput(3), etag); err != nil || !copied {
+		t.Fatalf("TouchObject = %v, %v, want true and no error", copied, err)
 	}
 	reqs := f.all()
-	if len(reqs) != 1 || reqs[0].Method != http.MethodPut {
-		t.Fatalf("requests = %+v, want one PUT", reqs)
+	if len(reqs) != 2 || reqs[0].Method != http.MethodHead || reqs[1].Method != http.MethodPut {
+		t.Fatalf("requests = %+v, want HEAD then copy", reqs)
 	}
-	if v := reqs[0].Header.Get("If-None-Match"); v != "" {
-		t.Fatalf("If-None-Match = %q, want none", v)
+	head, copy := reqs[0], reqs[1]
+	if head.Header.Get("If-Match") != etag {
+		t.Fatalf("HEAD If-Match = %q, want %s", head.Header.Get("If-Match"), etag)
 	}
-	if !bytes.Equal(reqs[0].Body, body) {
-		t.Fatalf("body = %q, want %q", reqs[0].Body, body)
+	source, err := url.PathUnescape(copy.Header.Get("X-Amz-Copy-Source"))
+	if err != nil || "/"+source != copy.Path || copy.Path != head.Path || len(copy.Body) != 0 {
+		t.Fatalf("copy source = %q (%v), destination = %q, body length = %d", source, err, copy.Path, len(copy.Body))
+	}
+	for header, want := range map[string]string{
+		"If-Match": etag, "X-Amz-Copy-Source-If-Match": etag,
+		"X-Amz-Metadata-Directive": "REPLACE", "X-Amz-Meta-Owner": "build",
+		"Content-Type": "application/octet-stream", "Cache-Control": "max-age=600",
+		"Expires":             "Tue, 24 Nov 2026 01:00:00 GMT",
+		"X-Amz-Storage-Class": "STANDARD_IA", "X-Amz-Server-Side-Encryption": "aws:kms",
+		"X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id":     "existing-key",
+		"X-Amz-Server-Side-Encryption-Bucket-Key-Enabled": "true",
+	} {
+		if got := copy.Header.Get(header); got != want {
+			t.Errorf("copy %s = %q, want %q", header, got, want)
+		}
+	}
+	if got := copy.Header.Get("X-Amz-Meta-Plaid-Cache-Refreshed-At"); got == "" {
+		t.Fatal("copy lacked refreshed-at metadata")
+	}
+}
+
+// TestS3TouchObjectHandlesConcurrentChanges allows repair after deletion
+// while leaving an object replaced by another writer alone.
+func TestS3TouchObjectHandlesConcurrentChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		code    string
+		missing bool
+	}{
+		{"deleted", http.StatusNotFound, "NoSuchKey", true},
+		{"changed", http.StatusPreconditionFailed, "PreconditionFailed", false},
+		{"conflict", http.StatusConflict, "ConditionalRequestConflict", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newTestS3(t, "", func(_ *fakeS3, w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodHead {
+					w.Header().Set("Content-Length", "9")
+					return
+				}
+				writeS3Error(w, tc.status, tc.code)
+			})
+			copied, err := s.TouchObject(testCtx(t), mkOutput(3), `"old"`)
+			if copied || (tc.missing && !errors.Is(err, ErrMiss)) || (!tc.missing && err != nil) {
+				t.Fatalf("TouchObject = %v, %v, want false with missing = %v", copied, err, tc.missing)
+			}
+		})
+	}
+}
+
+// TestS3TouchObjectSkipsOversizedBodies avoids attempting a single copy or
+// overwriting the existing object through an unconditional fallback.
+func TestS3TouchObjectSkipsOversizedBodies(t *testing.T) {
+	s, f := newTestS3(t, "", func(f *fakeS3, w http.ResponseWriter, r *http.Request) {
+		f.record(r)
+		w.Header().Set("Content-Length", strconv.FormatInt(maxSelfCopyBytes+1, 10))
+	})
+	if copied, err := s.TouchObject(testCtx(t), mkOutput(3), `"old"`); copied || err == nil {
+		t.Fatalf("TouchObject = %v, %v, want false and a size error", copied, err)
+	}
+	if reqs := f.all(); len(reqs) != 1 || reqs[0].Method != http.MethodHead {
+		t.Fatalf("requests = %+v, want only HEAD", reqs)
 	}
 }
 

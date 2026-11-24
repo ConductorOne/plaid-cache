@@ -80,9 +80,9 @@ func TestRefreshRewritesAStaleEntryOnALocalHit(t *testing.T) {
 		t.Fatalf("rewritten body = %q, want %q", got, body)
 	}
 	calls := tc.rem.callOrder()
-	rw := slices.Index(calls, "RewriteObject")
-	if rw < 0 || !slices.Contains(calls[rw:], "PutActionIf") {
-		t.Fatalf("calls = %v, want RewriteObject then PutActionIf", calls)
+	rw := slices.Index(calls, "TouchObject")
+	if rw < 0 || slices.Contains(calls[rw:], "PutObject") || !slices.Contains(calls[rw:], "PutActionIf") {
+		t.Fatalf("calls = %v, want TouchObject then PutActionIf", calls)
 	}
 }
 
@@ -107,6 +107,35 @@ func TestRefreshRepairsAnExpiredBody(t *testing.T) {
 	}
 }
 
+// TestRefreshRestoresABodyDeletedDuringTouch keeps the action record behind a
+// body that actually exists, even if the object expires after the age check.
+func TestRefreshRestoresABodyDeletedDuringTouch(t *testing.T) {
+	tc := newTestCache(t, withRemote(), withRefreshAfter(time.Hour))
+	a, o := mkAction(49), mkOutput(49)
+	body := []byte("expires during touch")
+	tc.rem.onTouch = func() {
+		tc.rem.mu.Lock()
+		defer tc.rem.mu.Unlock()
+		delete(tc.rem.objects, o)
+		delete(tc.rem.objectWritten, o)
+	}
+	tc.uploaded(t, a, o, body)
+	tc.rem.age(a, o, time.Now().Add(-2*time.Hour))
+
+	tc.get(t, a)
+	if snap := tc.settleRefresh(t, 1); snap.Rewritten != 1 || snap.Failed != 0 {
+		t.Fatalf("refresh = %+v, want one rewrite and no failures", snap)
+	}
+	if got, ok := tc.rem.storedObject(o); !ok || !bytes.Equal(got, body) {
+		t.Fatalf("restored body = %q (present %v), want %q", got, ok, body)
+	}
+	calls := tc.rem.callOrder()
+	touch := slices.Index(calls, "TouchObject")
+	if touch < 0 || !slices.Equal(calls[touch:], []string{"TouchObject", "PutObject", "PutActionIf"}) {
+		t.Fatalf("calls = %v, want copy attempt followed by body restore and conditional record write", calls)
+	}
+}
+
 // TestRefreshLeavesAFreshEntryAlone pins that a recently written entry costs
 // a check and nothing more.
 func TestRefreshLeavesAFreshEntryAlone(t *testing.T) {
@@ -118,8 +147,8 @@ func TestRefreshLeavesAFreshEntryAlone(t *testing.T) {
 	if snap := tc.settleRefresh(t, 1); snap.Rewritten != 0 {
 		t.Fatalf("refresh = %+v, want no rewrite", snap)
 	}
-	if slices.Contains(tc.rem.callOrder(), "RewriteObject") {
-		t.Fatalf("calls = %v, want no RewriteObject", tc.rem.callOrder())
+	if slices.Contains(tc.rem.callOrder(), "TouchObject") {
+		t.Fatalf("calls = %v, want no TouchObject", tc.rem.callOrder())
 	}
 }
 
@@ -152,7 +181,7 @@ func TestRefreshDoesNotRevertARecordWrittenDuringTheRefresh(t *testing.T) {
 	tc.uploaded(t, a, mine, []byte("our stale output"))
 	tc.rem.age(a, mine, time.Now().Add(-2*time.Hour))
 	tc.rem.mu.Lock()
-	tc.rem.onRewrite = func() { tc.rem.programAction(a, theirs, time.Now()) }
+	tc.rem.onTouch = func() { tc.rem.programAction(a, theirs, time.Now()) }
 	tc.rem.mu.Unlock()
 
 	tc.get(t, a)
@@ -179,7 +208,7 @@ func TestRefreshDoesNotOverwriteARecordCreatedDuringTheRefresh(t *testing.T) {
 	delete(tc.rem.actionWritten, a)
 	delete(tc.rem.actionETag, a)
 	tc.rem.objectWritten[mine] = time.Now().Add(-2 * time.Hour)
-	tc.rem.onRewrite = func() { tc.rem.programAction(a, theirs, time.Now()) }
+	tc.rem.onTouch = func() { tc.rem.programAction(a, theirs, time.Now()) }
 	tc.rem.mu.Unlock()
 
 	tc.get(t, a)
