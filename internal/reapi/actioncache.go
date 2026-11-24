@@ -73,15 +73,17 @@ func (a *actionCacheService) GetActionResult(ctx context.Context, req *repb.GetA
 		a.srv.logf("bazel grpc: action result %s does not parse: %v", d, err)
 		return nil, status.Errorf(codes.NotFound, "plaid-cache: no action result for %s", d)
 	}
-	if !a.srv.validateRRCCLocalClosure(ctx, &res) {
-		return nil, status.Errorf(codes.NotFound, "plaid-cache: incomplete local rrcc closure for %s", d)
-	}
-	if missing, ok := a.srv.outputsAvailable(ctx, &res); !ok {
+	if _, _, rrcc := rrccOutputs(&res); rrcc {
+		if !a.srv.validateRRCCLocalClosure(ctx, &res) {
+			return nil, status.Errorf(codes.NotFound, "plaid-cache: incomplete local rrcc closure for %s", d)
+		}
+	} else if !a.srv.actionOutputsAvailable(ctx, &res) {
 		a.srv.resultChecks.incomplete.Add(1)
-		a.srv.logf("bazel grpc: action result %s names absent blob %s/%d; serving a miss", d, missing.GetHash(), missing.GetSizeBytes())
-		return nil, status.Errorf(codes.NotFound, "plaid-cache: action result for %s names an absent output", d)
+		a.srv.logf("bazel grpc: action result %s names an output that cannot be served; serving a miss", d)
+		return nil, status.Errorf(codes.NotFound, "plaid-cache: incomplete action result for %s", d)
+	} else {
+		a.srv.resultChecks.complete.Add(1)
 	}
-	a.srv.resultChecks.complete.Add(1)
 	return &res, nil
 }
 

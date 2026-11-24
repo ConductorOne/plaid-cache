@@ -14,9 +14,9 @@ import (
 	"github.com/conductorone/plaid-cache/internal/bazel"
 )
 
-// rrccTreeLimit bounds one observation so a malicious cache entry cannot turn
+// outputMetadataLimit bounds one observation so a malicious cache entry cannot turn
 // an action-cache lookup into unbounded metadata work.
-const rrccTreeLimit = 16 << 20
+const outputMetadataLimit = 16 << 20
 
 // RRCCMetricsSnapshot reports local-closure observations for Bazel's experimental
 // remote repository-contents cache entries.
@@ -80,12 +80,12 @@ func (s *Server) validateRRCCLocalClosure(ctx context.Context, result *repb.Acti
 		return false
 	}
 	defer func() { _ = file.Close() }()
-	if size > rrccTreeLimit {
+	if size > outputMetadataLimit {
 		s.rrccMetrics.malformed.Add(1)
 		s.logf("bazel grpc: rrcc local closure tree %s is %d bytes, refusing to inspect", tree.GetHash(), size)
 		return false
 	}
-	body, err := io.ReadAll(io.LimitReader(file, rrccTreeLimit))
+	body, err := io.ReadAll(io.LimitReader(file, outputMetadataLimit))
 	if err != nil {
 		s.rrccMetrics.malformed.Add(1)
 		s.logf("bazel grpc: read rrcc tree %s: %v", tree.GetHash(), err)
@@ -113,7 +113,7 @@ func (s *Server) validateRRCCLocalClosure(ctx context.Context, result *repb.Acti
 // hasCAS includes the implicit empty blob without probing either storage tier.
 func (s *Server) hasCAS(ctx context.Context, d *repb.Digest) bool {
 	parsed, err := digest(d)
-	if err != nil {
+	if err != nil || ctx.Err() != nil {
 		return false
 	}
 	if d.GetSizeBytes() == 0 {
