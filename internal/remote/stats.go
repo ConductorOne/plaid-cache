@@ -52,7 +52,7 @@ const (
 	opGetObject
 	opPutObject
 	opHeadObject
-	opRewriteObject
+	opCopyObject
 	numOperations
 )
 
@@ -69,8 +69,8 @@ func (o operation) String() string {
 		return "put_object"
 	case opHeadObject:
 		return "head_object"
-	case opRewriteObject:
-		return "rewrite_object"
+	case opCopyObject:
+		return "copy_object"
 	}
 	return "unknown"
 }

@@ -62,13 +62,10 @@ type Backend interface {
 	// answer stands.
 	PutActionIf(ctx context.Context, a ids.ActionID, o ids.OutputID, mtime time.Time, etag string) (bool, error)
 
-	// RewriteObject stores a body unconditionally.
-	//
-	// PutObject skips a key that already exists, which leaves the object's age
-	// — and with it the clock of any age-based lifecycle rule on the bucket —
-	// exactly where it was. A body in constant use is never re-uploaded, so it
-	// is the first to expire. Rewriting it restarts that clock.
-	RewriteObject(ctx context.Context, o ids.OutputID, r io.ReadSeeker, size int64) error
+	// TouchObject refreshes an existing body's write age without a client
+	// upload. It returns ErrMiss when the object disappeared, or false without
+	// an error when it changed and the caller should leave it alone.
+	TouchObject(ctx context.Context, o ids.OutputID, etag string) (bool, error)
 
 	// Close releases any resources and waits for in-flight work.
 	Close() error
@@ -89,6 +86,9 @@ type Freshness struct {
 	// PutActionIf; empty when there was none. It is set for a record that did
 	// not parse, too, so that a rewrite can replace it.
 	ActionETag string
+
+	// ObjectETag binds a body refresh to the object checked by Freshness.
+	ObjectETag string
 }
 
 // actionRecord is the body of an action object: the output ID in hex and the
@@ -182,8 +182,8 @@ func (Noop) PutActionIf(context.Context, ids.ActionID, ids.OutputID, time.Time, 
 	return true, nil
 }
 
-// RewriteObject discards the body.
-func (Noop) RewriteObject(context.Context, ids.OutputID, io.ReadSeeker, int64) error { return nil }
+// TouchObject reports a missing body in the disabled shared tier.
+func (Noop) TouchObject(context.Context, ids.OutputID, string) (bool, error) { return false, ErrMiss }
 
 // Close is a no-op.
 func (Noop) Close() error { return nil }

@@ -60,9 +60,9 @@ type fakeRemote struct {
 
 	freshnessErr error
 
-	// onRewrite, when set, runs inside RewriteObject before it returns,
+	// onTouch, when set, runs during TouchObject,
 	// outside mu, so a test can land another writer's record mid-refresh.
-	onRewrite func()
+	onTouch func()
 
 	getActionErr error
 	getObjectErr error
@@ -153,29 +153,31 @@ func (f *fakeRemote) Freshness(_ context.Context, a ids.ActionID, o ids.OutputID
 	}
 	if _, ok := f.objects[o]; ok {
 		fr.ObjectWritten = f.objectWritten[o]
+		fr.ObjectETag = o.String()
 	}
 	return fr, nil
 }
 
-// RewriteObject stores a body whether or not one is already there.
-func (f *fakeRemote) RewriteObject(_ context.Context, o ids.OutputID, r io.ReadSeeker, size int64) error {
-	body, err := io.ReadAll(r)
-	if err != nil {
-		return err
-	}
-	if int64(len(body)) != size {
-		return fmt.Errorf("RewriteObject: read %d bytes, declared %d", len(body), size)
-	}
+// TouchObject renews the fake shared body's age without a client upload.
+func (f *fakeRemote) TouchObject(_ context.Context, o ids.OutputID, etag string) (bool, error) {
 	f.mu.Lock()
-	f.calls = append(f.calls, "RewriteObject")
-	f.objects[o] = body
-	f.objectWritten[o] = time.Now()
-	hook := f.onRewrite
+	f.calls = append(f.calls, "TouchObject")
+	hook := f.onTouch
 	f.mu.Unlock()
 	if hook != nil {
 		hook()
 	}
-	return nil
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.objects[o]; !ok {
+		return false, remote.ErrMiss
+	}
+	if etag != o.String() {
+		return false, nil
+	}
+	f.objectWritten[o] = time.Now()
+	return true, nil
 }
 
 // age backdates the last-written times of a's record and o's body.
