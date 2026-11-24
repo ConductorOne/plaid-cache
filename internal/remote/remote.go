@@ -55,6 +55,13 @@ type Backend interface {
 	// "could not ask".
 	Freshness(ctx context.Context, a ids.ActionID, o ids.OutputID) (Freshness, error)
 
+	// PutActionIf records that an action produced an output, but only if the
+	// record is still the one a caller read: etag is that read's ETag, or empty
+	// when the record was absent. It reports false, with a nil error, when
+	// another writer has changed the record since, which means that writer's
+	// answer stands.
+	PutActionIf(ctx context.Context, a ids.ActionID, o ids.OutputID, mtime time.Time, etag string) (bool, error)
+
 	// RewriteObject stores a body unconditionally.
 	//
 	// PutObject skips a key that already exists, which leaves the object's age
@@ -77,6 +84,11 @@ type Freshness struct {
 	// ObjectWritten when the body asked about was. Zero means absent.
 	ActionWritten time.Time
 	ObjectWritten time.Time
+
+	// ActionETag identifies the action record that was read, for a later
+	// PutActionIf; empty when there was none. It is set for a record that did
+	// not parse, too, so that a rewrite can replace it.
+	ActionETag string
 }
 
 // actionRecord is the body of an action object: the output ID in hex and the
@@ -163,6 +175,11 @@ func (Noop) PutObject(context.Context, ids.OutputID, io.ReadSeeker, int64) error
 // Freshness reports nothing held.
 func (Noop) Freshness(context.Context, ids.ActionID, ids.OutputID) (Freshness, error) {
 	return Freshness{}, nil
+}
+
+// PutActionIf discards the record.
+func (Noop) PutActionIf(context.Context, ids.ActionID, ids.OutputID, time.Time, string) (bool, error) {
+	return true, nil
 }
 
 // RewriteObject discards the body.

@@ -67,6 +67,9 @@ type RefreshSnapshot struct {
 	Failed int64 `json:"failed"`
 	// Dropped is how many offers found the queue full.
 	Dropped int64 `json:"dropped"`
+	// Superseded is how many record rewrites were skipped because another
+	// writer changed the record after it was read.
+	Superseded int64 `json:"superseded"`
 }
 
 // refresher checks the remote age of actions in local use and rewrites the
@@ -85,10 +88,11 @@ type refresher struct {
 	mu     sync.RWMutex
 	closed bool
 
-	checked   atomic.Int64
-	rewritten atomic.Int64
-	failed    atomic.Int64
-	dropped   atomic.Int64
+	checked    atomic.Int64
+	rewritten  atomic.Int64
+	failed     atomic.Int64
+	dropped    atomic.Int64
+	superseded atomic.Int64
 }
 
 // refreshShard is one independently locked slice of the recently-checked set.
@@ -185,10 +189,11 @@ func (r *refresher) close() {
 // Snapshot reports the refresher's counters.
 func (r *refresher) Snapshot() RefreshSnapshot {
 	return RefreshSnapshot{
-		Checked:   r.checked.Load(),
-		Rewritten: r.rewritten.Load(),
-		Failed:    r.failed.Load(),
-		Dropped:   r.dropped.Load(),
+		Checked:    r.checked.Load(),
+		Rewritten:  r.rewritten.Load(),
+		Failed:     r.failed.Load(),
+		Dropped:    r.dropped.Load(),
+		Superseded: r.superseded.Load(),
 	}
 }
 
@@ -244,9 +249,21 @@ func (c *Cache) refreshRemote(ctx context.Context, a ids.ActionID) {
 	// The record is written after the body, as on upload, and also whenever
 	// the body was: a record older than its body would expire first and turn a
 	// refreshed body into an unreferenced one.
-	if err := c.rem.PutAction(ctx, a, e.OutputID, time.Unix(0, e.CreatedAt)); err != nil {
+	//
+	// The write is conditional on the record still being the one read above.
+	// The decision to write was made from that read, and another machine may
+	// have published a newer answer for the action since — during the body
+	// rewrite, say. Writing unconditionally would put ours back over it.
+	written, err := c.rem.PutActionIf(ctx, a, e.OutputID, time.Unix(0, e.CreatedAt), f.ActionETag)
+	if err != nil {
 		r.failed.Add(1)
 		c.logf("refresh %s: put action: %v", a, err)
+		return
+	}
+	if !written {
+		// The body, under its own content address, is still refreshed; it
+		// is only the record that is the other writer's.
+		r.superseded.Add(1)
 		return
 	}
 	r.rewritten.Add(1)

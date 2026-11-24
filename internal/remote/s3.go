@@ -180,6 +180,36 @@ func (s *S3) putAction(ctx context.Context, a ids.ActionID, o ids.OutputID, mtim
 	return nil
 }
 
+// PutActionIf writes an action record only if it is still the one with the
+// given ETag, or still absent when etag is empty.
+func (s *S3) PutActionIf(ctx context.Context, a ids.ActionID, o ids.OutputID, mtime time.Time, etag string) (bool, error) {
+	start := time.Now()
+	body := formatActionRecord(o, mtime)
+	in := &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(s.keys.actionKey(a)),
+		Body:          strings.NewReader(body),
+		ContentLength: aws.Int64(int64(len(body))),
+	}
+	if etag == "" {
+		in.IfNoneMatch = aws.String("*")
+	} else {
+		in.IfMatch = aws.String(etag)
+	}
+	_, err := s.client.PutObject(ctx, in)
+	if err != nil && (isPreconditionFailed(err) || isConditionalConflict(err)) {
+		// The record moved under us. That is the other writer winning, which
+		// is an answer rather than a failure.
+		s.stats.observe(opPutAction, nil, time.Since(start))
+		return false, nil
+	}
+	s.stats.observe(opPutAction, err, time.Since(start))
+	if err != nil {
+		return false, fmt.Errorf("PutActionIf: %w", err)
+	}
+	return true, nil
+}
+
 // GetObject opens a body from the bucket.
 func (s *S3) GetObject(ctx context.Context, o ids.OutputID) (io.ReadCloser, int64, error) {
 	start := time.Now()
@@ -264,8 +294,9 @@ func (s *S3) Freshness(ctx context.Context, a ids.ActionID, o ids.OutputID) (Fre
 		if rerr != nil {
 			return Freshness{}, fmt.Errorf("Freshness: read action: %w", rerr)
 		}
+		f.ActionETag = aws.ToString(rec.ETag)
 		// A malformed record counts as absent, as it does for GetAction: the
-		// repair for it is the same rewrite.
+		// repair for it is the same rewrite, which the ETag above permits.
 		if out, _, perr := parseActionRecord(body); perr == nil && rec.LastModified != nil {
 			f.Output = out
 			f.ActionWritten = *rec.LastModified
@@ -352,6 +383,17 @@ func isPreconditionFailed(err error) bool {
 		return true
 	}
 	return httpStatus(err) == http.StatusPreconditionFailed
+}
+
+// isConditionalConflict reports whether err means a conditional write raced
+// another write to the same key in flight, which S3 answers with 409 rather
+// than 412. Either way, the other write is the one that counts.
+func isConditionalConflict(err error) bool {
+	var ae smithy.APIError
+	if errors.As(err, &ae) && ae.ErrorCode() == "ConditionalRequestConflict" {
+		return true
+	}
+	return httpStatus(err) == http.StatusConflict
 }
 
 // httpStatus extracts the HTTP status code from a smithy transport error, or

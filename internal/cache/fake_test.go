@@ -54,7 +54,15 @@ type fakeRemote struct {
 	actionWritten map[ids.ActionID]time.Time
 	objectWritten map[ids.OutputID]time.Time
 
+	// actionETag is each record's current ETag, which changes on every write.
+	actionETag map[ids.ActionID]string
+	etagSeq    int
+
 	freshnessErr error
+
+	// onRewrite, when set, runs inside RewriteObject before it returns,
+	// outside mu, so a test can land another writer's record mid-refresh.
+	onRewrite func()
 
 	getActionErr error
 	getObjectErr error
@@ -74,6 +82,7 @@ func newFakeRemote() *fakeRemote {
 		objects:       make(map[ids.OutputID][]byte),
 		actionWritten: make(map[ids.ActionID]time.Time),
 		objectWritten: make(map[ids.OutputID]time.Time),
+		actionETag:    make(map[ids.ActionID]string),
 	}
 }
 
@@ -100,9 +109,32 @@ func (f *fakeRemote) PutAction(_ context.Context, a ids.ActionID, o ids.OutputID
 	if f.putActionErr != nil {
 		return f.putActionErr
 	}
+	f.writeActionLocked(a, o, mtime)
+	return nil
+}
+
+// writeActionLocked stores a record and gives it a new ETag. mu must be held.
+func (f *fakeRemote) writeActionLocked(a ids.ActionID, o ids.OutputID, mtime time.Time) {
 	f.actions[a] = fakeActionRecord{output: o, mtime: mtime}
 	f.actionWritten[a] = time.Now()
-	return nil
+	f.etagSeq++
+	f.actionETag[a] = fmt.Sprintf("\"etag-%d\"", f.etagSeq)
+}
+
+// PutActionIf stores a record only if its ETag is still etag, or it is still
+// absent when etag is empty.
+func (f *fakeRemote) PutActionIf(_ context.Context, a ids.ActionID, o ids.OutputID, mtime time.Time, etag string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "PutActionIf")
+	if f.putActionErr != nil {
+		return false, f.putActionErr
+	}
+	if f.actionETag[a] != etag {
+		return false, nil
+	}
+	f.writeActionLocked(a, o, mtime)
+	return true, nil
 }
 
 // Freshness reports when a's record and o's body were last written.
@@ -117,6 +149,7 @@ func (f *fakeRemote) Freshness(_ context.Context, a ids.ActionID, o ids.OutputID
 	if rec, ok := f.actions[a]; ok {
 		fr.Output = rec.output
 		fr.ActionWritten = f.actionWritten[a]
+		fr.ActionETag = f.actionETag[a]
 	}
 	if _, ok := f.objects[o]; ok {
 		fr.ObjectWritten = f.objectWritten[o]
@@ -134,10 +167,14 @@ func (f *fakeRemote) RewriteObject(_ context.Context, o ids.OutputID, r io.ReadS
 		return fmt.Errorf("RewriteObject: read %d bytes, declared %d", len(body), size)
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls = append(f.calls, "RewriteObject")
 	f.objects[o] = body
 	f.objectWritten[o] = time.Now()
+	hook := f.onRewrite
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return nil
 }
 
@@ -222,8 +259,7 @@ func (f *fakeRemote) Close() error {
 func (f *fakeRemote) programAction(a ids.ActionID, o ids.OutputID, mtime time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.actions[a] = fakeActionRecord{output: o, mtime: mtime}
-	f.actionWritten[a] = time.Now()
+	f.writeActionLocked(a, o, mtime)
 }
 
 // programObject makes the backend serve body for o.

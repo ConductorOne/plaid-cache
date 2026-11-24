@@ -147,7 +147,8 @@ func renderMetrics(r StatusResponse) []byte {
 		sample{labels: labels("result", "checked"), value: float64(r.Refresh.Checked)},
 		sample{labels: labels("result", "rewritten"), value: float64(r.Refresh.Rewritten)},
 		sample{labels: labels("result", "failed"), value: float64(r.Refresh.Failed)},
-		sample{labels: labels("result", "dropped"), value: float64(r.Refresh.Dropped)})
+		sample{labels: labels("result", "dropped"), value: float64(r.Refresh.Dropped)},
+		sample{labels: labels("result", "superseded"), value: float64(r.Refresh.Superseded)})
 
 	// The shared tier's transport, which is the only part of this report about how
 	// the cache reaches the network rather than about what it holds. Absent when

@@ -81,8 +81,8 @@ func TestRefreshRewritesAStaleEntryOnALocalHit(t *testing.T) {
 	}
 	calls := tc.rem.callOrder()
 	rw := slices.Index(calls, "RewriteObject")
-	if rw < 0 || !slices.Contains(calls[rw:], "PutAction") {
-		t.Fatalf("calls = %v, want RewriteObject then PutAction", calls)
+	if rw < 0 || !slices.Contains(calls[rw:], "PutActionIf") {
+		t.Fatalf("calls = %v, want RewriteObject then PutActionIf", calls)
 	}
 }
 
@@ -138,6 +138,56 @@ func TestRefreshDoesNotOverwriteAnotherMachinesFreshRecord(t *testing.T) {
 	}
 	if rec, _ := tc.rem.storedAction(a); rec.output != theirs {
 		t.Fatalf("record names %v, want the other machine's %v", rec.output, theirs)
+	}
+}
+
+// TestRefreshDoesNotRevertARecordWrittenDuringTheRefresh pins the race where
+// the refresher reads action -> ours, another machine publishes action ->
+// theirs while the body is being rewritten, and the refresher's record write
+// would otherwise put ours back. The write is conditional on the ETag read, so
+// it loses and the newer record stands.
+func TestRefreshDoesNotRevertARecordWrittenDuringTheRefresh(t *testing.T) {
+	tc := newTestCache(t, withRemote(), withRefreshAfter(time.Hour))
+	a, mine, theirs := mkAction(49), mkOutput(49), mkOutput(50)
+	tc.uploaded(t, a, mine, []byte("our stale output"))
+	tc.rem.age(a, mine, time.Now().Add(-2*time.Hour))
+	tc.rem.mu.Lock()
+	tc.rem.onRewrite = func() { tc.rem.programAction(a, theirs, time.Now()) }
+	tc.rem.mu.Unlock()
+
+	tc.get(t, a)
+	snap := tc.settleRefresh(t, 1)
+	if snap.Superseded != 1 || snap.Rewritten != 0 || snap.Failed != 0 {
+		t.Fatalf("refresh = %+v, want one superseded record write", snap)
+	}
+	if rec, _ := tc.rem.storedAction(a); rec.output != theirs {
+		t.Fatalf("record names %v, want the newer %v", rec.output, theirs)
+	}
+	if _, objectAt := tc.rem.written(a, mine); time.Since(objectAt) > time.Minute {
+		t.Fatalf("body written at %v, want it refreshed even though the record was not", objectAt)
+	}
+}
+
+// TestRefreshDoesNotOverwriteARecordCreatedDuringTheRefresh pins the same race
+// when the record was absent at the read: the write is If-None-Match.
+func TestRefreshDoesNotOverwriteARecordCreatedDuringTheRefresh(t *testing.T) {
+	tc := newTestCache(t, withRemote(), withRefreshAfter(time.Hour))
+	a, mine, theirs := mkAction(51), mkOutput(51), mkOutput(52)
+	tc.uploaded(t, a, mine, []byte("ours, record lost"))
+	tc.rem.mu.Lock()
+	delete(tc.rem.actions, a)
+	delete(tc.rem.actionWritten, a)
+	delete(tc.rem.actionETag, a)
+	tc.rem.objectWritten[mine] = time.Now().Add(-2 * time.Hour)
+	tc.rem.onRewrite = func() { tc.rem.programAction(a, theirs, time.Now()) }
+	tc.rem.mu.Unlock()
+
+	tc.get(t, a)
+	if snap := tc.settleRefresh(t, 1); snap.Superseded != 1 {
+		t.Fatalf("refresh = %+v, want one superseded record write", snap)
+	}
+	if rec, _ := tc.rem.storedAction(a); rec.output != theirs {
+		t.Fatalf("record names %v, want the newer %v", rec.output, theirs)
 	}
 }
 

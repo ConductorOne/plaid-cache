@@ -569,6 +569,7 @@ func TestS3FreshnessReportsLastModified(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/action/"):
 			w.Header().Set("Last-Modified", recordAt.Format(http.TimeFormat))
+			w.Header().Set("ETag", `"rec-1"`)
 			_, _ = io.WriteString(w, out.String()+" 1")
 		case r.Method == http.MethodHead && strings.Contains(r.URL.Path, "/output/"):
 			w.Header().Set("Last-Modified", objectAt.Format(http.TimeFormat))
@@ -581,7 +582,7 @@ func TestS3FreshnessReportsLastModified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Freshness: %v", err)
 	}
-	if got.Output != out || !got.ActionWritten.Equal(recordAt) || !got.ObjectWritten.Equal(objectAt) {
+	if got.Output != out || !got.ActionWritten.Equal(recordAt) || !got.ObjectWritten.Equal(objectAt) || got.ActionETag != `"rec-1"` {
 		t.Fatalf("Freshness = %+v, want output %v written %v, body written %v", got, out, recordAt, objectAt)
 	}
 }
@@ -638,5 +639,50 @@ func TestS3RewriteObjectIsUnconditional(t *testing.T) {
 	}
 	if !bytes.Equal(reqs[0].Body, body) {
 		t.Fatalf("body = %q, want %q", reqs[0].Body, body)
+	}
+}
+
+// TestS3PutActionIfIsConditional pins the precondition each case sends and
+// that a lost precondition is reported as superseded rather than as an error.
+func TestS3PutActionIfIsConditional(t *testing.T) {
+	for _, tc := range []struct {
+		name, etag, wantHeader, wantValue string
+		status                            int
+		code                              string
+		wantWritten                       bool
+	}{
+		{"matches", `"rec-1"`, "If-Match", `"rec-1"`, http.StatusOK, "", true},
+		{"absent", "", "If-None-Match", "*", http.StatusOK, "", true},
+		{"changed", `"rec-1"`, "If-Match", `"rec-1"`, http.StatusPreconditionFailed, "PreconditionFailed", false},
+		{"racing", `"rec-1"`, "If-Match", `"rec-1"`, http.StatusConflict, "ConditionalRequestConflict", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, f := newTestS3(t, "", func(f *fakeS3, w http.ResponseWriter, r *http.Request) {
+				f.record(r)
+				if tc.code != "" {
+					writeS3Error(w, tc.status, tc.code)
+				}
+			})
+			written, err := s.PutActionIf(testCtx(t), mkAction(7), mkOutput(8), time.Unix(0, 1), tc.etag)
+			if err != nil || written != tc.wantWritten {
+				t.Fatalf("PutActionIf = %v, %v; want %v, nil", written, err, tc.wantWritten)
+			}
+			reqs := f.all()
+			if len(reqs) != 1 || reqs[0].Header.Get(tc.wantHeader) != tc.wantValue {
+				t.Fatalf("requests = %+v, want one with %s: %s", reqs, tc.wantHeader, tc.wantValue)
+			}
+		})
+	}
+}
+
+// TestS3PutActionIfReportsOtherFailures pins that a refusal that is not a lost
+// precondition is an error.
+func TestS3PutActionIfReportsOtherFailures(t *testing.T) {
+	s, _ := newTestS3(t, "", func(f *fakeS3, w http.ResponseWriter, r *http.Request) {
+		f.record(r)
+		writeS3Error(w, http.StatusForbidden, "AccessDenied")
+	})
+	if _, err := s.PutActionIf(testCtx(t), mkAction(7), mkOutput(8), time.Unix(0, 1), ""); err == nil {
+		t.Fatalf("PutActionIf against a refusing bucket = nil error, want one")
 	}
 }
