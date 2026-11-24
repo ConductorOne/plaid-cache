@@ -42,6 +42,7 @@ type Cache struct {
 	logf    Logf
 	uploads *uploader
 	touches *toucher
+	refresh *refresher
 	metrics Metrics
 
 	// present remembers recent positive Has answers so a digest probed again
@@ -131,6 +132,11 @@ func New(p Params) *Cache {
 	c.uploads = newUploader(p.Config.UploadConcurrency, p.Config.UploadQueueDepth, p.Config.UploadBlockTimeout, logf, &c.metrics)
 	c.uploads.superseded = c.superseded
 	c.touches = newToucher(p.Index.TouchMany, p.Config.TouchGranularity, logf)
+	var after time.Duration
+	if p.Config.RemoteEnabled() {
+		after = p.Config.RemoteRefreshAfter
+	}
+	c.refresh = newRefresher(after, c.refreshRemote, logf)
 	return c
 }
 
@@ -163,6 +169,7 @@ func (c *Cache) Get(ctx context.Context, a ids.ActionID) (Result, error) {
 		path, _, err := c.blobs.Get(e.OutputID)
 		if err == nil {
 			c.touches.enqueue(a, e.LastUsedAt)
+			c.refresh.offer(a, time.Now().UnixNano())
 			c.metrics.GetLocalHit.Add(1)
 			return Result{
 				OutputID: e.OutputID,
@@ -199,6 +206,7 @@ func (c *Cache) Open(ctx context.Context, a ids.ActionID) (*os.File, Result, err
 		f, size, err := c.blobs.Open(e.OutputID)
 		if err == nil {
 			c.touches.enqueue(a, e.LastUsedAt)
+			c.refresh.offer(a, time.Now().UnixNano())
 			c.metrics.GetLocalHit.Add(1)
 			return f, Result{
 				OutputID: e.OutputID,
@@ -309,6 +317,9 @@ func (c *Cache) getRemote(ctx context.Context, a ids.ActionID) (Result, error) {
 		c.logf("index put %s: %v", a, err)
 	}
 
+	// Faulted in from the bucket, so in use, and its remote copy may be the
+	// oldest thing about it.
+	c.refresh.offer(a, now)
 	c.metrics.GetRemoteHit.Add(1)
 	return Result{OutputID: outputID, Size: size, DiskPath: path, Time: time.Unix(0, created)}, nil
 }
@@ -348,6 +359,7 @@ func (c *Cache) Has(ctx context.Context, a ids.ActionID) bool {
 	now := time.Now().UnixNano()
 	if lastUsed, ok := c.present.lookup(a, now); ok {
 		c.touches.enqueue(a, lastUsed)
+		c.refresh.offer(a, now)
 		return true
 	}
 	gen := c.present.generation()
@@ -359,6 +371,7 @@ func (c *Cache) Has(ctx context.Context, a ids.ActionID) bool {
 		return false
 	}
 	c.touches.enqueue(a, e.LastUsedAt)
+	c.refresh.offer(a, now)
 	c.present.remember(a, gen, now, c.touchedAt(e.LastUsedAt, now))
 	return true
 }
@@ -462,6 +475,10 @@ func (c *Cache) Metrics() MetricsSnapshot { return c.metrics.Snapshot() }
 func (c *Cache) Presence() PresenceSnapshot {
 	return PresenceSnapshot{Hits: c.present.hits.Load(), Misses: c.present.misses.Load()}
 }
+
+// Refresh reports what the shared-tier refresher has done since this process
+// started.
+func (c *Cache) Refresh() RefreshSnapshot { return c.refresh.Snapshot() }
 
 // UploadQueue reports how many uploads are waiting and how many may wait.
 //
@@ -571,6 +588,7 @@ func (c *Cache) maybeCompact(pruned int64) {
 // Close waits for queued touches and uploads to finish or time out. It does not
 // close the index, body store, or remote backend.
 func (c *Cache) Close() error {
+	c.refresh.close()
 	c.touches.close()
 	c.uploads.close()
 	// Persist before going away. The daemon exits on an idle timeout and a

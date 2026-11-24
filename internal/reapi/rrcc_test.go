@@ -170,7 +170,7 @@ func TestRRCCLocalClosureMetricsRecordsMissingFile(t *testing.T) {
 func TestRRCCLocalClosureMetricsIgnoreOrdinaryActions(t *testing.T) {
 	h := newHarness(t)
 	action := digestOf([]byte("ordinary action"))
-	if _, err := h.ac.UpdateActionResult(ctx(t), &repb.UpdateActionResultRequest{ActionDigest: action, ActionResult: result(0, "ordinary")}); err != nil {
+	if _, err := h.ac.UpdateActionResult(ctx(t), &repb.UpdateActionResultRequest{ActionDigest: action, ActionResult: h.storedResult(t, 0, "ordinary")}); err != nil {
 		t.Fatalf("UpdateActionResult: %v", err)
 	}
 	if _, err := h.ac.GetActionResult(ctx(t), &repb.GetActionResultRequest{ActionDigest: action}); err != nil {

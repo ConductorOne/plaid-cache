@@ -162,6 +162,15 @@ type StatusResponse struct {
 	RRCC reapi.RRCCMetricsSnapshot `json:"rrcc"`
 	Err  string                    `json:"err,omitempty"`
 
+	// ActionResults counts action-cache hits by whether every blob they named
+	// could be served; an incomplete one was answered as a miss.
+	ActionResults reapi.ActionResultChecksSnapshot `json:"action_results"`
+
+	// Refresh is what the shared-tier refresher has done since this process
+	// started: entries in local use whose remote copy was checked, and those
+	// written again because it was getting old.
+	Refresh cache.RefreshSnapshot `json:"refresh"`
+
 	// RPC is what the gRPC listener has been asked to do since this process
 	// started: calls by method and outcome with their durations, presence-check
 	// answers per digest, and blob bytes each way. It is nil when the listener

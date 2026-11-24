@@ -206,11 +206,18 @@ An action-cache entry names CAS blobs that are stored, and evicted, separately f
 - **Locally**, when eviction reaches a blob before the entry pointing at it. Eviction is oldest-first by last use, and an ordinary build reads an entry and its blobs within the same moment, so they tend to age together — but nothing enforces it, and under `--remote_download_outputs=minimal` the gap between the two widens to however long it is before something needs the bytes.
 - **In the shared tier**, when an object-lifecycle rule expires them. There is no delete operation, so remote retention is whatever the bucket's rules say, and an age-based rule cannot be told to expire an action and its outputs as a unit.
 
-Bazel treats the resulting dangling reference as a failed download rather than as corruption, and `--experimental_remote_cache_eviction_retries` (5 by default) bounds how many times it will reset its state and retry rather than failing the build. Serving a plain miss for the absent blob is the whole of the server's obligation, and it is enough: evicting the entire cache in between a `--remote_download_outputs=minimal` build and the request for its 400 MB output re-ran the action and completed the build successfully. Verifying the reference at lookup time would mean parsing `ActionResult` and probing every blob it names on the hot path, which costs more than the occasional re-run it would save, so it is documented here rather than implemented.
+A dangling reference served as a hit is not harmless. Bazel keeps the action result without downloading outputs it does not need yet; when a later action finally asks for one, the fetch fails the build with `Lost inputs no longer available remotely`. `--experimental_remote_cache_eviction_retries` resets and retries, but the retry looks the action up again and is served the same result naming the same absent blob, so a build whose inputs have expired in the shared tier fails on every retry.
+
+Two things keep that from happening:
+
+- **A gRPC action-cache hit is checked before it is served.** Every output file, output directory tree, stdout and stderr blob the `ActionResult` names must be present locally or in the shared tier; if one is not, the lookup is answered `NOT_FOUND` and Bazel re-runs the action, which uploads its outputs afresh. Local presence is the same cheap probe `FindMissingBlobs` makes, usually answered from the presence memo, and only a blob absent locally costs a round trip to the bucket. An output directory is checked by its `Tree` blob, not by every file it lists. The HTTP transport stores action results as opaque bytes and is not checked.
+- **Entries in local use are kept fresh in the shared tier.** A lifecycle rule counts an object's age from when it was written, and nothing on the read path writes: hits are served locally, and an upload of a body the bucket already holds is skipped by a conditional put. Left alone, an entry's remote age therefore counts from its first upload however often it is used, and the busiest entries expire first. Every local hit, fault-in and presence probe offers its action to a background refresher, which at most once per quarter of `PLAID_GOCACHE_REMOTE_REFRESH_AFTER` looks up the remote record's and body's last-modified times and, where either is older than that window or missing, writes them again from the local copy — the body unconditionally, then the record. A fresh record naming a different output is another machine's newer answer and is left alone.
+
+Set `PLAID_GOCACHE_REMOTE_REFRESH_AFTER` comfortably below the bucket's expiry: the difference is the guaranteed remaining life of anything this daemon has recently used, and it must cover Bazel's `--experimental_remote_cache_ttl` (3h by default). A body held only in the bucket and not on this machine is not refreshed by this daemon, so the completeness check above is what covers it.
 
 Bazel's experimental remote repository-contents cache (RRCC) is the exception: its synthetic action result is served only when the `.recorded_inputs` marker, repository `Tree`, and every file in that tree are available locally or from the shared tier. An incomplete repository closure is an action-cache miss. A zero-byte file with the SHA-256 empty digest is implicitly available and readable without an upload or a stored blob; it does not make an otherwise complete repository miss.
 
-If you set a lifecycle rule on the bucket, expiring action records earlier than output bodies keeps the dangling reference on the harmless side: an action record with no body is a miss, where a body with no action record is merely unreferenced.
+If you set a lifecycle rule on the bucket, expiring action records earlier than output bodies keeps the dangling reference on the harmless side: an action record with no body is a miss, where a body with no action record is merely unreferenced. Refreshing writes a record no earlier than its body for the same reason.
 
 ### Runtime profiling
 
@@ -284,10 +291,12 @@ There is no `directory`, no `config`, and no `volume` line, and `remote` says wh
 | `plaid_cache_uploads_total{result}` | counter | Uploads by outcome: `ok`, `failed`, `dropped`, `skipped`. |
 | `plaid_cache_upload_queue_depth`, `plaid_cache_upload_queue_capacity` | gauge | Uploads waiting on this daemon's pool, and how many may wait. Depth at capacity means uploads are being dropped. |
 | `plaid_cache_remote_requests_total{conn}` | counter | Requests to the shared tier by connection: `reused` or `new`. `new` paid for a handshake. |
-| `plaid_cache_remote_operation_duration_seconds{operation,outcome}` | histogram | How long a shared-tier operation took, by `get_action`/`put_action`/`get_object`/`put_object` and `ok`/`miss`/`error`. |
+| `plaid_cache_remote_operation_duration_seconds{operation,outcome}` | histogram | How long a shared-tier operation took, by `get_action`/`put_action`/`get_object`/`put_object`/`head_object`/`rewrite_object` and `ok`/`miss`/`error`. |
 | `plaid_cache_grpc_request_duration_seconds{method,outcome}` | histogram | Each gRPC call's duration by REAPI/ByteStream method and `ok`/`not_found`/`error`. `not_found` is a lookup miss, not a fault. Buckets run from 100µs to 30s. Process-local; absent without a gRPC listener. |
 | `plaid_cache_grpc_presence_digests_total{result}` | counter | Digests `FindMissingBlobs` was asked about, `present` or `missing`. Divided by that method's call count it is the average batch size. Process-local. |
 | `plaid_cache_grpc_blob_bytes_total{direction}` | counter | Uncompressed blob bytes `read` by and `write`n from gRPC clients. Process-local. |
+| `plaid_cache_action_result_checks_total{result}` | counter | gRPC action-cache hits by whether every blob they name could be served: `complete`, or `incomplete` (answered as a miss). Process-local. |
+| `plaid_cache_remote_refresh_total{result}` | counter | Entries in local use whose shared-tier age was `checked`, `rewritten` because it was stale or missing, `failed`, or `dropped` from a full queue. Process-local. |
 | `plaid_cache_presence_memo_lookups_total{result}` | counter | Presence probes answered from the in-memory memo (`hit`) or verified against the index and a stat (`miss`). Process-local. |
 | `plaid_cache_activity_start_time_seconds` | gauge | When the counters above started counting. |
 
@@ -592,6 +601,7 @@ be a surprising amount of reach for this one to have.
 | `PLAID_GOCACHE_S3_REGION` | Remote region. | from the AWS config chain |
 | `PLAID_GOCACHE_S3_PREFIX` | Key prefix within the bucket. | empty |
 | `PLAID_GOCACHE_MIN_UPLOAD_SIZE` | Skip uploading bodies smaller than this. Skipping also omits the action record, so the entry becomes a remote miss and the action is re-run rather than re-downloaded. | `0` (upload everything) |
+| `PLAID_GOCACHE_REMOTE_REFRESH_AFTER` | How old a shared-tier entry in local use may get before it is written to the bucket again. Keep it well below the bucket's lifecycle expiry. `0` disables refreshing. | `24h` |
 | `PLAID_GOCACHE_UPLOAD_CONCURRENCY` | Remote upload workers. | `NumCPU` |
 | `PLAID_GOCACHE_UPLOAD_QUEUE_DEPTH` | Uploads that may wait per worker before further ones are dropped. Raising it buys tolerance of a burst with memory. | `64` |
 | `PLAID_GOCACHE_UPLOAD_BLOCK_TIMEOUT` | How long a put waits for room in the upload queue before dropping the upload, as a Go duration. Zero never waits. | `0` (drop rather than wait) |

@@ -76,6 +76,12 @@ func (a *actionCacheService) GetActionResult(ctx context.Context, req *repb.GetA
 	if !a.srv.validateRRCCLocalClosure(ctx, &res) {
 		return nil, status.Errorf(codes.NotFound, "plaid-cache: incomplete local rrcc closure for %s", d)
 	}
+	if missing, ok := a.srv.outputsAvailable(ctx, &res); !ok {
+		a.srv.resultChecks.incomplete.Add(1)
+		a.srv.logf("bazel grpc: action result %s names absent blob %s/%d; serving a miss", d, missing.GetHash(), missing.GetSizeBytes())
+		return nil, status.Errorf(codes.NotFound, "plaid-cache: action result for %s names an absent output", d)
+	}
+	a.srv.resultChecks.complete.Add(1)
 	return &res, nil
 }
 

@@ -48,6 +48,14 @@ type fakeRemote struct {
 	actions map[ids.ActionID]fakeActionRecord
 	objects map[ids.OutputID][]byte
 
+	// actionWritten and objectWritten are when each key was last written, as
+	// the bucket's last-modified time would say. A conditional PutObject that
+	// finds the key present leaves it alone, as S3 does.
+	actionWritten map[ids.ActionID]time.Time
+	objectWritten map[ids.OutputID]time.Time
+
+	freshnessErr error
+
 	getActionErr error
 	getObjectErr error
 	putObjectErr error
@@ -62,8 +70,10 @@ type fakeRemote struct {
 // write.
 func newFakeRemote() *fakeRemote {
 	return &fakeRemote{
-		actions: make(map[ids.ActionID]fakeActionRecord),
-		objects: make(map[ids.OutputID][]byte),
+		actions:       make(map[ids.ActionID]fakeActionRecord),
+		objects:       make(map[ids.OutputID][]byte),
+		actionWritten: make(map[ids.ActionID]time.Time),
+		objectWritten: make(map[ids.OutputID]time.Time),
 	}
 }
 
@@ -91,7 +101,59 @@ func (f *fakeRemote) PutAction(_ context.Context, a ids.ActionID, o ids.OutputID
 		return f.putActionErr
 	}
 	f.actions[a] = fakeActionRecord{output: o, mtime: mtime}
+	f.actionWritten[a] = time.Now()
 	return nil
+}
+
+// Freshness reports when a's record and o's body were last written.
+func (f *fakeRemote) Freshness(_ context.Context, a ids.ActionID, o ids.OutputID) (remote.Freshness, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "Freshness")
+	if f.freshnessErr != nil {
+		return remote.Freshness{}, f.freshnessErr
+	}
+	var fr remote.Freshness
+	if rec, ok := f.actions[a]; ok {
+		fr.Output = rec.output
+		fr.ActionWritten = f.actionWritten[a]
+	}
+	if _, ok := f.objects[o]; ok {
+		fr.ObjectWritten = f.objectWritten[o]
+	}
+	return fr, nil
+}
+
+// RewriteObject stores a body whether or not one is already there.
+func (f *fakeRemote) RewriteObject(_ context.Context, o ids.OutputID, r io.ReadSeeker, size int64) error {
+	body, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	if int64(len(body)) != size {
+		return fmt.Errorf("RewriteObject: read %d bytes, declared %d", len(body), size)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "RewriteObject")
+	f.objects[o] = body
+	f.objectWritten[o] = time.Now()
+	return nil
+}
+
+// age backdates the last-written times of a's record and o's body.
+func (f *fakeRemote) age(a ids.ActionID, o ids.OutputID, written time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.actionWritten[a] = written
+	f.objectWritten[o] = written
+}
+
+// written returns the last-written times of a's record and o's body.
+func (f *fakeRemote) written(a ids.ActionID, o ids.OutputID) (action, object time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.actionWritten[a], f.objectWritten[o]
 }
 
 // GetObject opens a programmed body.
@@ -141,7 +203,10 @@ func (f *fakeRemote) PutObject(ctx context.Context, o ids.OutputID, r io.ReadSee
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.objects[o] = body
+	if _, ok := f.objects[o]; !ok {
+		f.objects[o] = body
+		f.objectWritten[o] = time.Now()
+	}
 	return nil
 }
 
@@ -158,6 +223,7 @@ func (f *fakeRemote) programAction(a ids.ActionID, o ids.OutputID, mtime time.Ti
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.actions[a] = fakeActionRecord{output: o, mtime: mtime}
+	f.actionWritten[a] = time.Now()
 }
 
 // programObject makes the backend serve body for o.
@@ -165,6 +231,7 @@ func (f *fakeRemote) programObject(o ids.OutputID, body []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.objects[o] = append([]byte(nil), body...)
+	f.objectWritten[o] = time.Now()
 }
 
 // callOrder returns a copy of the recorded call sequence.

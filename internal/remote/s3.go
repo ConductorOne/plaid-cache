@@ -248,6 +248,73 @@ func (s *S3) putObject(ctx context.Context, o ids.OutputID, r io.ReadSeeker, siz
 	return nil
 }
 
+// Freshness reports when the action record and the body o were last written.
+func (s *S3) Freshness(ctx context.Context, a ids.ActionID, o ids.OutputID) (Freshness, error) {
+	var f Freshness
+	recStart := time.Now()
+	rec, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.keys.actionKey(a)),
+	})
+	switch {
+	case err == nil:
+		s.stats.observe(opGetAction, nil, time.Since(recStart))
+		body, rerr := io.ReadAll(io.LimitReader(rec.Body, 256))
+		_ = rec.Body.Close() // read-only; the read error above is what matters
+		if rerr != nil {
+			return Freshness{}, fmt.Errorf("Freshness: read action: %w", rerr)
+		}
+		// A malformed record counts as absent, as it does for GetAction: the
+		// repair for it is the same rewrite.
+		if out, _, perr := parseActionRecord(body); perr == nil && rec.LastModified != nil {
+			f.Output = out
+			f.ActionWritten = *rec.LastModified
+		}
+	case isNotFound(err):
+		s.stats.observe(opGetAction, ErrMiss, time.Since(recStart))
+	default:
+		s.stats.observe(opGetAction, err, time.Since(recStart))
+		return Freshness{}, fmt.Errorf("Freshness: get action: %w", err)
+	}
+
+	start := time.Now()
+	head, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.keys.objectKey(o)),
+	})
+	switch {
+	case err == nil:
+		s.stats.observe(opHeadObject, nil, time.Since(start))
+		if head.LastModified != nil {
+			f.ObjectWritten = *head.LastModified
+		}
+	case isNotFound(err):
+		s.stats.observe(opHeadObject, ErrMiss, time.Since(start))
+	default:
+		s.stats.observe(opHeadObject, err, time.Since(start))
+		return Freshness{}, fmt.Errorf("Freshness: head object: %w", err)
+	}
+	return f, nil
+}
+
+// RewriteObject stores a body without the existence precondition PutObject
+// uses, so that the object's last-modified time, which is what an age-based
+// lifecycle rule counts from, starts again.
+func (s *S3) RewriteObject(ctx context.Context, o ids.OutputID, r io.ReadSeeker, size int64) error {
+	start := time.Now()
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(s.keys.objectKey(o)),
+		Body:          r,
+		ContentLength: aws.Int64(size),
+	})
+	s.stats.observe(opRewriteObject, err, time.Since(start))
+	if err != nil {
+		return fmt.Errorf("RewriteObject: %w", err)
+	}
+	return nil
+}
+
 // Close releases the backend. The SDK client holds no resources needing an
 // explicit shutdown, so this exists only to satisfy Backend.
 func (s *S3) Close() error { return nil }

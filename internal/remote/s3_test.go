@@ -556,3 +556,87 @@ func TestS3IdleConnsKeepsAWorkerPoolsConnections(t *testing.T) {
 		t.Fatalf("second wave opened %d new connections, want every one reused", opened)
 	}
 }
+
+// TestS3FreshnessReportsLastModified pins that Freshness reads the action
+// record's and the body's last-modified times, which is what an age-based
+// lifecycle rule counts from.
+func TestS3FreshnessReportsLastModified(t *testing.T) {
+	action, out := mkAction(0x61), mkOutput(0x62)
+	recordAt := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	objectAt := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
+	s, _ := newTestS3(t, "", func(f *fakeS3, w http.ResponseWriter, r *http.Request) {
+		f.record(r)
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/action/"):
+			w.Header().Set("Last-Modified", recordAt.Format(http.TimeFormat))
+			_, _ = io.WriteString(w, out.String()+" 1")
+		case r.Method == http.MethodHead && strings.Contains(r.URL.Path, "/output/"):
+			w.Header().Set("Last-Modified", objectAt.Format(http.TimeFormat))
+			w.Header().Set("Content-Length", "3")
+		default:
+			writeS3Error(w, http.StatusBadRequest, "Unexpected")
+		}
+	})
+	got, err := s.Freshness(testCtx(t), action, out)
+	if err != nil {
+		t.Fatalf("Freshness: %v", err)
+	}
+	if got.Output != out || !got.ActionWritten.Equal(recordAt) || !got.ObjectWritten.Equal(objectAt) {
+		t.Fatalf("Freshness = %+v, want output %v written %v, body written %v", got, out, recordAt, objectAt)
+	}
+}
+
+// TestS3FreshnessReportsAbsenceAsZero pins that missing keys are zero times,
+// not errors, so a caller can repair them.
+func TestS3FreshnessReportsAbsenceAsZero(t *testing.T) {
+	s, _ := newTestS3(t, "", func(f *fakeS3, w http.ResponseWriter, r *http.Request) {
+		f.record(r)
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writeS3Error(w, http.StatusNotFound, "NoSuchKey")
+	})
+	got, err := s.Freshness(testCtx(t), mkAction(1), mkOutput(2))
+	if err != nil {
+		t.Fatalf("Freshness: %v", err)
+	}
+	if !got.ActionWritten.IsZero() || !got.ObjectWritten.IsZero() {
+		t.Fatalf("Freshness = %+v, want both times zero", got)
+	}
+}
+
+// TestS3FreshnessReportsTransportFailure pins that a failure to ask is an
+// error rather than a claim the entry is gone.
+func TestS3FreshnessReportsTransportFailure(t *testing.T) {
+	s, _ := newTestS3(t, "", func(f *fakeS3, w http.ResponseWriter, r *http.Request) {
+		f.record(r)
+		writeS3Error(w, http.StatusForbidden, "AccessDenied")
+	})
+	if _, err := s.Freshness(testCtx(t), mkAction(1), mkOutput(2)); err == nil {
+		t.Fatalf("Freshness against a refusing bucket = nil error, want one")
+	}
+}
+
+// TestS3RewriteObjectIsUnconditional pins that a rewrite carries no
+// If-None-Match, which is the precondition that makes PutObject leave an
+// existing object, and its age, alone.
+func TestS3RewriteObjectIsUnconditional(t *testing.T) {
+	s, f := newTestS3(t, "", func(f *fakeS3, w http.ResponseWriter, r *http.Request) {
+		f.record(r)
+	})
+	body := []byte("refreshed")
+	if err := s.RewriteObject(testCtx(t), mkOutput(3), bytes.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("RewriteObject: %v", err)
+	}
+	reqs := f.all()
+	if len(reqs) != 1 || reqs[0].Method != http.MethodPut {
+		t.Fatalf("requests = %+v, want one PUT", reqs)
+	}
+	if v := reqs[0].Header.Get("If-None-Match"); v != "" {
+		t.Fatalf("If-None-Match = %q, want none", v)
+	}
+	if !bytes.Equal(reqs[0].Body, body) {
+		t.Fatalf("body = %q, want %q", reqs[0].Body, body)
+	}
+}

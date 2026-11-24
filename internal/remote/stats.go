@@ -37,7 +37,7 @@ type stats struct {
 	ops [numOperations][numOutcomes]histogram
 }
 
-// operation is one of the four calls this package makes against the shared
+// operation is one of the calls this package makes against the shared
 // tier.
 //
 // It is an index rather than a string so that recording one costs an array
@@ -51,6 +51,8 @@ const (
 	opPutAction
 	opGetObject
 	opPutObject
+	opHeadObject
+	opRewriteObject
 	numOperations
 )
 
@@ -65,6 +67,10 @@ func (o operation) String() string {
 		return "get_object"
 	case opPutObject:
 		return "put_object"
+	case opHeadObject:
+		return "head_object"
+	case opRewriteObject:
+		return "rewrite_object"
 	}
 	return "unknown"
 }

@@ -49,8 +49,34 @@ type Backend interface {
 	// immutable, so an implementation may skip the write if the key exists.
 	PutObject(ctx context.Context, o ids.OutputID, r io.ReadSeeker, size int64) error
 
+	// Freshness reports when the shared tier last wrote an action's record and
+	// the body o. Either time is zero when that key is absent; an error is
+	// reserved for a transport failure, so a caller can tell "gone" from
+	// "could not ask".
+	Freshness(ctx context.Context, a ids.ActionID, o ids.OutputID) (Freshness, error)
+
+	// RewriteObject stores a body unconditionally.
+	//
+	// PutObject skips a key that already exists, which leaves the object's age
+	// — and with it the clock of any age-based lifecycle rule on the bucket —
+	// exactly where it was. A body in constant use is never re-uploaded, so it
+	// is the first to expire. Rewriting it restarts that clock.
+	RewriteObject(ctx context.Context, o ids.OutputID, r io.ReadSeeker, size int64) error
+
 	// Close releases any resources and waits for in-flight work.
 	Close() error
+}
+
+// Freshness is what the shared tier holds for one action, and how old it is.
+type Freshness struct {
+	// Output is the body the remote action record names; zero when there is
+	// no record.
+	Output ids.OutputID
+
+	// ActionWritten is when the action record was last written, and
+	// ObjectWritten when the body asked about was. Zero means absent.
+	ActionWritten time.Time
+	ObjectWritten time.Time
 }
 
 // actionRecord is the body of an action object: the output ID in hex and the
@@ -133,6 +159,14 @@ func (Noop) GetObject(context.Context, ids.OutputID) (io.ReadCloser, int64, erro
 
 // PutObject discards the body.
 func (Noop) PutObject(context.Context, ids.OutputID, io.ReadSeeker, int64) error { return nil }
+
+// Freshness reports nothing held.
+func (Noop) Freshness(context.Context, ids.ActionID, ids.OutputID) (Freshness, error) {
+	return Freshness{}, nil
+}
+
+// RewriteObject discards the body.
+func (Noop) RewriteObject(context.Context, ids.OutputID, io.ReadSeeker, int64) error { return nil }
 
 // Close is a no-op.
 func (Noop) Close() error { return nil }

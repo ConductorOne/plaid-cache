@@ -44,7 +44,7 @@ func TestListedInstanceSharesTheUnnamedKeyspace(t *testing.T) {
 	if _, err := h.ac.UpdateActionResult(ctx(t), &repb.UpdateActionResultRequest{
 		InstanceName: name,
 		ActionDigest: action,
-		ActionResult: result(0, "it worked"),
+		ActionResult: h.storedResult(t, 0, "it worked"),
 	}); err != nil {
 		t.Fatalf("UpdateActionResult under %q: %v", name, err)
 	}
