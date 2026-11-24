@@ -319,6 +319,20 @@ func (s *S3) Freshness(ctx context.Context, a ids.ActionID, o ids.OutputID) (Fre
 		if head.LastModified != nil {
 			f.ObjectWritten = *head.LastModified
 		}
+		f.ObjectETag = aws.ToString(head.ETag)
+		f.ObjectSize = aws.ToInt64(head.ContentLength)
+		f.object = objectAttrs{
+			contentType:        aws.ToString(head.ContentType),
+			contentEncoding:    aws.ToString(head.ContentEncoding),
+			contentDisposition: aws.ToString(head.ContentDisposition),
+			contentLanguage:    aws.ToString(head.ContentLanguage),
+			cacheControl:       aws.ToString(head.CacheControl),
+			metadata:           head.Metadata,
+			sse:                string(head.ServerSideEncryption),
+			sseKMSKeyID:        aws.ToString(head.SSEKMSKeyId),
+			bucketKeyEnabled:   head.BucketKeyEnabled,
+			storageClass:       string(head.StorageClass),
+		}
 	case isNotFound(err):
 		s.stats.observe(opHeadObject, ErrMiss, time.Since(start))
 	default:
@@ -326,6 +340,79 @@ func (s *S3) Freshness(ctx context.Context, a ids.ActionID, o ids.OutputID) (Fre
 		return Freshness{}, fmt.Errorf("Freshness: head object: %w", err)
 	}
 	return f, nil
+}
+
+// maxSingleCopyBytes is the largest object one CopyObject request may copy.
+// Past it S3 requires a multipart copy, which is not worth its complexity
+// here: the local body is a fallback that works at any size.
+const maxSingleCopyBytes = 5 << 30
+
+// CopyObjectInPlace copies a body onto itself so that its last-modified time,
+// which an age-based lifecycle rule counts from, starts again, without the
+// daemon sending the bytes.
+//
+// The copy is conditional on the ETag the Freshness read saw, so it cannot
+// resurrect an object deleted since or copy over one replaced since. It
+// replaces the metadata, as a self-copy must, with exactly what the read
+// found, and restates the encryption and storage class, which a copy would
+// otherwise reset to the bucket defaults.
+//
+// On a versioned bucket every copy is a new version, and each request costs
+// what a PUT does; the refresher's window is what bounds how often either
+// happens.
+func (s *S3) CopyObjectInPlace(ctx context.Context, o ids.OutputID, f Freshness) error {
+	if f.ObjectSize > maxSingleCopyBytes {
+		return ErrCopyTooLarge
+	}
+	key := s.keys.objectKey(o)
+	in := &s3.CopyObjectInput{
+		Bucket:            aws.String(s.bucket),
+		Key:               aws.String(key),
+		CopySource:        aws.String(s.bucket + "/" + key),
+		MetadataDirective: types.MetadataDirectiveReplace,
+		Metadata:          f.object.metadata,
+	}
+	if f.ObjectETag != "" {
+		in.CopySourceIfMatch = aws.String(f.ObjectETag)
+	}
+	a := f.object
+	setIf := func(dst **string, v string) {
+		if v != "" {
+			*dst = aws.String(v)
+		}
+	}
+	setIf(&in.ContentType, a.contentType)
+	setIf(&in.ContentEncoding, a.contentEncoding)
+	setIf(&in.ContentDisposition, a.contentDisposition)
+	setIf(&in.ContentLanguage, a.contentLanguage)
+	setIf(&in.CacheControl, a.cacheControl)
+	if a.sse != "" {
+		in.ServerSideEncryption = types.ServerSideEncryption(a.sse)
+	}
+	setIf(&in.SSEKMSKeyId, a.sseKMSKeyID)
+	in.BucketKeyEnabled = a.bucketKeyEnabled
+	if a.storageClass != "" {
+		in.StorageClass = types.StorageClass(a.storageClass)
+	}
+
+	start := time.Now()
+	_, err := s.client.CopyObject(ctx, in)
+	switch {
+	case err == nil:
+		s.stats.observe(opCopyObject, nil, time.Since(start))
+		return nil
+	case isNotFound(err):
+		s.stats.observe(opCopyObject, ErrMiss, time.Since(start))
+		return ErrMiss
+	case isPreconditionFailed(err):
+		// Replaced since the read. The key is content-addressed, so the
+		// replacement holds the same bytes, and it was just written.
+		s.stats.observe(opCopyObject, nil, time.Since(start))
+		return nil
+	default:
+		s.stats.observe(opCopyObject, err, time.Since(start))
+		return fmt.Errorf("CopyObjectInPlace: %w", err)
+	}
 }
 
 // RewriteObject stores a body without the existence precondition PutObject

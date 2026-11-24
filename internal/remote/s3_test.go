@@ -686,3 +686,119 @@ func TestS3PutActionIfReportsOtherFailures(t *testing.T) {
 		t.Fatalf("PutActionIf against a refusing bucket = nil error, want one")
 	}
 }
+
+// headThenCopy serves a HEAD for one body with the given headers, answers any
+// copy with status and code, and returns the backend and recorder.
+func headThenCopy(t *testing.T, head http.Header, status int, code string) (*S3, *fakeS3) {
+	t.Helper()
+	return newTestS3(t, "", func(f *fakeS3, w http.ResponseWriter, r *http.Request) {
+		f.record(r)
+		switch {
+		case r.Method == http.MethodGet:
+			writeS3Error(w, http.StatusNotFound, "NoSuchKey")
+		case r.Method == http.MethodHead:
+			for k, v := range head {
+				w.Header()[k] = v
+			}
+		case r.Method == http.MethodPut && code != "":
+			writeS3Error(w, status, code)
+		case r.Method == http.MethodPut:
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>"new"</ETag></CopyObjectResult>`)
+		}
+	})
+}
+
+// TestS3CopyObjectInPlacePreservesTheObject pins that a self-copy is
+// conditional on the ETag read, replaces the metadata with what was read, and
+// restates content headers, encryption and storage class, so the only thing
+// that changes is the date.
+func TestS3CopyObjectInPlacePreservesTheObject(t *testing.T) {
+	head := http.Header{}
+	head.Set("Last-Modified", time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC).Format(http.TimeFormat))
+	head.Set("ETag", `"old"`)
+	head.Set("Content-Length", "12")
+	head.Set("Content-Type", "application/octet-stream")
+	head.Set("Cache-Control", "immutable")
+	head.Set("X-Amz-Meta-Owner", "plaid")
+	head.Set("X-Amz-Server-Side-Encryption", "aws:kms")
+	head.Set("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", "arn:aws:kms:us-west-2:1:key/k")
+	head.Set("X-Amz-Storage-Class", "EXPRESS_ONEZONE")
+	s, f := headThenCopy(t, head, 0, "")
+	o := mkOutput(9)
+
+	fr, err := s.Freshness(testCtx(t), mkAction(9), o)
+	if err != nil {
+		t.Fatalf("Freshness: %v", err)
+	}
+	if err := s.CopyObjectInPlace(testCtx(t), o, fr); err != nil {
+		t.Fatalf("CopyObjectInPlace: %v", err)
+	}
+
+	reqs := f.all()
+	cp := reqs[len(reqs)-1]
+	key := keyspace{}.objectKey(o)
+	for h, want := range map[string]string{
+		"X-Amz-Copy-Source":                           testBucket + "/" + key,
+		"X-Amz-Copy-Source-If-Match":                  `"old"`,
+		"X-Amz-Metadata-Directive":                    "REPLACE",
+		"X-Amz-Meta-Owner":                            "plaid",
+		"Content-Type":                                "application/octet-stream",
+		"Cache-Control":                               "immutable",
+		"X-Amz-Server-Side-Encryption":                "aws:kms",
+		"X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id": "arn:aws:kms:us-west-2:1:key/k",
+		"X-Amz-Storage-Class":                         "EXPRESS_ONEZONE",
+	} {
+		if got := cp.Header.Get(h); got != want {
+			t.Errorf("%s = %q, want %q", h, got, want)
+		}
+	}
+	if cp.Method != http.MethodPut || !strings.HasSuffix(cp.Path, "/"+key) || len(cp.Body) != 0 {
+		t.Fatalf("copy request = %s %s with %d body bytes, want a bodiless PUT to the same key", cp.Method, cp.Path, len(cp.Body))
+	}
+}
+
+// TestS3CopyObjectInPlaceOutcomes pins how the copy's failures are reported:
+// gone is a miss the caller uploads for, replaced is as good as copied, and
+// anything else is an error.
+func TestS3CopyObjectInPlaceOutcomes(t *testing.T) {
+	head := http.Header{}
+	head.Set("Last-Modified", time.Now().Add(-48*time.Hour).UTC().Format(http.TimeFormat))
+	head.Set("ETag", `"old"`)
+	head.Set("Content-Length", "3")
+	for _, tc := range []struct {
+		name   string
+		status int
+		code   string
+		want   func(error) bool
+	}{
+		{"deleted", http.StatusNotFound, "NoSuchKey", func(err error) bool { return errors.Is(err, ErrMiss) }},
+		{"replaced", http.StatusPreconditionFailed, "PreconditionFailed", func(err error) bool { return err == nil }},
+		{"refused", http.StatusForbidden, "AccessDenied", func(err error) bool { return err != nil && !errors.Is(err, ErrMiss) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := headThenCopy(t, head, tc.status, tc.code)
+			fr, err := s.Freshness(testCtx(t), mkAction(1), mkOutput(1))
+			if err != nil {
+				t.Fatalf("Freshness: %v", err)
+			}
+			if err := s.CopyObjectInPlace(testCtx(t), mkOutput(1), fr); !tc.want(err) {
+				t.Fatalf("CopyObjectInPlace = %v", err)
+			}
+		})
+	}
+}
+
+// TestS3CopyObjectInPlaceDeclinesPastTheSingleCopyLimit pins that a body too
+// large for one CopyObject request is handed back for an upload without a
+// request being made.
+func TestS3CopyObjectInPlaceDeclinesPastTheSingleCopyLimit(t *testing.T) {
+	s, f := newTestS3(t, "", func(f *fakeS3, w http.ResponseWriter, r *http.Request) { f.record(r) })
+	err := s.CopyObjectInPlace(testCtx(t), mkOutput(1), Freshness{ObjectETag: `"x"`, ObjectSize: maxSingleCopyBytes + 1})
+	if !errors.Is(err, ErrCopyTooLarge) {
+		t.Fatalf("CopyObjectInPlace = %v, want ErrCopyTooLarge", err)
+	}
+	if n := len(f.all()); n != 0 {
+		t.Fatalf("requests = %d, want none", n)
+	}
+}

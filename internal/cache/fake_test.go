@@ -60,9 +60,16 @@ type fakeRemote struct {
 
 	freshnessErr error
 
-	// onRewrite, when set, runs inside RewriteObject before it returns,
-	// outside mu, so a test can land another writer's record mid-refresh.
-	onRewrite func()
+	// objectETag is each body's current ETag, which changes on every write.
+	objectETag map[ids.OutputID]string
+
+	// copyErr, when set, is what CopyObjectInPlace returns.
+	copyErr error
+
+	// onBodyWrite, when set, runs inside CopyObjectInPlace and RewriteObject
+	// before they return, outside mu, so a test can land another writer's
+	// record mid-refresh.
+	onBodyWrite func()
 
 	getActionErr error
 	getObjectErr error
@@ -83,6 +90,7 @@ func newFakeRemote() *fakeRemote {
 		actionWritten: make(map[ids.ActionID]time.Time),
 		objectWritten: make(map[ids.OutputID]time.Time),
 		actionETag:    make(map[ids.ActionID]string),
+		objectETag:    make(map[ids.OutputID]string),
 	}
 }
 
@@ -151,10 +159,43 @@ func (f *fakeRemote) Freshness(_ context.Context, a ids.ActionID, o ids.OutputID
 		fr.ActionWritten = f.actionWritten[a]
 		fr.ActionETag = f.actionETag[a]
 	}
-	if _, ok := f.objects[o]; ok {
+	if body, ok := f.objects[o]; ok {
 		fr.ObjectWritten = f.objectWritten[o]
+		fr.ObjectETag = f.objectETag[o]
+		fr.ObjectSize = int64(len(body))
 	}
 	return fr, nil
+}
+
+// writeObjectLocked stores a body and gives it a new ETag. mu must be held.
+func (f *fakeRemote) writeObjectLocked(o ids.OutputID, body []byte) {
+	f.objects[o] = body
+	f.objectWritten[o] = time.Now()
+	f.etagSeq++
+	f.objectETag[o] = fmt.Sprintf("\"obj-%d\"", f.etagSeq)
+}
+
+// CopyObjectInPlace gives a body a new last-modified time, as S3's self-copy
+// does, if it is still the object fr read.
+func (f *fakeRemote) CopyObjectInPlace(_ context.Context, o ids.OutputID, fr remote.Freshness) error {
+	f.mu.Lock()
+	f.calls = append(f.calls, "CopyObjectInPlace")
+	err := f.copyErr
+	hook := f.onBodyWrite
+	if err == nil {
+		body, ok := f.objects[o]
+		switch {
+		case !ok:
+			err = remote.ErrMiss
+		case f.objectETag[o] == fr.ObjectETag:
+			f.writeObjectLocked(o, body)
+		}
+	}
+	f.mu.Unlock()
+	if err == nil && hook != nil {
+		hook()
+	}
+	return err
 }
 
 // RewriteObject stores a body whether or not one is already there.
@@ -168,9 +209,8 @@ func (f *fakeRemote) RewriteObject(_ context.Context, o ids.OutputID, r io.ReadS
 	}
 	f.mu.Lock()
 	f.calls = append(f.calls, "RewriteObject")
-	f.objects[o] = body
-	f.objectWritten[o] = time.Now()
-	hook := f.onRewrite
+	f.writeObjectLocked(o, body)
+	hook := f.onBodyWrite
 	f.mu.Unlock()
 	if hook != nil {
 		hook()
@@ -241,8 +281,7 @@ func (f *fakeRemote) PutObject(ctx context.Context, o ids.OutputID, r io.ReadSee
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.objects[o]; !ok {
-		f.objects[o] = body
-		f.objectWritten[o] = time.Now()
+		f.writeObjectLocked(o, body)
 	}
 	return nil
 }
@@ -266,8 +305,7 @@ func (f *fakeRemote) programAction(a ids.ActionID, o ids.OutputID, mtime time.Ti
 func (f *fakeRemote) programObject(o ids.OutputID, body []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.objects[o] = append([]byte(nil), body...)
-	f.objectWritten[o] = time.Now()
+	f.writeObjectLocked(o, append([]byte(nil), body...))
 }
 
 // callOrder returns a copy of the recorded call sequence.

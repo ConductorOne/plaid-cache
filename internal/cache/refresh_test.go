@@ -11,6 +11,7 @@ import (
 
 	"github.com/conductorone/plaid-cache/internal/config"
 	"github.com/conductorone/plaid-cache/internal/ids"
+	"github.com/conductorone/plaid-cache/internal/remote"
 )
 
 // withRefreshAfter sets how old a remote entry in local use may get.
@@ -54,8 +55,9 @@ func (tc *testCache) settleRefresh(t *testing.T, n int64) RefreshSnapshot {
 
 // TestRefreshRewritesAStaleEntryOnALocalHit pins the fix for busy entries
 // expiring from the shared tier: an entry hit locally whose remote record and
-// body are older than the refresh window is written to the bucket again, body
-// first, unconditionally, so an age-based lifecycle rule's clock restarts.
+// body are older than the refresh window is written again, so an age-based
+// lifecycle rule's clock restarts. A body still in the bucket is copied onto
+// itself there rather than uploaded again, then the record is rewritten.
 func TestRefreshRewritesAStaleEntryOnALocalHit(t *testing.T) {
 	tc := newTestCache(t, withRemote(), withRefreshAfter(time.Hour))
 	a, o := mkAction(41), mkOutput(41)
@@ -69,20 +71,75 @@ func TestRefreshRewritesAStaleEntryOnALocalHit(t *testing.T) {
 	}
 	snap := tc.settleRefresh(t, 1)
 
-	if snap.Rewritten != 1 || snap.Failed != 0 {
-		t.Fatalf("refresh = %+v, want one rewrite and no failures", snap)
+	if snap.Rewritten != 1 || snap.Copied != 1 || snap.Uploaded != 0 || snap.Failed != 0 {
+		t.Fatalf("refresh = %+v, want one rewrite by copy and no failures", snap)
 	}
 	actionAt, objectAt := tc.rem.written(a, o)
 	if !actionAt.After(old) || !objectAt.After(old) {
 		t.Fatalf("written at action=%v object=%v, want both after %v", actionAt, objectAt, old)
 	}
 	if got, _ := tc.rem.storedObject(o); !bytes.Equal(got, body) {
-		t.Fatalf("rewritten body = %q, want %q", got, body)
+		t.Fatalf("body after copy = %q, want %q", got, body)
 	}
 	calls := tc.rem.callOrder()
-	rw := slices.Index(calls, "RewriteObject")
-	if rw < 0 || !slices.Contains(calls[rw:], "PutActionIf") {
-		t.Fatalf("calls = %v, want RewriteObject then PutActionIf", calls)
+	if slices.Contains(calls, "RewriteObject") {
+		t.Fatalf("calls = %v, want the body copied in place, not uploaded", calls)
+	}
+	cp := slices.Index(calls, "CopyObjectInPlace")
+	if cp < 0 || !slices.Contains(calls[cp:], "PutActionIf") {
+		t.Fatalf("calls = %v, want CopyObjectInPlace then PutActionIf", calls)
+	}
+}
+
+// TestRefreshUploadsWhenTheCopyCannot pins the fallback to the local body for
+// a body deleted between the read and the copy, and for one too large for a
+// single copy request.
+func TestRefreshUploadsWhenTheCopyCannot(t *testing.T) {
+	for name, copyErr := range map[string]error{
+		"deleted":   remote.ErrMiss,
+		"too large": remote.ErrCopyTooLarge,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tc := newTestCache(t, withRemote(), withRefreshAfter(time.Hour))
+			a, o := mkAction(53), mkOutput(53)
+			body := []byte("uploaded after all")
+			tc.uploaded(t, a, o, body)
+			tc.rem.age(a, o, time.Now().Add(-2*time.Hour))
+			tc.rem.mu.Lock()
+			tc.rem.copyErr = copyErr
+			tc.rem.mu.Unlock()
+
+			tc.get(t, a)
+			snap := tc.settleRefresh(t, 1)
+			if snap.Rewritten != 1 || snap.Uploaded != 1 || snap.Copied != 0 {
+				t.Fatalf("refresh = %+v, want one rewrite by upload", snap)
+			}
+			if got, _ := tc.rem.storedObject(o); !bytes.Equal(got, body) {
+				t.Fatalf("body = %q, want %q", got, body)
+			}
+		})
+	}
+}
+
+// TestRefreshLeavesTheRecordAloneWhenTheBodyFails pins that the record is only
+// refreshed after its body is: a fresh record over a stale body would outlive
+// it.
+func TestRefreshLeavesTheRecordAloneWhenTheBodyFails(t *testing.T) {
+	tc := newTestCache(t, withRemote(), withRefreshAfter(time.Hour))
+	a, o := mkAction(54), mkOutput(54)
+	tc.uploaded(t, a, o, []byte("copy refused"))
+	old := time.Now().Add(-2 * time.Hour)
+	tc.rem.age(a, o, old)
+	tc.rem.mu.Lock()
+	tc.rem.copyErr = errBoom
+	tc.rem.mu.Unlock()
+
+	tc.get(t, a)
+	if snap := tc.settleRefresh(t, 1); snap.Failed != 1 || snap.Rewritten != 0 {
+		t.Fatalf("refresh = %+v, want one failure", snap)
+	}
+	if actionAt, _ := tc.rem.written(a, o); !actionAt.Equal(old) {
+		t.Fatalf("record written at %v, want it left at %v", actionAt, old)
 	}
 }
 
@@ -99,8 +156,8 @@ func TestRefreshRepairsAnExpiredBody(t *testing.T) {
 	tc.rem.mu.Unlock()
 
 	tc.get(t, a)
-	if snap := tc.settleRefresh(t, 1); snap.Rewritten != 1 {
-		t.Fatalf("refresh = %+v, want one rewrite", snap)
+	if snap := tc.settleRefresh(t, 1); snap.Rewritten != 1 || snap.Uploaded != 1 {
+		t.Fatalf("refresh = %+v, want one rewrite by upload", snap)
 	}
 	if got, ok := tc.rem.storedObject(o); !ok || !bytes.Equal(got, body) {
 		t.Fatalf("body after refresh = %q (present %v), want %q", got, ok, body)
@@ -152,7 +209,7 @@ func TestRefreshDoesNotRevertARecordWrittenDuringTheRefresh(t *testing.T) {
 	tc.uploaded(t, a, mine, []byte("our stale output"))
 	tc.rem.age(a, mine, time.Now().Add(-2*time.Hour))
 	tc.rem.mu.Lock()
-	tc.rem.onRewrite = func() { tc.rem.programAction(a, theirs, time.Now()) }
+	tc.rem.onBodyWrite = func() { tc.rem.programAction(a, theirs, time.Now()) }
 	tc.rem.mu.Unlock()
 
 	tc.get(t, a)
@@ -179,7 +236,7 @@ func TestRefreshDoesNotOverwriteARecordCreatedDuringTheRefresh(t *testing.T) {
 	delete(tc.rem.actionWritten, a)
 	delete(tc.rem.actionETag, a)
 	tc.rem.objectWritten[mine] = time.Now().Add(-2 * time.Hour)
-	tc.rem.onRewrite = func() { tc.rem.programAction(a, theirs, time.Now()) }
+	tc.rem.onBodyWrite = func() { tc.rem.programAction(a, theirs, time.Now()) }
 	tc.rem.mu.Unlock()
 
 	tc.get(t, a)

@@ -6,11 +6,13 @@ package cache
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/conductorone/plaid-cache/internal/ids"
+	"github.com/conductorone/plaid-cache/internal/remote"
 )
 
 // The shared tier's age problem.
@@ -31,8 +33,8 @@ import (
 //
 // The refresher closes that gap from the side that knows an entry is in use:
 // every local hit offers its action here, and an action whose remote record or
-// body is older than RemoteRefreshAfter is written to the bucket again from the
-// local copy. A hit therefore keeps an entry alive in the shared tier the same
+// body is older than RemoteRefreshAfter is written to the bucket again: a body
+// still there by a copy onto itself, one that is gone from the local copy. A hit therefore keeps an entry alive in the shared tier the same
 // way it keeps it alive in the local one.
 
 // refreshShards spreads the recently-checked set over independent locks, for
@@ -63,6 +65,11 @@ type RefreshSnapshot struct {
 	Checked int64 `json:"checked"`
 	// Rewritten is how many of those had a record or body written again.
 	Rewritten int64 `json:"rewritten"`
+	// Copied is how many stale bodies the bucket copied onto themselves, and
+	// Uploaded how many were sent again from the local copy because they were
+	// gone or too large to copy.
+	Copied   int64 `json:"copied"`
+	Uploaded int64 `json:"uploaded"`
 	// Failed is how many checks or rewrites failed.
 	Failed int64 `json:"failed"`
 	// Dropped is how many offers found the queue full.
@@ -90,6 +97,8 @@ type refresher struct {
 
 	checked    atomic.Int64
 	rewritten  atomic.Int64
+	copied     atomic.Int64
+	uploaded   atomic.Int64
 	failed     atomic.Int64
 	dropped    atomic.Int64
 	superseded atomic.Int64
@@ -191,6 +200,8 @@ func (r *refresher) Snapshot() RefreshSnapshot {
 	return RefreshSnapshot{
 		Checked:    r.checked.Load(),
 		Rewritten:  r.rewritten.Load(),
+		Copied:     r.copied.Load(),
+		Uploaded:   r.uploaded.Load(),
 		Failed:     r.failed.Load(),
 		Dropped:    r.dropped.Load(),
 		Superseded: r.superseded.Load(),
@@ -229,22 +240,8 @@ func (c *Cache) refreshRemote(ctx context.Context, a ids.ActionID) {
 		return
 	}
 
-	if staleBody {
-		body, size, err := c.blobs.Open(e.OutputID)
-		if err != nil {
-			if !errors.Is(err, context.Canceled) {
-				c.logf("refresh %s: open %s: %v", a, e.OutputID, err)
-			}
-			r.failed.Add(1)
-			return
-		}
-		err = c.rem.RewriteObject(ctx, e.OutputID, body, size)
-		_ = body.Close() // read-only; the rewrite's error is the one that matters
-		if err != nil {
-			r.failed.Add(1)
-			c.logf("refresh %s: rewrite %s: %v", a, e.OutputID, err)
-			return
-		}
+	if staleBody && !c.refreshBody(ctx, a, e.OutputID, f) {
+		return
 	}
 	// The record is written after the body, as on upload, and also whenever
 	// the body was: a record older than its body would expire first and turn a
@@ -267,4 +264,47 @@ func (c *Cache) refreshRemote(ctx context.Context, a ids.ActionID) {
 		return
 	}
 	r.rewritten.Add(1)
+}
+
+// refreshBody restarts a stale body's age in the shared tier, and reports
+// whether it did.
+//
+// A body still in the bucket is copied onto itself there, so the bytes do not
+// cross the network. A body that is gone, or too large for one copy request,
+// is uploaded from the local copy instead.
+func (c *Cache) refreshBody(ctx context.Context, a ids.ActionID, o ids.OutputID, f remote.Freshness) bool {
+	r := c.refresh
+	if !f.ObjectWritten.IsZero() {
+		err := c.rem.CopyObjectInPlace(ctx, o, f)
+		switch {
+		case err == nil:
+			r.copied.Add(1)
+			return true
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, remote.ErrCopyTooLarge):
+			// Deleted since the read, or past the copy limit: fall through to
+			// the upload.
+		default:
+			r.failed.Add(1)
+			c.logf("refresh %s: copy %s: %v", a, o, err)
+			return false
+		}
+	}
+
+	body, size, err := c.blobs.Open(o)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			c.logf("refresh %s: open %s: %v", a, o, err)
+		}
+		r.failed.Add(1)
+		return false
+	}
+	err = c.rem.RewriteObject(ctx, o, body, size)
+	_ = body.Close() // read-only; the rewrite's error is the one that matters
+	if err != nil {
+		r.failed.Add(1)
+		c.logf("refresh %s: rewrite %s: %v", a, o, err)
+		return false
+	}
+	r.uploaded.Add(1)
+	return true
 }

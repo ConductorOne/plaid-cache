@@ -146,6 +146,8 @@ func renderMetrics(r StatusResponse) []byte {
 		"Shared-tier entries in local use, by what the refresher did about their remote age. Process-local.",
 		sample{labels: labels("result", "checked"), value: float64(r.Refresh.Checked)},
 		sample{labels: labels("result", "rewritten"), value: float64(r.Refresh.Rewritten)},
+		sample{labels: labels("result", "copied"), value: float64(r.Refresh.Copied)},
+		sample{labels: labels("result", "uploaded"), value: float64(r.Refresh.Uploaded)},
 		sample{labels: labels("result", "failed"), value: float64(r.Refresh.Failed)},
 		sample{labels: labels("result", "dropped"), value: float64(r.Refresh.Dropped)},
 		sample{labels: labels("result", "superseded"), value: float64(r.Refresh.Superseded)})

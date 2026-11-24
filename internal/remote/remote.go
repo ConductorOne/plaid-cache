@@ -24,6 +24,9 @@ import (
 	"github.com/conductorone/plaid-cache/internal/ids"
 )
 
+// ErrCopyTooLarge reports a body too large for a single-request copy.
+var ErrCopyTooLarge = errors.New("remote: object too large to copy in one request")
+
 // ErrMiss reports that a key is absent. It wraps fs.ErrNotExist so callers can
 // use errors.Is against either.
 var ErrMiss = fmt.Errorf("remote: key not present: %w", fs.ErrNotExist)
@@ -62,6 +65,18 @@ type Backend interface {
 	// answer stands.
 	PutActionIf(ctx context.Context, a ids.ActionID, o ids.OutputID, mtime time.Time, etag string) (bool, error)
 
+	// CopyObjectInPlace refreshes a body that is still in the bucket by having
+	// the bucket copy it onto itself, which gives it a new last-modified time
+	// without the body crossing the network. f is the Freshness read that found
+	// it stale; the copy applies only while the object is still the one read.
+	//
+	// It returns nil when the object was copied, or was replaced by another
+	// writer in the meantime, which leaves it just as fresh. It returns an error
+	// wrapping fs.ErrNotExist when the object has gone, and ErrCopyTooLarge when
+	// it is past what one copy request can handle; for either, the caller falls
+	// back to uploading its own copy.
+	CopyObjectInPlace(ctx context.Context, o ids.OutputID, f Freshness) error
+
 	// RewriteObject stores a body unconditionally.
 	//
 	// PutObject skips a key that already exists, which leaves the object's age
@@ -89,6 +104,32 @@ type Freshness struct {
 	// PutActionIf; empty when there was none. It is set for a record that did
 	// not parse, too, so that a rewrite can replace it.
 	ActionETag string
+
+	// ObjectETag and ObjectSize describe the body that was read, so that
+	// CopyObjectInPlace copies only that object and knows whether it can.
+	ObjectETag string
+	ObjectSize int64
+
+	// object is what a self-copy must carry over for the copy to be the same
+	// object with a new date: its metadata, content headers, encryption and
+	// storage class. Only the backend that read it uses it.
+	object objectAttrs
+}
+
+// objectAttrs is the part of a body's HEAD that a self-copy has to restate.
+// A copy onto itself must replace the metadata — S3 refuses one that changes
+// nothing — so anything not restated would be lost.
+type objectAttrs struct {
+	contentType        string
+	contentEncoding    string
+	contentDisposition string
+	contentLanguage    string
+	cacheControl       string
+	metadata           map[string]string
+	sse                string
+	sseKMSKeyID        string
+	bucketKeyEnabled   *bool
+	storageClass       string
 }
 
 // actionRecord is the body of an action object: the output ID in hex and the
@@ -181,6 +222,9 @@ func (Noop) Freshness(context.Context, ids.ActionID, ids.OutputID) (Freshness, e
 func (Noop) PutActionIf(context.Context, ids.ActionID, ids.OutputID, time.Time, string) (bool, error) {
 	return true, nil
 }
+
+// CopyObjectInPlace reports the body absent.
+func (Noop) CopyObjectInPlace(context.Context, ids.OutputID, Freshness) error { return ErrMiss }
 
 // RewriteObject discards the body.
 func (Noop) RewriteObject(context.Context, ids.OutputID, io.ReadSeeker, int64) error { return nil }
