@@ -79,7 +79,7 @@ func (a *actionCacheService) GetActionResult(ctx context.Context, req *repb.GetA
 		}
 	} else if !a.srv.actionOutputsAvailable(ctx, &res) {
 		a.srv.resultChecks.incomplete.Add(1)
-		a.srv.logf("bazel grpc: action result %s names an output that cannot be served; serving a miss", d)
+		a.srv.logf("bazel grpc: action result %s names an output that is absent or was not confirmed within %s; serving a miss", d, actionOutputCheckTimeout)
 		return nil, status.Errorf(codes.NotFound, "plaid-cache: incomplete action result for %s", d)
 	} else {
 		a.srv.resultChecks.complete.Add(1)

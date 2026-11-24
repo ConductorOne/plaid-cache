@@ -139,7 +139,7 @@ func renderMetrics(r StatusResponse) []byte {
 		sample{labels: labels("result", "file_missing"), value: float64(r.RRCC.FileMissing)},
 		sample{labels: labels("result", "malformed"), value: float64(r.RRCC.Malformed)})
 	writeFamily(&b, "action_result_checks_total", "counter",
-		"Action-cache hits by whether every blob they name could be served. An incomplete one is answered as a miss so the client re-runs the action. Process-local.",
+		"Action-cache hits, other than repository-contents results, by whether every blob they name could be served. An incomplete one is answered as a miss so the client re-runs the action. Process-local.",
 		sample{labels: labels("result", "complete"), value: float64(r.ActionResults.Complete)},
 		sample{labels: labels("result", "incomplete"), value: float64(r.ActionResults.Incomplete)})
 	writeFamily(&b, "remote_refresh_total", "counter",
