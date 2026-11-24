@@ -73,8 +73,12 @@ func (a *actionCacheService) GetActionResult(ctx context.Context, req *repb.GetA
 		a.srv.logf("bazel grpc: action result %s does not parse: %v", d, err)
 		return nil, status.Errorf(codes.NotFound, "plaid-cache: no action result for %s", d)
 	}
-	if !a.srv.validateRRCCLocalClosure(ctx, &res) {
-		return nil, status.Errorf(codes.NotFound, "plaid-cache: incomplete local rrcc closure for %s", d)
+	if _, _, rrcc := rrccOutputs(&res); rrcc {
+		if !a.srv.validateRRCCLocalClosure(ctx, &res) {
+			return nil, status.Errorf(codes.NotFound, "plaid-cache: incomplete local rrcc closure for %s", d)
+		}
+	} else if !a.srv.actionOutputsAvailable(ctx, &res) {
+		return nil, status.Errorf(codes.NotFound, "plaid-cache: incomplete action result for %s", d)
 	}
 	return &res, nil
 }

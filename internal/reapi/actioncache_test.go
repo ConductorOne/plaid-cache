@@ -27,6 +27,7 @@ func TestActionCacheRoundTrip(t *testing.T) {
 	h := newHarness(t)
 	action := digestOf([]byte("some action"))
 	want := result(0, "it worked")
+	putBlob(t, h, []byte("it worked"))
 
 	if _, err := h.ac.UpdateActionResult(ctx(t), &repb.UpdateActionResultRequest{
 		ActionDigest: action,
@@ -65,6 +66,7 @@ func TestActionCacheOverwrites(t *testing.T) {
 	h := newHarness(t)
 	action := digestOf([]byte("an action that gets re-run"))
 
+	putBlob(t, h, []byte("output"))
 	for _, code := range []int32{1, 0} {
 		if _, err := h.ac.UpdateActionResult(ctx(t), &repb.UpdateActionResultRequest{
 			ActionDigest: action,
@@ -98,6 +100,7 @@ func TestActionResultAndActionShareOneDigestWithoutColliding(t *testing.T) {
 	actionBlob := []byte("a serialised Action message")
 	shared := digestOf(actionBlob)
 	putBlob(t, h, actionBlob)
+	putBlob(t, h, []byte("the action's output"))
 
 	if _, err := h.ac.UpdateActionResult(ctx(t), &repb.UpdateActionResultRequest{
 		ActionDigest: shared,
@@ -136,6 +139,7 @@ func TestActionCacheReadsWhatTheHTTPTransportWrote(t *testing.T) {
 	action := digestOf([]byte("an action stored the other way"))
 	d := mustDigest(t, action.GetHash())
 
+	putBlob(t, h, []byte("written over http"))
 	body := marshalResult(t, result(7, "written over http"))
 	if err := h.store.Put(ctx(t), bazel.KindAC, d, bytes.NewReader(body)); err != nil {
 		t.Fatalf("Put: %v", err)
